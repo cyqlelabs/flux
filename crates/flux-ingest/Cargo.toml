@@ -1,0 +1,24 @@
+[package]
+name = "flux-ingest"
+description = "Model artifact inspection: GGUF/safetensors metadata, shard and hash manifests, compatibility"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+flux-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+futures.workspace = true
+tracing.workspace = true
+zip.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

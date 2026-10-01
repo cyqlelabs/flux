@@ -1,0 +1,21 @@
+[package]
+name = "flux-plan"
+description = "Measured, constrained execution planner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+flux-core.workspace = true
+flux-probe.workspace = true
+flux-ingest.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "flux-bench"
+description = "Reproducible benchmark harness, quality checks, soak and fault injection, release gates"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+flux-core.workspace = true
+flux-probe.workspace = true
+flux-plan.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+rand.workspace = true
+libc.workspace = true
+tracing.workspace = true

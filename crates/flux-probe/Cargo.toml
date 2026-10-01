@@ -1,0 +1,19 @@
+[package]
+name = "flux-probe"
+description = "Host hardware inventory and measured storage bandwidth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version = "1.89"
+
+[dependencies]
+flux-core.workspace = true
+anyhow.workspace = true
+libc.workspace = true
+nvml-wrapper = { workspace = true, features = ["legacy-functions"] }
+serde_json.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

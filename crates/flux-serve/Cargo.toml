@@ -1,0 +1,23 @@
+[package]
+name = "flux-serve"
+description = "Flux HTTP API: admission, bounded queues, cancellation and streaming against a saved plan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+flux-core.workspace = true
+flux-plan.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true

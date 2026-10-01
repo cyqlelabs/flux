@@ -1,0 +1,27 @@
+[package]
+name = "flux-cli"
+description = "Flux command line: inspect, fetch, probe, plan, serve, bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "flux"
+path = "src/main.rs"
+
+[dependencies]
+flux-core.workspace = true
+flux-ingest.workspace = true
+flux-probe.workspace = true
+flux-plan.workspace = true
+flux-serve.workspace = true
+flux-bench.workspace = true
+futures.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true

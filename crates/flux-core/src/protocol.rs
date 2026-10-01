@@ -1,0 +1,240 @@
+//! Versioned control protocol between flux-serve and a flux-worker process.
+//! One JSON object per line: requests on the worker's stdin, events on its stdout.
+
+use crate::plan::Plan;
+use serde::{Deserialize, Serialize};
+
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Unset fields keep the backend's defaults, so every engine samples the same way for the same request.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Sampling {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeat_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeat_last_n: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u32>,
+    /// Bans end-of-generation tokens so benchmarks get exactly `max_tokens`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignore_eos: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum Request {
+    Hello {
+        protocol: u32,
+    },
+    Load {
+        plan: Box<Plan>,
+        /// Install per-node time attribution (slows traced steps; see `Trace`).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        trace: bool,
+    },
+    Tokenize {
+        id: u64,
+        text: String,
+        add_special: bool,
+    },
+    /// Renders chat messages (OpenAI shape) with the model's own template.
+    ApplyTemplate {
+        id: u64,
+        messages: serde_json::Value,
+        #[serde(default)]
+        tools: Option<serde_json::Value>,
+        add_generation_prompt: bool,
+    },
+    /// Creates a sequence and processes its prompt. Decoding starts only when credit arrives via `Decode`.
+    Prefill {
+        req: String,
+        prompt: Vec<i32>,
+        sampling: Sampling,
+        stop: Vec<String>,
+        max_tokens: u32,
+        /// Special tokens to render as text (the chat template's preserved tokens); others render empty.
+        #[serde(default)]
+        render_special: Vec<i32>,
+    },
+    /// Grants credit for `n` more tokens; bounds how far generation may run ahead of the consumer.
+    Decode {
+        req: String,
+        n: u32,
+    },
+    Cancel {
+        req: String,
+    },
+    /// Whole OpenAI chat request for engines that only accept messages (e.g. Strata).
+    /// Tokens arrive as `Token` events with `token = -1`; credit applies as for `Prefill`.
+    Chat {
+        req: String,
+        body: serde_json::Value,
+    },
+    Stats {
+        id: u64,
+    },
+    /// Decodes `steps` tokens after `prompt` untraced, then traced, while no request is active.
+    Trace {
+        id: u64,
+        prompt: Vec<i32>,
+        steps: u32,
+        /// Observe every computing node (heavy synchronization) instead of one point per device split.
+        #[serde(default)]
+        per_op: bool,
+        /// Count expert selections per MoE layer instead of timing.
+        #[serde(default)]
+        routes: bool,
+    },
+    Shutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishReason {
+    /// End-of-generation token.
+    Eog,
+    /// A stop string matched; its text is not emitted.
+    Stop,
+    /// `max_tokens` reached.
+    Length,
+    Cancelled,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    Protocol,
+    NotLoaded,
+    LoadFailed,
+    /// Prompt plus `max_tokens` exceeds the planned context per sequence.
+    ContextFull,
+    /// All planned sequences are in use.
+    Busy,
+    BadRequest,
+    Backend,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceMemory {
+    pub device: String,
+    pub model: u64,
+    pub context: u64,
+    pub compute: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorkerStats {
+    pub active: u32,
+    pub steps: u64,
+    pub prefilled_tokens: u64,
+    pub decoded_tokens: u64,
+    pub step_ms_p50: f64,
+    pub step_ms_p95: f64,
+    pub memory: Vec<DeviceMemory>,
+    pub rss_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "ev", rename_all = "snake_case")]
+pub enum Event {
+    Hello {
+        protocol: u32,
+        worker: String,
+        engine: String,
+        backend_revision: String,
+        /// `tokens` (Tokenize/ApplyTemplate/Prefill) or `chat` (Chat only).
+        level: String,
+    },
+    Loaded {
+        load_ms: f64,
+        n_ctx_seq: u32,
+        n_seq: u32,
+        memory: Vec<DeviceMemory>,
+    },
+    Tokens {
+        id: u64,
+        tokens: Vec<i32>,
+    },
+    Templated {
+        id: u64,
+        prompt: String,
+        preserved_tokens: Vec<i32>,
+        additional_stops: Vec<String>,
+    },
+    Prefilled {
+        req: String,
+        n_prompt: u32,
+        ms: f64,
+    },
+    /// `text` is the valid UTF-8 completed by this token; it may be empty while a character is split across tokens.
+    Token {
+        req: String,
+        i: u32,
+        token: i32,
+        text: String,
+        t_us: u64,
+    },
+    /// One streamed chunk from a chat-level engine, relayed verbatim (OpenAI chat.completion.chunk).
+    ChatChunk {
+        req: String,
+        chunk: serde_json::Value,
+        t_us: u64,
+    },
+    /// Credit exhausted; waiting for `Decode`.
+    Paused {
+        req: String,
+    },
+    Finished {
+        req: String,
+        reason: FinishReason,
+        n_prompt: u32,
+        n_decoded: u32,
+        /// Text held back while it could still become a stop string, released at the end.
+        tail: String,
+    },
+    Stats {
+        id: u64,
+        stats: WorkerStats,
+    },
+    Traced {
+        id: u64,
+        report: serde_json::Value,
+    },
+    Error {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        req: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<u64>,
+        code: ErrorCode,
+        message: String,
+    },
+    Bye,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_format_is_tagged() {
+        let r = Request::Decode { req: "r1".into(), n: 8 };
+        assert_eq!(serde_json::to_string(&r).unwrap(), r#"{"op":"decode","req":"r1","n":8}"#);
+        let e: Event = serde_json::from_str(r#"{"ev":"paused","req":"r1"}"#).unwrap();
+        assert_eq!(e, Event::Paused { req: "r1".into() });
+        let s = Sampling { temperature: Some(0.0), ..Default::default() };
+        assert_eq!(serde_json::to_string(&s).unwrap(), r#"{"temperature":0.0}"#);
+    }
+}
