@@ -24,6 +24,18 @@ flowchart LR
 | GPU | An NVIDIA GPU and the CUDA toolkit for the default build; set `GGML_CUDA=OFF` to build for CPU only |
 | Python | Python 3 with `torch`, `numpy`, and `transformers`, needed only by `flux convert` |
 
+## Supported models
+
+Flux runs any GGUF file whose `general.architecture` the pinned llama.cpp implements: 148 architectures at the current pin, including the Llama, Qwen3, Qwen3-Next, Gemma 3, DeepSeek, gpt-oss, GLM, and MiniCPM families. The list moves with `backend.pin`, because Flux reads it from llama.cpp's source at build time. Run `flux inspect <model>` to check a file before planning.
+
+| Model format | How Flux runs it |
+|---|---|
+| GGUF with a supported architecture | The native engine or `llama-server` |
+| Hugging Face safetensors | Convert it to GGUF with `flux convert`, or register an engine for it in `flux.toml` |
+| EXL3, GPTQ, AWQ, or FP8 | Register an engine that serves the format, such as TabbyAPI or vLLM, in `flux.toml` |
+
+Expert caching and the second-GPU tier apply only to mixture-of-experts models; dense models get measured layer placement. A plan cannot exceed the model's trained context. Flux has been tested end to end on Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, and MiniCPM5.
+
 ## Build
 
 ```sh
