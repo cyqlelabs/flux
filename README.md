@@ -5,10 +5,7 @@ Flux is a measured execution planner and runtime for LLM inference. It measures 
 Cost models only rank and prune candidates; Flux always saves the plan that measured fastest. It runs on a pinned, patched build of [llama.cpp](https://github.com/ggml-org/llama.cpp) and can also plan for `llama-server` or any OpenAI-compatible engine you configure.
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/pipeline-dark.png">
-    <img src="assets/pipeline-light.png" width="348" alt="A GGUF or Hugging Face model goes through inspect, probe, and plan; the saved plan feeds serve and bench">
-  </picture>
+  <img src="assets/pipeline.png" width="348" alt="A GGUF or Hugging Face model goes through inspect, probe, and plan; the saved plan feeds serve and bench">
 </p>
 
 ## Compared with hand-tuned engines
@@ -203,10 +200,7 @@ Throughput depends on everything else the machine is doing: a busy browser can h
 Only `flux-worker` links llama.cpp, so a native crash never takes down `flux`. Planning and probing run the worker as one-shot jobs. Serving and plan validation keep a `flux-worker serve` process alive and talk to it over a versioned JSON-lines protocol.
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/architecture-dark.png">
-    <img src="assets/architecture-light.png" width="220" alt="An HTTP client calls flux, which talks JSON lines to flux-worker, which calls llama.cpp through the flux-native bridge">
-  </picture>
+  <img src="assets/architecture.png" width="220" alt="An HTTP client calls flux, which talks JSON lines to flux-worker, which calls llama.cpp through the flux-native bridge">
 </p>
 
 | Crate | Role |

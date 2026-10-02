@@ -1,4 +1,4 @@
-%%{init: {"flowchart": {"rankSpacing": 28, "nodeSpacing": 28, "padding": 10}}}%%
+%%{init: {"theme": "base", "themeVariables": {"primaryColor": "#dbeafe", "primaryTextColor": "#0f172a", "primaryBorderColor": "#2563eb", "textColor": "#0f172a", "lineColor": "#8b949e", "edgeLabelBackground": "#dbeafe"}, "flowchart": {"rankSpacing": 28, "nodeSpacing": 28, "padding": 10}}}%%
 flowchart TD
     C["HTTP client"] --> F["flux<br/>API, admission, journal"]
     F <-->|"JSON lines"| W["flux-worker"]
