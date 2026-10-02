@@ -43,6 +43,7 @@ fn sampling(b: &Value) -> Sampling {
         frequency_penalty: f("frequency_penalty"),
         seed: b.get("seed").and_then(Value::as_u64).map(|v| v as u32),
         ignore_eos: b.get("ignore_eos").and_then(Value::as_bool),
+        runner_up: None,
     }
 }
 

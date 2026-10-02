@@ -57,7 +57,7 @@ fn validated_rate(p: &Plan) -> Option<f64> {
 pub async fn build(cfg: FluxConfig, plan: Plan, replanner: Option<Replanner>) -> Result<Arc<AppState>> {
     let logs = cfg.data_dir.join("logs");
     std::fs::create_dir_all(&logs)?;
-    let model_name = plan.source_files()[0].file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let model_name = plan.model_files[0].file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     let concurrency = plan.workload.concurrency as usize;
     let rate = validated_rate(&plan);
     let tuning = plan.clone();

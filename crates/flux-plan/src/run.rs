@@ -15,6 +15,8 @@ pub struct StreamResult {
     /// Arrival time of every token, seconds since the request was sent.
     pub token_times_s: Vec<f64>,
     pub tokens: Vec<i32>,
+    /// Runner-up of each token's row, where the engine reports it.
+    pub alts: Vec<Option<i32>>,
     pub finish: Option<FinishReason>,
     pub error: Option<String>,
     pub total_s: f64,
@@ -44,18 +46,30 @@ pub async fn corpus_prompt(worker: &Worker, corpus: &Corpus, role: Role, index: 
     }
 }
 
+/// A chat request of about `n_tokens` tokens in the model's own template: a corpus passage the user asks
+/// the model to explain. Its reply is chat-shaped generation (reasoning, prose), which routes experts and
+/// accepts drafts like interactive traffic rather than like a continuation of encyclopedia text.
+pub async fn chat_prompt(worker: &Worker, corpus: &Corpus, role: Role, index: usize, n_tokens: usize) -> Result<Vec<i32>> {
+    const ASK: &str = "Read the passage below. Explain its main points in your own words, note anything surprising, and say what questions it leaves open.\n\n";
+    let passage: String = corpus.text(role, index, n_tokens * 4).chars().take(n_tokens * 4).collect();
+    let messages = serde_json::json!([{"role": "user", "content": format!("{ASK}{passage}")}]);
+    let templated = worker.apply_template(messages, None).await?;
+    worker.tokenize(&templated.prompt, true).await
+}
+
 /// Runs one request to completion, granting all credit up front.
 pub async fn run_stream(worker: &Worker, req: &str, prompt: Vec<i32>, max_tokens: u32, sampling: Sampling) -> Result<StreamResult> {
     let n_prompt = prompt.len();
     let t0 = Instant::now();
     let mut rx = worker.start(req, prompt, sampling, vec![], max_tokens, vec![]).await?;
     worker.credit(req, max_tokens).await?;
-    let mut r = StreamResult { n_prompt, ttft_s: 0.0, token_times_s: vec![], tokens: vec![], finish: None, error: None, total_s: 0.0 };
+    let mut r = StreamResult { n_prompt, ttft_s: 0.0, token_times_s: vec![], tokens: vec![], alts: vec![], finish: None, error: None, total_s: 0.0 };
     while let Some(ev) = rx.recv().await {
         match ev {
             Event::Token { .. } | Event::ChatChunk { .. } => {
-                if let Event::Token { token, .. } = ev {
+                if let Event::Token { token, alt, .. } = ev {
                     r.tokens.push(token);
+                    r.alts.push(alt);
                 }
                 let t = t0.elapsed().as_secs_f64();
                 if r.token_times_s.is_empty() {
@@ -108,6 +122,8 @@ pub struct RunSummary {
     /// Total emitted tokens over wall time of the whole set.
     pub aggregate_tps: f64,
     pub failures: usize,
+    /// Ids of every emitted token.
+    pub tokens: Vec<i32>,
 }
 
 pub fn summarize(results: &[StreamResult], wall_s: f64) -> Option<RunSummary> {
@@ -119,5 +135,6 @@ pub fn summarize(results: &[StreamResult], wall_s: f64) -> Option<RunSummary> {
         token_ms: Summary::of(&gaps)?,
         aggregate_tps: ok.iter().map(|r| r.token_times_s.len()).sum::<usize>() as f64 / wall_s,
         failures: results.len() - ok.len(),
+        tokens: ok.iter().flat_map(|r| r.tokens.iter().copied()).collect(),
     })
 }

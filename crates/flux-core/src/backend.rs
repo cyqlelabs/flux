@@ -1,7 +1,7 @@
 //! One set of llama.cpp load parameters, rendered both for the flux-native bridge (JSON)
 //! and for the pinned llama-server binary (CLI flags), so every engine runs the same placement.
 
-use crate::plan::{Speculation, SplitMode, TensorOverride};
+use crate::plan::{Speculation, SplitMode, SplitSpec, TensorOverride};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -28,9 +28,14 @@ pub struct BackendParams {
     pub type_v: String,
     pub op_offload: bool,
     pub kv_unified: bool,
-    /// Only the llama-server engine implements speculation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speculation: Option<Speculation>,
+    /// Layers whose experts a GPU cache serves (native engine), with their initial cached experts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expert_cache: Option<SplitSpec>,
+    /// Keeps the cache's residency fixed, for reproducible runs (rollback certification).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub expert_cache_frozen: bool,
 }
 
 impl BackendParams {
@@ -131,7 +136,9 @@ mod tests {
             type_v: "f16".into(),
             op_offload: true,
             kv_unified: false,
-            speculation: Some(Speculation { kind: "draft-mtp".into(), draft_model: None, n_max: 3 }),
+            speculation: Some(Speculation { kind: "draft-mtp".into(), draft_model: None, n_max: 3, draft_vocab: None }),
+            expert_cache: None,
+            expert_cache_frozen: false,
         };
         let a = p.llama_server_args().join(" ");
         assert!(a.ends_with("--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0"));

@@ -10,7 +10,7 @@ if [[ "$HEAD" != "$PIN" ]]; then
   echo "third_party/llama.cpp is at $HEAD, backend.pin requires $PIN" >&2
   exit 1
 fi
-# Flux extensions to the pinned revision (expert split for hot/cold MoE residency).
+# Flux extensions to the pinned revision (GPU expert cache, MTP heads, Q2_0 AVX2 kernel).
 for patch in "$ROOT"/patches/llama.cpp/*.patch; do
   if git -C "$SRC" apply --reverse --check "$patch" 2>/dev/null; then
     continue
@@ -23,6 +23,7 @@ cmake -S "$SRC" -B "$SRC/build" \
   -DGGML_CUDA="${GGML_CUDA:-ON}" \
   -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS:-75;86}" \
   -DGGML_NATIVE=ON \
+  -DGGML_OPENMP=OFF \
   -DGGML_CUDA_FA=ON \
   -DGGML_CUDA_GRAPHS=ON \
   -DLLAMA_BUILD_TESTS=OFF \

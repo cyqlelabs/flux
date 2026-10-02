@@ -7,7 +7,7 @@ use flux_core::model::ModelManifest;
 use flux_core::plan::{ctx_bucket, Plan, ProfileKey};
 use flux_plan::store::PlanStore;
 use flux_probe::native::{self, ProbeOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub fn log(s: &str) {
     eprintln!("· {s}");
@@ -15,6 +15,24 @@ pub fn log(s: &str) {
 
 pub fn inspect_hashed(cfg: &FluxConfig, path: &Path) -> Result<ModelManifest> {
     flux_ingest::inspect(path, &flux_ingest::InspectOptions { hash: true, config: cfg })
+}
+
+/// The model with next-token heads grafted on, derived once into the cache (keyed by both identities).
+pub fn graft_heads(cfg: &FluxConfig, model: &Path, heads: &Path) -> Result<PathBuf> {
+    let trunk = inspect_hashed(cfg, model)?.identity.context("the model has no content identity")?;
+    let mut head_file = vec![flux_ingest::hashing::model_file(heads)?];
+    flux_ingest::hashing::HashIndex::open(&cfg.cache_dir).hash_all(&mut head_file)?;
+    let head_id = flux_ingest::hashing::identity(&head_file).context("the heads file has no content identity")?;
+    let key = flux_core::fsutil::sha256_hex(format!("{trunk}+{head_id}").as_bytes());
+    let out = cfg.cache_dir.join("derived").join(format!("{}.gguf", &key[..16]));
+    if !out.exists() {
+        log(&format!("grafting {} onto {} -> {}", heads.display(), model.display(), out.display()));
+        std::fs::create_dir_all(out.parent().unwrap())?;
+        let m = flux_ingest::gguf::GgufModel::open(model)?;
+        let h = flux_ingest::gguf::GgufModel::open(heads)?;
+        flux_ingest::repack::graft(&m, &h, &out, &|_, _| {})?;
+    }
+    Ok(out)
 }
 
 pub async fn corpus(cfg: &FluxConfig) -> Result<Corpus> {
@@ -117,16 +135,23 @@ pub async fn lookup(cfg: &FluxConfig, m: &ModelManifest, r: &ProbeReport, n_ctx:
 
 pub fn print_plan(p: &Plan) {
     println!("plan        {} · {} · {}", p.id, p.engine, p.created.format("%Y-%m-%d %H:%M"));
-    println!("model       {} ({})", p.source_files()[0].display(), p.architecture);
-    if let Some(s) = &p.expert_split {
+    println!("model       {} ({})", p.model_files[0].display(), p.architecture);
+    if let Some(s) = &p.expert_cache {
         println!(
-            "experts     {} hot experts in {} split layers serve {:.1}% of calibration routing from GPU memory ({:.1}% with whole tensors); runs {}",
+            "experts     GPU cache of {} experts over {} layers, initially serving {:.1}% of calibration routing ({:.1}% with whole tensors); adapts while decoding",
             s.hot_experts,
             s.spec.layers.len(),
             s.gpu_served * 100.0,
-            s.gpu_served_by_tensors * 100.0,
-            p.model_files[0].display()
+            s.gpu_served_by_tensors * 100.0
         );
+        for t in &s.spec.tiers {
+            println!(
+                "            {} serves {} of them for {} layers placed on other GPUs",
+                t.device,
+                t.layers.iter().map(|(_, es)| es.len()).sum::<usize>(),
+                t.layers.len()
+            );
+        }
     }
     println!("workload    {} tokens per sequence × {} · {:?}", p.workload.n_ctx_seq, p.workload.concurrency, p.workload.objective);
     println!("placement   {}", p.placement.describe());
@@ -178,17 +203,9 @@ pub fn store(cfg: &FluxConfig) -> PlanStore {
     PlanStore::new(&cfg.plans_dir())
 }
 
-/// Saves the plan, then deletes split checkpoints that no saved plan runs.
+/// Saves the plan.
 pub fn save(cfg: &FluxConfig, plan: &Plan) -> Result<std::path::PathBuf> {
-    let store = store(cfg);
-    let path = store.save(plan)?;
-    let used: Vec<std::path::PathBuf> = store.list().into_iter().filter(|p| p.expert_split.is_some()).flat_map(|p| p.model_files).collect();
-    for e in std::fs::read_dir(cfg.cache_dir.join("moe-split")).into_iter().flatten().flatten() {
-        if e.path().extension().is_some_and(|x| x == "gguf") && !used.contains(&e.path()) {
-            std::fs::remove_file(e.path())?;
-        }
-    }
-    Ok(path)
+    store(cfg).save(plan)
 }
 
 /// Refuses a plan whose GPUs no longer have the memory it was measured to need, naming the shortfall,
@@ -222,7 +239,7 @@ pub fn replanner(cfg: FluxConfig) -> flux_serve::Replanner {
     std::sync::Arc::new(move |current: Plan| {
         let cfg = cfg.clone();
         Box::pin(async move {
-            let m = inspect_hashed(&cfg, &current.source_files()[0])?;
+            let m = inspect_hashed(&cfg, &current.model_files[0])?;
             let report = probe_report(&cfg, Some(&m), false, true).await?;
             let corpus = corpus(&cfg).await?;
             let req = flux_plan::planner::PlanRequest {
@@ -357,7 +374,7 @@ fn print_routes(cfg: &FluxConfig, plan: &flux_core::plan::Plan, r: &serde_json::
         );
     }
     // GPU expert budget the plan already spends: layers whose routed experts are not overridden to the CPU.
-    let m = inspect_hashed(cfg, &plan.source_files()[0])?;
+    let m = inspect_hashed(cfg, &plan.model_files[0])?;
     let host_layers: std::collections::BTreeSet<u32> = m
         .tensors
         .iter()

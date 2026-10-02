@@ -215,7 +215,7 @@ pub async fn run(opts: &ProbeOptions<'_>, log: &(dyn Fn(&str) + Sync)) -> Result
         let gbps: Vec<f64> = k.iter().map(|p| p.weight_gbps(main_bytes)).collect();
         cpu_bandwidth.push(CpuBandwidth { threads: t, gbps: Summary::of(&gbps).unwrap() });
     }
-    let best_threads = cpu_bandwidth.iter().max_by(|a, b| a.gbps.p50.total_cmp(&b.gbps.p50)).map_or(cores, |b| b.threads);
+    let best_threads = flux_core::hardware::decode_threads(&cpu_bandwidth, cores).map_or(cores, |b| b.threads);
 
     let mut kernels = vec![];
     let prefill = if opts.quick { 256 } else { 512 };

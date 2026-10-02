@@ -268,7 +268,7 @@ async fn stream(
                         take_credit(out, req, credit).await?;
                         let text = if k + 1 == tokens.len() { content.to_string() } else { String::new() };
                         let t_us = start.elapsed().as_micros() as u64;
-                        out.send(&Event::Token { req: req.into(), i: emitted, token: tok, text, t_us });
+                        out.send(&Event::Token { req: req.into(), i: emitted, token: tok, text, t_us, alt: None });
                         emitted += 1;
                     }
                     if v["stop"].as_bool() == Some(true) {

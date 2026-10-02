@@ -49,6 +49,7 @@ impl Block {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Head {
     pub output: Vec<Weight>,
+    /// Resident host bytes of the input embedding tables (see `layout`).
     pub input_bytes: u64,
 }
 
@@ -72,8 +73,13 @@ fn weight(t: &TensorInfo) -> Weight {
     Weight { ggml_type: t.ggml_type, bytes: t.bytes, macs }
 }
 
-/// Splits the manifest into blocks with state sized for `n_seq` sequences of `n_ctx_seq` cells.
-pub fn layout(m: &ModelManifest, facts: &ArchFacts, n_seq: u64, n_ctx_seq: u64, type_k: GgmlType, type_v: GgmlType) -> Layout {
+/// Host bytes an input embedding table keeps resident when it is memory-mapped: lookups touch only the rows of
+/// the tokens seen, so a large table (e.g. per-layer n-gram embeddings) never becomes resident as a whole.
+const INPUT_RESIDENT_CAP: u64 = 1 << 30;
+
+/// Splits the manifest into blocks with state sized for `n_seq` sequences of `n_ctx_seq` cells. With `mlock`,
+/// input embedding tables count in full; otherwise up to `INPUT_RESIDENT_CAP` each.
+pub fn layout(m: &ModelManifest, facts: &ArchFacts, n_seq: u64, n_ctx_seq: u64, type_k: GgmlType, type_v: GgmlType, mlock: bool) -> Layout {
     let n_all = (facts.n_layer + facts.n_layer_nextn) as usize;
     let mut blocks: Vec<Block> = (0..n_all as u32).map(|index| Block { index, ..Default::default() }).collect();
     let state = facts.state_bytes_per_layer(n_seq, n_ctx_seq, type_k, type_v);
@@ -92,7 +98,7 @@ pub fn layout(m: &ModelManifest, facts: &ArchFacts, n_seq: u64, n_ctx_seq: u64, 
             }
             (Some(l), _) if (l as usize) < n_all => blocks[l as usize].dense.push(weight(t)),
             (None, TensorRole::Output | TensorRole::OutputNorm) => head.output.push(weight(t)),
-            (None, TensorRole::TokenEmbedding) => head.input_bytes += t.bytes,
+            (None, TensorRole::TokenEmbedding) => head.input_bytes += if mlock { t.bytes } else { t.bytes.min(INPUT_RESIDENT_CAP) },
             _ => {}
         }
     }
@@ -174,7 +180,7 @@ mod tests {
             compatibility: Compatibility::Executable { engines: vec![] },
             identity: None,
         };
-        let l = layout(&m, &facts, 1, 1024, GgmlType::F16, GgmlType::F16);
+        let l = layout(&m, &facts, 1, 1024, GgmlType::F16, GgmlType::F16, false);
         assert_eq!(l.blocks[0].dense_bytes(), 500);
         assert_eq!(l.blocks[1].expert_bytes(), 800);
         assert_eq!(l.blocks[1].experts[0].n, 32);

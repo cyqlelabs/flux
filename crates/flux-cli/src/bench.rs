@@ -140,7 +140,7 @@ pub async fn run(cfg: FluxConfig, cmd: BenchCmd) -> Result<()> {
             let plan = planning::find_plan(&cfg, &plan)?;
             let corpus = planning::corpus(&cfg).await?;
             let mut r: BackendParams = plan.backend_params();
-            r.model = plan.source_files()[0].clone();
+            r.model = plan.model_files[0].clone();
             r.overrides.clear();
             r.split_mode = flux_core::plan::SplitMode::Layer;
             if reference == "cpu" {
@@ -155,7 +155,7 @@ pub async fn run(cfg: FluxConfig, cmd: BenchCmd) -> Result<()> {
             // llama.cpp choosing its own GPU placement: the divergence users already accept.
             let accepted = vec![
                 "--model".to_string(),
-                plan.source_files()[0].display().to_string(),
+                plan.model_files[0].display().to_string(),
                 "--fit".into(),
                 "on".into(),
                 "--flash-attn".into(),
@@ -186,7 +186,7 @@ pub async fn run(cfg: FluxConfig, cmd: BenchCmd) -> Result<()> {
             let len = (p.workload.n_ctx_seq / 2).clamp(64, 1024);
             let cell = Cell { prompt_tokens: len, output_tokens: 256, concurrency: 1 };
             let tokenizer = Contestant { label: "flux".into(), kind: Kind::Flux { plan: p.id.clone() } };
-            let ps = build_prompts(&cfg, &tokenizer, &p.source_files()[0], &cell, 16, &corpus, &dir).await?;
+            let ps = build_prompts(&cfg, &tokenizer, &p.model_files[0], &cell, 16, &corpus, &dir).await?;
             let prompts: Vec<Vec<i32>> = ps.tokens.into_iter().enumerate().map(|(i, t)| t[..(32 + i * 61).min(t.len())].to_vec()).collect();
             let opts = flux_bench::soak::SoakOptions {
                 duration: parse_duration(&duration)?,
@@ -225,7 +225,7 @@ pub async fn run(cfg: FluxConfig, cmd: BenchCmd) -> Result<()> {
             std::fs::create_dir_all(&dir)?;
             let o = flux_bench::arrivals::ArrivalOptions { duration: parse_duration(&duration)?, rate, chat_turns, seed: 5 };
             let cell = Cell { prompt_tokens: p.workload.n_ctx_seq.saturating_sub(272), output_tokens: 256, concurrency: p.workload.concurrency };
-            let mut auto = flux_bench::baseline::configs(&p.source_files()[0], &cell, &[], 0).into_iter().next().context("no baseline")?;
+            let mut auto = flux_bench::baseline::configs(&p.model_files[0], &cell, &[], 0).into_iter().next().context("no baseline")?;
             if let Kind::LlamaServer { args } = &mut auto.kind {
                 // Same thread count as the plan; chat templates through jinja like Flux.
                 let t = args.iter().position(|a| a == "--threads").unwrap();
@@ -237,7 +237,7 @@ pub async fn run(cfg: FluxConfig, cmd: BenchCmd) -> Result<()> {
             let mut reports = vec![];
             for c in [&flux, &auto] {
                 planning::log(&format!("arrivals: {}", c.label));
-                reports.push(flux_bench::arrivals::run(&cfg, c, &p.source_files()[0], ctx_total, &corpus, &o, &dir).await?);
+                reports.push(flux_bench::arrivals::run(&cfg, c, &p.model_files[0], ctx_total, &corpus, &o, &dir).await?);
             }
             for r in &reports {
                 println!(

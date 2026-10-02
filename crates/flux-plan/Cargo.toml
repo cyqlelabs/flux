@@ -8,7 +8,6 @@ license.workspace = true
 [dependencies]
 flux-core.workspace = true
 flux-probe.workspace = true
-flux-ingest.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

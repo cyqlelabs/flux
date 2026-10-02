@@ -110,6 +110,10 @@ impl HardwareInventory {
                 g.pcie_width_max.unwrap_or(0)
             ));
         }
+        // The devices the backend can use: masking GPUs (e.g. CUDA_VISIBLE_DEVICES) is another topology.
+        for d in &self.backend_devices {
+            parts.push(format!("dev={}@{}", d.name, d.pci_bus_id.as_deref().unwrap_or("")));
+        }
         crate::fsutil::sha256_hex(parts.join("|").as_bytes())[..16].to_string()
     }
 
@@ -221,8 +225,17 @@ impl ProbeReport {
         self.copies.iter().find(|c| c.device == device && c.direction == direction && c.pinned == pinned && c.peer.is_none())
     }
 
-    /// Best measured CPU read bandwidth and the thread count that achieved it.
-    pub fn best_cpu_bandwidth(&self) -> Option<&CpuBandwidth> {
-        self.cpu_bandwidth.iter().max_by(|a, b| a.gbps.p50.total_cmp(&b.gbps.p50))
+    /// Decode CPU bandwidth and the thread count chosen for it (see `decode_threads`).
+    pub fn decode_cpu_bandwidth(&self) -> Option<&CpuBandwidth> {
+        decode_threads(&self.cpu_bandwidth, self.inventory.cpu.cores)
     }
+}
+
+/// The fewest threads, at most one per physical core, within 10% of the best bandwidth among them. Decode
+/// synchronizes every thread at each CPU operation, so threads past bandwidth saturation only add barrier
+/// cost, and SMT siblings stall the whole step when other processes want the cores.
+pub fn decode_threads(sweep: &[CpuBandwidth], cores: u32) -> Option<&CpuBandwidth> {
+    let within: Vec<&CpuBandwidth> = sweep.iter().filter(|b| b.threads <= cores).collect();
+    let best = within.iter().map(|b| b.gbps.p50).fold(0.0, f64::max);
+    within.into_iter().filter(|b| b.gbps.p50 >= 0.9 * best).min_by_key(|b| b.threads)
 }

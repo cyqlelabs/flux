@@ -1,7 +1,7 @@
 //! Safe wrapper over the flux-native C ABI. Only flux-worker links this crate, so native
 //! failures stay inside a worker process.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Result};
 use serde_json::Value;
 use std::ffi::{c_char, CStr, CString};
 use std::ptr::NonNull;
@@ -43,11 +43,17 @@ mod ffi {
         pub fn fx_trace(e: *mut Engine, req: *const c_char) -> *mut c_char;
         pub fn fx_route_stats(e: *mut Engine, req: *const c_char) -> *mut c_char;
         pub fn fx_seq_clear(e: *mut Engine, seq: i32);
+        pub fn fx_seq_checkpoint(e: *mut Engine, seq: i32) -> bool;
+        pub fn fx_seq_keep(e: *mut Engine, seq: i32, keep: i32) -> i32;
+        pub fn fx_spec_draft(e: *mut Engine, seq: i32, pos: i32, last: i32, n_max: i32, out: *mut i32) -> i32;
+        pub fn fx_spec_accept(e: *mut Engine, seq: i32, pos: i32, n_accepted: i32) -> bool;
 
         pub fn fx_sampler_new(e: *mut Engine, sampling: *const c_char) -> *mut Sampler;
         pub fn fx_sampler_free(s: *mut Sampler);
         pub fn fx_sampler_accept_prompt(s: *mut Sampler, token: i32);
         pub fn fx_sampler_sample(s: *mut Sampler, e: *mut Engine, idx: i32) -> i32;
+        pub fn fx_runner_up(e: *mut Engine, idx: i32, chosen: i32) -> i32;
+        pub fn fx_sampler_sample_draft(s: *mut Sampler, e: *mut Engine, row: i32, draft: *const i32, n_draft: i32, out: *mut i32) -> i32;
     }
 }
 
@@ -170,6 +176,8 @@ impl Engine {
             1 => bail!("no KV slot available for this batch (context full)"),
             2 => bail!("decode aborted"),
             -100 => bail!("batch larger than n_batch"),
+            -101 => bail!("the drafter failed to follow the decoded batch"),
+            -102 => bail!("llama_decode threw (see the worker log)"),
             rc => bail!("llama_decode failed with status {rc}"),
         }
     }
@@ -188,6 +196,39 @@ impl Engine {
 
     pub fn seq_clear(&mut self, seq: i32) {
         unsafe { ffi::fx_seq_clear(self.ptr.as_ptr(), seq) }
+    }
+
+    /// Saves the sequence's recurrent state at its current end, for prompt reuse.
+    pub fn seq_checkpoint(&mut self, seq: i32) -> bool {
+        unsafe { ffi::fx_seq_checkpoint(self.ptr.as_ptr(), seq) }
+    }
+
+    /// Keeps up to `keep` leading positions of the sequence; returns how many it could keep.
+    pub fn seq_keep(&mut self, seq: i32, keep: usize) -> usize {
+        unsafe { ffi::fx_seq_keep(self.ptr.as_ptr(), seq, keep as i32) }.max(0) as usize
+    }
+
+    /// The most likely token of a decoded row other than `chosen`.
+    pub fn runner_up(&mut self, row: i32, chosen: i32) -> Option<i32> {
+        let t = unsafe { ffi::fx_runner_up(self.ptr.as_ptr(), row, chosen) };
+        (t >= 0).then_some(t)
+    }
+
+    /// Up to `n_max` draft tokens following `last`, which sits at `pos` (engines planned with speculation).
+    pub fn spec_draft(&mut self, seq: i32, pos: i32, last: i32, n_max: usize) -> Vec<i32> {
+        let mut out = vec![0i32; n_max];
+        let n = unsafe { ffi::fx_spec_draft(self.ptr.as_ptr(), seq, pos, last, n_max as i32, out.as_mut_ptr()) };
+        out.truncate(n.max(0) as usize);
+        out
+    }
+
+    /// Drops the sequence from `pos` on after verification, telling the drafter how many drafts were kept.
+    pub fn spec_accept(&mut self, seq: i32, pos: i32, n_accepted: usize) -> Result<()> {
+        if unsafe { ffi::fx_spec_accept(self.ptr.as_ptr(), seq, pos, n_accepted as i32) } {
+            Ok(())
+        } else {
+            bail!("the backend could not roll the sequence back to position {pos}")
+        }
     }
 }
 
@@ -215,8 +256,21 @@ impl Sampler {
         unsafe { ffi::fx_sampler_accept_prompt(self.ptr.as_ptr(), token) }
     }
 
-    pub fn sample(&mut self, engine: &mut Engine, row: i32) -> i32 {
-        unsafe { ffi::fx_sampler_sample(self.ptr.as_ptr(), engine.ptr.as_ptr(), row) }
+    pub fn sample(&mut self, engine: &mut Engine, row: i32) -> Result<i32> {
+        match unsafe { ffi::fx_sampler_sample(self.ptr.as_ptr(), engine.ptr.as_ptr(), row) } {
+            t if t >= 0 => Ok(t),
+            _ => bail!("sampling failed (see worker log)"),
+        }
+    }
+
+    /// Samples rows `row..=row + draft.len()` against the draft, stopping at the first disagreement: the
+    /// accepted draft tokens followed by the next sampled token.
+    pub fn sample_draft(&mut self, engine: &mut Engine, row: i32, draft: &[i32]) -> Result<Vec<i32>> {
+        let mut out = vec![0i32; draft.len() + 1];
+        let n = unsafe { ffi::fx_sampler_sample_draft(self.ptr.as_ptr(), engine.ptr.as_ptr(), row, draft.as_ptr(), draft.len() as i32, out.as_mut_ptr()) };
+        ensure!(n > 0, "sampling failed (see worker log)");
+        out.truncate(n as usize);
+        Ok(out)
     }
 }
 

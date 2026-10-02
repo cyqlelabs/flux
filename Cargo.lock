@@ -534,7 +534,6 @@ dependencies = [
  "anyhow",
  "chrono",
  "flux-core",
- "flux-ingest",
  "flux-probe",
  "futures",
  "serde",

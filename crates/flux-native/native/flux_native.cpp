@@ -9,6 +9,7 @@
 #include "llama-ext.h"
 #include "llama.h"
 #include "sampling.h"
+#include "speculative.h"
 
 #include <nlohmann/json.hpp>
 
@@ -62,6 +63,15 @@ void ensure_init() {
 
 double now_us() {
     return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// The batch size from which the backend offloads host-weight ops to a GPU (GGML_OP_OFFLOAD_MIN_BATCH, default 32).
+int32_t op_offload_min_batch() {
+    static const int32_t n = [] {
+        const char * v = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
+        return v ? std::max(atoi(v), 1) : 32;
+    }();
+    return n;
 }
 
 ggml_backend_dev_t dev_by_name(const std::string & name) {
@@ -149,6 +159,7 @@ struct load_params {
             const std::string dev = o.at("device").get<std::string>();
             ggml_backend_buffer_type_t buft = dev == "CPU" ? ggml_backend_cpu_buffer_type() : ggml_backend_dev_buffer_type(dev_by_name(dev));
             overrides.push_back({patterns.back().c_str(), buft});
+            host_overrides |= dev == "CPU";
         }
         overrides.push_back({nullptr, nullptr});
         mp.tensor_buft_overrides = overrides.data();
@@ -170,8 +181,94 @@ struct load_params {
         cp.op_offload = j.value("op_offload", true);
         cp.kv_unified = j.value("kv_unified", false);
         cp.no_perf = false;
+
+        // Expert cache: per layer, the initial cached experts (the first `hot` of `order`).
+        const json ec = j.value("expert_cache", json());
+        if (ec.is_object()) {
+            for (const auto & l : ec.at("layers")) {
+                const int32_t hot = l.at(2).get<int32_t>();
+                cache_layers.push_back(l.at(0).get<int32_t>());
+                cache_slots.push_back(hot);
+                cache_offsets.push_back((int32_t) cache_experts.size());
+                for (int32_t k = 0; k < hot; k++) {
+                    cache_experts.push_back(l.at(1).at(k).get<int32_t>());
+                }
+            }
+            cache_offsets.push_back((int32_t) cache_experts.size());
+            // Tiers: experts another GPU serves for cached layers placed elsewhere.
+            for (const auto & t : ec.value("tiers", json::array())) {
+                tier_spec & ts = cache_tiers.emplace_back();
+                ts.device = t.at("device").get<std::string>();
+                for (const auto & l : t.at("layers")) {
+                    ts.layers.push_back(l.at(0).get<int32_t>());
+                    ts.offsets.push_back((int32_t) ts.experts.size());
+                    for (const auto & x : l.at(1)) {
+                        ts.experts.push_back(x.get<int32_t>());
+                    }
+                }
+                ts.offsets.push_back((int32_t) ts.experts.size());
+            }
+        }
+        cache_frozen = j.value("expert_cache_frozen", false);
+
+        // Speculation drafts with the model's own next-token heads; the target keeps one recurrent-state
+        // snapshot per draft token so a partly rejected draft rolls back without re-decoding.
+        const json sp = j.value("speculation", json());
+        if (sp.is_object()) {
+            if (sp.value("kind", std::string()) != "draft-mtp") {
+                throw std::runtime_error("the native engine drafts only with the model's next-token heads (draft-mtp)");
+            }
+            spec_n_max = sp.value("n_max", 3);
+            spec_draft_vocab = sp.value("draft_vocab", 0);
+            mp.load_mtp = true;
+            cp.n_rs_seq = (uint32_t) spec_n_max;
+        }
+        // A batch requests logits only for each decoding sequence's verification rows and a prompt's last
+        // token; reserving vocabulary-wide rows for every token of a prompt chunk would cost a GPU-sized slab.
+        cp.n_outputs_max = n_seq * (uint32_t) (spec_n_max + 1) + 1;
     }
+
+    int32_t spec_n_max = 0, spec_draft_vocab = 0;
+    bool host_overrides = false;
+    std::vector<int32_t> cache_layers, cache_offsets, cache_experts, cache_slots;
+    struct tier_spec {
+        std::string device;
+        std::vector<int32_t> layers, offsets, experts;
+    };
+    std::vector<tier_spec> cache_tiers;
+    bool cache_frozen = false;
 };
+
+// The next-token heads' draft context: same placement and threads as the target, MTP graph, no rollback
+// snapshots of its own. Its micro-batch only has to carry a prompt's hidden states through the heads after
+// prefill: 128 tokens take few passes while keeping its buffers small on the heads' GPU.
+llama_context_params draft_context_params(const llama_context_params & target, llama_context * ctx_tgt) {
+    llama_context_params dp = target;
+    dp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    dp.n_ctx = llama_n_ctx(ctx_tgt);
+    dp.n_rs_seq = 0;
+    dp.ctx_other = ctx_tgt;
+    dp.n_ubatch = std::min<uint32_t>(dp.n_ubatch, 128);
+    return dp;
+}
+
+// `draft_vocab` > 0 limits drafts to the first token ids (the plan measured that the model's output stays
+// there): the heads' output head over the rest would cost most of each draft step. Verification uses every id.
+llama_context * new_draft_context(llama_model * model, const llama_context_params & target, llama_context * ctx_tgt, int32_t draft_vocab) {
+    llama_context * ctx = llama_init_from_model(model, draft_context_params(target, ctx_tgt));
+    if (ctx && draft_vocab > 0) {
+        llama_set_draft_vocab(ctx, draft_vocab);
+    }
+    return ctx;
+}
+
+// Plans with host-resident weights (overridden tensors or CPU layers) stage the weights they offload and send
+// offloaded ops to the GPU with the fastest measured host link; upstream llama.cpp does neither by default.
+void tune_offload(llama_context * ctx, const load_params & p, const llama_model * model) {
+    if (p.host_overrides || p.mp.n_gpu_layers <= llama_model_n_layer(model)) {
+        llama_set_offload_tuning(ctx, true);
+    }
+}
 
 // Per-device totals of a context's buffers. Host-visible buffers (including CUDA pinned host) count as CPU.
 json memory_json(const llama_context * ctx) {
@@ -183,10 +280,11 @@ json memory_json(const llama_context * ctx) {
         t.model += mb.model;
         t.context += mb.context;
         t.compute += mb.compute;
+        t.staging += mb.staging;
     }
     json out = json::array();
     for (const auto & [name, t] : totals) {
-        out.push_back({{"device", name}, {"model", t.model}, {"context", t.context}, {"compute", t.compute}});
+        out.push_back({{"device", name}, {"model", t.model}, {"context", t.context}, {"compute", t.compute}, {"staging", t.staging}});
     }
     return out;
 }
@@ -500,8 +598,32 @@ struct fx_engine {
     common_chat_templates_ptr tmpls;
     llama_batch batch{};
     int32_t n_batch = 0;
+    // Speculation: the next-token heads run in their own context against the target's hidden states.
+    llama_context * ctx_dft = nullptr;
+    common_speculative * spec = nullptr;
+    int32_t spec_n_max = 0;
+    // Verification rounds, drafted and accepted tokens, and time spent drafting, verifying, sampling the
+    // verified rows and following the target (microseconds), logged periodically.
+    int64_t spec_rounds = 0, spec_drafted = 0, spec_accepted = 0, spec_draft_us = 0, spec_verify_us = 0, spec_sample_us = 0, spec_follow_us = 0;
+    int32_t n_threads = 0, n_threads_batch = 0;
+    // Recurrent state cannot be trimmed back to an arbitrary position, only restored from a checkpoint.
+    bool recurrent = false;
+    // An expert cache serves the plan's cached layers; its hit rate is logged every `cache_log_every` decodes.
+    bool cached = false;
+    int64_t decodes = 0;
+    static constexpr int64_t cache_log_every = 256;
+    // Prompt reuse: per sequence, the recurrent state saved at `n` positions.
+    struct checkpoint {
+        int32_t n = 0;
+        std::vector<uint8_t> data;
+        // The drafter's pending hidden state at the same position, so drafts after reuse pair with it.
+        std::vector<uint8_t> draft;
+    };
+    std::map<int32_t, checkpoint> checkpoints;
 
     ~fx_engine() {
+        if (spec) common_speculative_free(spec);
+        if (ctx_dft) llama_free(ctx_dft);
         if (batch.token) llama_batch_free(batch);
         if (ctx) llama_free(ctx);
         if (model) llama_model_free(model);
@@ -556,8 +678,33 @@ char * fx_measure(const char * params_json) {
             llama_model_free(model);
             return err_json("backend could not create a context with these parameters");
         }
+        tune_offload(ctx, p, model);
+        llama_context * ctx_dft = nullptr;
+        if (p.spec_n_max > 0) {
+            ctx_dft = new_draft_context(model, p.cp, ctx, p.spec_draft_vocab);
+            if (!ctx_dft) {
+                llama_free(ctx);
+                llama_model_free(model);
+                return err_json("backend could not create the draft context with these parameters");
+            }
+        }
+        json memory = memory_json(ctx);
+        if (ctx_dft) {
+            // The draft context shares the model's weights: add only its own cache and compute buffers.
+            for (const auto & d : memory_json(ctx_dft)) {
+                auto it = std::find_if(memory.begin(), memory.end(), [&](const json & m) { return m["device"] == d["device"]; });
+                if (it == memory.end()) {
+                    memory.push_back({{"device", d["device"]}, {"model", 0}, {"context", d["context"]}, {"compute", d["compute"]}});
+                    continue;
+                }
+                for (const char * k : {"context", "compute"}) {
+                    (*it)[k] = (*it)[k].get<uint64_t>() + d[k].get<uint64_t>();
+                }
+            }
+            llama_free(ctx_dft);
+        }
         json out = {
-            {"memory", memory_json(ctx)},
+            {"memory", memory},
             {"n_ctx", llama_n_ctx(ctx)},
             {"n_ctx_seq", llama_n_ctx_seq(ctx)},
             {"n_layer", llama_model_n_layer(model)},
@@ -755,13 +902,69 @@ fx_engine * fx_engine_load(const char * params_json, char ** error) {
             *error = dup("backend failed to create the context (insufficient memory?)");
             return nullptr;
         }
+        tune_offload(e->ctx, p, e->model);
         e->vocab = llama_model_get_vocab(e->model);
         e->tmpls = common_chat_templates_init(e->model, "");
         e->n_batch = (int32_t) llama_n_batch(e->ctx);
         e->batch = llama_batch_init(e->n_batch, 0, 1);
+        e->n_threads = p.cp.n_threads;
+        e->n_threads_batch = p.cp.n_threads_batch;
+        e->recurrent = llama_model_is_recurrent(e->model) || llama_model_is_hybrid(e->model);
+        if (!p.cache_layers.empty()) {
+            if (llama_moe_cache_init(e->ctx, (int32_t) p.cache_layers.size(), p.cache_layers.data(), p.cache_offsets.data(), p.cache_experts.data(),
+                                     p.cache_slots.data()) != 0) {
+                delete e;
+                *error = dup("backend failed to set up the expert cache (see worker log)");
+                return nullptr;
+            }
+            for (const auto & t : p.cache_tiers) {
+                if (llama_moe_cache_tier(e->ctx, t.device.c_str(), (int32_t) t.layers.size(), t.layers.data(), t.offsets.data(), t.experts.data()) != 0) {
+                    delete e;
+                    *error = dup(("backend failed to set up the expert tier on " + t.device + " (see worker log)").c_str());
+                    return nullptr;
+                }
+            }
+            if (p.cache_frozen) {
+                llama_moe_cache_freeze(e->ctx, true);
+            }
+            // Prompt uploads and the tiers reach full speed only once the host experts are page-locked: wait,
+            // so a loaded engine runs (and is measured) at its real speed from the first request.
+            llama_moe_cache_wait_pinned(e->ctx);
+            e->cached = true;
+        }
+        if (p.spec_n_max > 0) {
+            if (llama_model_n_layer_nextn(e->model) == 0) {
+                delete e;
+                *error = dup("speculation needs next-token heads, and the model has none");
+                return nullptr;
+            }
+            e->ctx_dft = new_draft_context(e->model, p.cp, e->ctx, p.spec_draft_vocab);
+            if (!e->ctx_dft) {
+                delete e;
+                *error = dup("backend failed to create the draft context (insufficient memory?)");
+                return nullptr;
+            }
+            common_params_speculative sp;
+            sp.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
+            sp.draft.n_max = p.spec_n_max;
+            // Always draft n_max tokens: a fixed verification batch keeps the target graph reused.
+            sp.draft.p_min = 0.0f;
+            sp.draft.ctx_tgt = e->ctx;
+            sp.draft.ctx_dft = e->ctx_dft;
+            e->spec = common_speculative_init(sp, llama_n_seq_max(e->ctx));
+            if (!e->spec) {
+                delete e;
+                *error = dup("backend failed to initialize drafting with the next-token heads");
+                return nullptr;
+            }
+            e->spec_n_max = p.spec_n_max;
+        }
         return e;
     } catch (const std::exception & ex) {
         *error = dup(ex.what());
+        return nullptr;
+    } catch (...) {
+        *error = dup("backend raised a non-standard exception while loading (see worker log)");
         return nullptr;
     }
 }
@@ -779,6 +982,8 @@ char * fx_engine_info(fx_engine * e) {
             {"n_batch", e->n_batch},
             {"n_vocab", llama_vocab_n_tokens(e->vocab)},
             {"add_bos", llama_vocab_get_add_bos(e->vocab)},
+            {"spec_n_max", e->spec_n_max},
+            {"recurrent", e->recurrent},
             {"memory", memory_json(e->ctx)},
         }.dump());
     } catch (const std::exception & ex) {
@@ -844,7 +1049,43 @@ int32_t fx_decode(fx_engine * e, int32_t n, const int32_t * tokens, const int32_
         e->batch.seq_id[i][0] = seq[i];
         e->batch.logits[i] = logits[i];
     }
-    return llama_decode(e->ctx, e->batch);
+    // Batches below the op-offload threshold (decode steps, draft verification) keep host work on the CPU
+    // like single-token decode, so they use the decode thread count; prompt chunks use the batch count.
+    const bool small = n < op_offload_min_batch();
+    llama_set_n_threads(e->ctx, e->n_threads, small ? e->n_threads : e->n_threads_batch);
+    const int64_t t_verify = ggml_time_us();
+    int32_t rc;
+    try {
+        rc = llama_decode(e->ctx, e->batch);
+    } catch (const std::exception & ex) {
+        fprintf(stderr, "decode failed: %s\n", ex.what());
+        return -102;
+    }
+    if (e->spec && small) {
+        // The drafter reads the target's hidden states next, so waiting here only moves the wait into this timer.
+        llama_synchronize(e->ctx);
+        e->spec_verify_us += ggml_time_us() - t_verify;
+    }
+    if (rc == 0 && e->cached && ++e->decodes % fx_engine::cache_log_every == 0) {
+        int64_t hits = 0, lookups = 0, swaps = 0;
+        llama_moe_cache_stats(e->ctx, &hits, &lookups, &swaps);
+        fprintf(stderr, "expert cache: %.1f%% of %lld selections served from GPU memory, %lld swaps\n", 100.0 * hits / std::max<int64_t>(lookups, 1),
+                (long long) lookups, (long long) swaps);
+    }
+    // The drafter consumes the target's hidden state for every decoded row, prompt included.
+    try {
+        const int64_t t0 = ggml_time_us();
+        if (rc == 0 && e->spec && !common_speculative_process(e->spec, e->batch)) {
+            return -101;
+        }
+        if (small) {
+            e->spec_follow_us += ggml_time_us() - t0;
+        }
+    } catch (const std::exception & ex) {
+        fprintf(stderr, "drafter failed: %s\n", ex.what());
+        return -101;
+    }
+    return rc;
 }
 
 char * fx_trace(fx_engine * e, const char * request_json) {
@@ -990,6 +1231,103 @@ char * fx_route_stats(fx_engine * e, const char * request_json) {
 
 void fx_seq_clear(fx_engine * e, int32_t seq) {
     llama_memory_seq_rm(llama_get_memory(e->ctx), seq, -1, -1);
+    if (e->ctx_dft) {
+        llama_memory_seq_rm(llama_get_memory(e->ctx_dft), seq, -1, -1);
+    }
+    e->checkpoints.erase(seq);
+}
+
+bool fx_seq_checkpoint(fx_engine * e, int32_t seq) {
+    try {
+        auto & c = e->checkpoints[seq];
+        c.data.resize(llama_state_seq_get_size_ext(e->ctx, seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+        c.n = llama_memory_seq_pos_max(llama_get_memory(e->ctx), seq) + 1;
+        if (llama_state_seq_get_data_ext(e->ctx, c.data.data(), c.data.size(), seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == c.data.size()) {
+            if (!e->spec || !common_speculative_get_state(e->spec, seq, c.draft)) {
+                c.draft.clear();
+            }
+            return true;
+        }
+        e->checkpoints.erase(seq);
+        return false;
+    } catch (const std::exception & ex) {
+        fprintf(stderr, "checkpoint failed: %s\n", ex.what());
+        e->checkpoints.erase(seq);
+        return false;
+    }
+}
+
+int32_t fx_seq_keep(fx_engine * e, int32_t seq, int32_t keep) {
+    llama_memory_t mem = llama_get_memory(e->ctx);
+    const int32_t end = llama_memory_seq_pos_max(mem, seq) + 1;
+    const auto trim_draft = [&](int32_t n) {
+        if (e->ctx_dft) {
+            llama_memory_seq_rm(llama_get_memory(e->ctx_dft), seq, n, -1);
+        }
+    };
+    if (keep >= end) {
+        return end;
+    }
+    // Attention caches trim anywhere. Recurrent rollback snapshots may predate the last step (a short
+    // final ubatch leaves deeper slots stale), so recurrent state comes back only from the checkpoint.
+    if (!e->recurrent && keep > 0 && llama_memory_seq_rm(mem, seq, keep, -1)) {
+        trim_draft(keep);
+        return keep;
+    }
+    const auto it = e->checkpoints.find(seq);
+    if (it != e->checkpoints.end() && it->second.n > 0 && it->second.n <= keep) {
+        const auto & c = it->second;
+        if (llama_state_seq_set_data_ext(e->ctx, c.data.data(), c.data.size(), seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == c.data.size() &&
+            llama_memory_seq_rm(mem, seq, c.n, -1)) {
+            trim_draft(c.n);
+            if (e->spec && !c.draft.empty()) {
+                common_speculative_set_state(e->spec, seq, c.draft);
+            }
+            return c.n;
+        }
+    }
+    fx_seq_clear(e, seq);
+    return 0;
+}
+
+int32_t fx_spec_draft(fx_engine * e, int32_t seq, int32_t pos, int32_t last, int32_t n_max, int32_t * out) {
+    static const llama_tokens no_prompt;
+    llama_tokens draft;
+    try {
+        const int64_t t0 = ggml_time_us();
+        common_speculative_get_draft_params(e->spec, seq) = {true, n_max, pos, last, &no_prompt, &draft};
+        common_speculative_draft(e->spec);
+        e->spec_draft_us += ggml_time_us() - t0;
+    } catch (const std::exception & ex) {
+        // Drafting is an optimization: a failed draft verifies nothing extra.
+        fprintf(stderr, "drafting failed: %s\n", ex.what());
+        draft.clear();
+    }
+    // Verification re-enters these positions with the target's hidden states.
+    llama_memory_seq_rm(llama_get_memory(e->ctx_dft), seq, pos, -1);
+    draft.resize(std::min<size_t>(draft.size(), (size_t) std::max(n_max, 0)));
+    e->spec_drafted += (int64_t) draft.size();
+    std::copy(draft.begin(), draft.end(), out);
+    return (int32_t) draft.size();
+}
+
+bool fx_spec_accept(fx_engine * e, int32_t seq, int32_t pos, int32_t n_accepted) {
+    try {
+        const bool ok = llama_memory_seq_rm(llama_get_memory(e->ctx), seq, pos, -1);
+        llama_memory_seq_rm(llama_get_memory(e->ctx_dft), seq, pos, -1);
+        common_speculative_accept(e->spec, seq, (uint16_t) n_accepted);
+        e->spec_accepted += n_accepted;
+        if (++e->spec_rounds % 64 == 0) {
+            fprintf(stderr, "speculation: %lld rounds, %lld of %lld drafts accepted (%.1f tokens per round), %.1f ms drafting, %.1f ms verifying, %.1f ms sampling and %.1f ms following per round\n",
+                    (long long) e->spec_rounds, (long long) e->spec_accepted, (long long) e->spec_drafted, 1.0 + (double) e->spec_accepted / (double) e->spec_rounds,
+                    e->spec_draft_us / 1e3 / e->spec_rounds, e->spec_verify_us / 1e3 / e->spec_rounds, e->spec_sample_us / 1e3 / e->spec_rounds,
+                    e->spec_follow_us / 1e3 / e->spec_rounds);
+        }
+        return ok;
+    } catch (const std::exception & ex) {
+        fprintf(stderr, "rollback failed: %s\n", ex.what());
+        return false;
+    }
 }
 
 fx_sampler * fx_sampler_new(fx_engine * e, const char * sampling_json) {
@@ -1034,9 +1372,45 @@ void fx_sampler_accept_prompt(fx_sampler * s, int32_t token) {
 }
 
 int32_t fx_sampler_sample(fx_sampler * s, fx_engine * e, int32_t idx) {
-    const llama_token t = common_sampler_sample(s->s, e->ctx, idx);
-    common_sampler_accept(s->s, t, true);
-    return t;
+    try {
+        const llama_token t = common_sampler_sample(s->s, e->ctx, idx);
+        common_sampler_accept(s->s, t, true);
+        return t;
+    } catch (const std::exception & ex) {
+        fprintf(stderr, "sampling failed: %s\n", ex.what());
+        return -1;
+    }
+}
+
+int32_t fx_runner_up(fx_engine * e, int32_t idx, int32_t chosen) {
+    const float * logits = llama_get_logits_ith(e->ctx, idx);
+    if (!logits) {
+        return -1;
+    }
+    int32_t best = -1;
+    for (int32_t t = 0, n = llama_vocab_n_tokens(e->vocab); t < n; t++) {
+        if (t != chosen && (best < 0 || logits[t] > logits[best])) {
+            best = t;
+        }
+    }
+    return best;
+}
+
+int32_t fx_sampler_sample_draft(fx_sampler * s, fx_engine * e, int32_t row, const int32_t * draft, int32_t n_draft, int32_t * out) {
+    try {
+        std::vector<int> idxs(n_draft + 1);
+        for (int32_t i = 0; i <= n_draft; i++) {
+            idxs[i] = row + i;
+        }
+        const int64_t t0 = ggml_time_us();
+        const auto ids = common_sampler_sample_and_accept_n(s->s, e->ctx, idxs, llama_tokens(draft, draft + n_draft));
+        e->spec_sample_us += ggml_time_us() - t0;
+        std::copy(ids.begin(), ids.end(), out);
+        return (int32_t) ids.size();
+    } catch (const std::exception & ex) {
+        fprintf(stderr, "sampling failed: %s\n", ex.what());
+        return -1;
+    }
 }
 
 } // extern "C"

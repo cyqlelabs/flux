@@ -415,6 +415,13 @@ pub(crate) mod tests {
             self.kv.push((k.into(), 5, v.to_le_bytes().to_vec()));
             self
         }
+        pub fn u32s(mut self, k: &str, vals: &[u32]) -> Self {
+            let mut b = 4u32.to_le_bytes().to_vec();
+            b.extend((vals.len() as u64).to_le_bytes());
+            vals.iter().for_each(|v| b.extend(v.to_le_bytes()));
+            self.kv.push((k.into(), 9, b));
+            self
+        }
         pub fn strs(mut self, k: &str, vals: &[&str]) -> Self {
             let mut b = 8u32.to_le_bytes().to_vec();
             b.extend((vals.len() as u64).to_le_bytes());

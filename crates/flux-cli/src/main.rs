@@ -75,7 +75,9 @@ enum Cmd {
         /// KV cache type; anything but f16 is a separately labelled quality profile.
         #[arg(long, default_value = "f16")]
         kv: String,
-        #[arg(long, default_value_t = 512)]
+        /// Largest prompt chunk to try. Each chunk streams host-resident experts to the GPU once, so a chunk
+        /// that holds the whole prompt reaches the first token sooner; smaller chunks are tried too.
+        #[arg(long, default_value_t = 1024)]
         ubatch: u32,
         #[arg(long, default_value_t = 512)]
         prompt_tokens: u32,
@@ -92,6 +94,10 @@ enum Cmd {
         /// Separate draft model for --speculation.
         #[arg(long)]
         draft_model: Option<PathBuf>,
+        /// Next-token (MTP) heads to graft onto the model: a GGUF of head blocks numbered after the trunk.
+        /// Implies --speculation.
+        #[arg(long)]
+        heads: Option<PathBuf>,
         /// Prune candidates that cannot reach this decode rate even optimistically.
         #[arg(long)]
         min_tps: Option<f64>,
@@ -194,6 +200,7 @@ async fn main() -> Result<()> {
             allow_storage_streaming,
             speculation,
             draft_model,
+            heads,
             min_tps,
             mlock,
             replan,
@@ -203,6 +210,11 @@ async fn main() -> Result<()> {
             if let Some(b) = budget_s {
                 cfg.plan.tuning_budget_s = b;
             }
+            let model = match &heads {
+                Some(h) => planning::graft_heads(&cfg, &model, h)?,
+                None => model,
+            };
+            let speculation = speculation || heads.is_some();
             let m = planning::inspect_hashed(&cfg, &model)?;
             let report = planning::probe_report(&cfg, Some(&m), false, reprobe).await?;
             if !replan {
@@ -259,7 +271,7 @@ async fn main() -> Result<()> {
                     p.workload.n_ctx_seq,
                     p.workload.concurrency,
                     p.placement.describe(),
-                    p.source_files()[0].file_name().unwrap_or_default().to_string_lossy()
+                    p.model_files[0].file_name().unwrap_or_default().to_string_lossy()
                 );
             }
         }

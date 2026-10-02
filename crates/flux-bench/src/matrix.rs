@@ -52,7 +52,7 @@ pub fn collect(cfg: &FluxConfig, extra_bench_dirs: &[&Path]) -> Vec<Row> {
             let soak = soaks.iter().filter(|(id, _)| id == &p.id).map(|(_, r)| r.pass).reduce(|a, b| a && b);
             Row {
                 architecture: p.architecture.clone(),
-                model: p.source_files()[0].file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
+                model: p.model_files[0].file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
                 engine: p.engine.to_string(),
                 topology: p.key.topology.clone(),
                 plan: p.id.clone(),

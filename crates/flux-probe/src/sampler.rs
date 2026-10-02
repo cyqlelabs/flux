@@ -128,9 +128,11 @@ mod tests {
     #[test]
     fn samples_own_process_tree() {
         let s = Sampler::start(&[], Some(std::process::id()), Duration::from_millis(5));
-        let _buf = vec![1u8; 32 << 20];
+        // black_box: an unused buffer may be optimized away in release builds.
+        let buf = std::hint::black_box(vec![1u8; 32 << 20]);
         std::thread::sleep(Duration::from_millis(30));
         let p = s.finish();
+        drop(std::hint::black_box(buf));
         assert!(p.tree_rss > 32 << 20, "{}", p.tree_rss);
     }
 }

@@ -30,6 +30,9 @@ pub struct Sampling {
     /// Bans end-of-generation tokens so benchmarks get exactly `max_tokens`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ignore_eos: Option<bool>,
+    /// Reports each undrafted token's runner-up (`Token.alt`), which certification compares against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runner_up: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -133,6 +136,10 @@ pub struct DeviceMemory {
     pub model: u64,
     pub context: u64,
     pub compute: u64,
+    /// The part of `compute` that stages op-offloaded expert weights during prefill; an expert cache at least
+    /// this large on the device holds it instead.
+    #[serde(default)]
+    pub staging: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -186,6 +193,9 @@ pub enum Event {
         token: i32,
         text: String,
         t_us: u64,
+        /// The runner-up of the row this token was sampled from (native engine, single-row steps).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        alt: Option<i32>,
     },
     /// One streamed chunk from a chat-level engine, relayed verbatim (OpenAI chat.completion.chunk).
     ChatChunk {

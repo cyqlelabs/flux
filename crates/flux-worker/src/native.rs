@@ -17,14 +17,19 @@ struct Seq {
     prefilled: usize,
     /// Next KV position to write.
     pos: i32,
+    /// Tokens written to the slot's KV, kept for prompt reuse when the sequence finishes.
+    kv: Vec<i32>,
     sampler: Sampler,
     max_tokens: u32,
     emitted: u32,
     credit: u32,
     /// Emitted token not yet written to the KV cache; fed by the next decode step.
     next: Option<i32>,
-    /// Sampled token waiting for credit.
+    /// Sampled token waiting for credit, and the runner-up of its row.
     held: Option<i32>,
+    held_alt: Option<i32>,
+    /// The request asked for runner-ups (a scan of the whole vocabulary per undrafted token).
+    runner_up: bool,
     text: TextStream,
     render_special: HashSet<i32>,
     t_start: Instant,
@@ -46,8 +51,14 @@ pub struct NativeWorker {
     engine: Option<Engine>,
     n_ctx_seq: u32,
     n_batch: usize,
+    /// Draft tokens per step when the plan speculates (0 otherwise).
+    spec_n_max: usize,
+    /// Recurrent state: prompt reuse restores it from a checkpoint taken before the last prompt token.
+    recurrent: bool,
     seqs: Vec<Seq>,
     free: Vec<i32>,
+    /// Tokens each idle slot still holds from its last request, reused by the next prompt sharing them.
+    cached: Vec<Vec<i32>>,
     start: Instant,
     steps: u64,
     prefilled: u64,
@@ -62,8 +73,11 @@ impl NativeWorker {
             engine: None,
             n_ctx_seq: 0,
             n_batch: 0,
+            spec_n_max: 0,
+            recurrent: false,
             seqs: vec![],
             free: vec![],
+            cached: vec![],
             start: Instant::now(),
             steps: 0,
             prefilled: 0,
@@ -159,8 +173,13 @@ impl NativeWorker {
                 if !self.seqs.is_empty() {
                     return self.error(None, Some(id), ErrorCode::Busy, "tracing needs an idle worker");
                 }
-                let req = serde_json::json!({"prompt": prompt, "steps": steps, "per_op": per_op, "seq": self.free.last().copied().unwrap_or(0)});
+                let seq = self.free.last().copied().unwrap_or(0);
+                let req = serde_json::json!({"prompt": prompt, "steps": steps, "per_op": per_op, "seq": seq});
                 let engine = self.engine.as_mut().unwrap();
+                engine.seq_clear(seq);
+                if let Some(c) = self.cached.get_mut(seq as usize) {
+                    c.clear();
+                }
                 match if routes { engine.route_stats(&req) } else { engine.trace(&req) } {
                     Ok(report) => self.out.send(&Event::Traced { id, report }),
                     Err(e) => self.error(None, Some(id), ErrorCode::Backend, e.to_string()),
@@ -176,9 +195,6 @@ impl NativeWorker {
             return self.error(None, None, ErrorCode::LoadFailed, "a model is already loaded; start a new worker");
         }
         let params = plan.backend_params();
-        if params.speculation.is_some() {
-            return self.error(None, None, ErrorCode::LoadFailed, "speculation is only planned for the llama-server engine");
-        }
         let t0 = Instant::now();
         let mut json = serde_json::to_value(&params).expect("params serialize");
         json["trace"] = trace.into();
@@ -187,8 +203,11 @@ impl NativeWorker {
                 let info = e.info().unwrap_or_default();
                 self.n_ctx_seq = info["n_ctx_seq"].as_u64().unwrap_or(params.n_ctx_seq as u64) as u32;
                 self.n_batch = info["n_batch"].as_u64().unwrap_or(params.n_batch as u64) as usize;
+                self.spec_n_max = info["spec_n_max"].as_u64().unwrap_or(0) as usize;
+                self.recurrent = info["recurrent"].as_bool().unwrap_or(false);
                 let n_seq = info["n_seq"].as_u64().unwrap_or(params.n_seq as u64) as u32;
                 self.free = (0..n_seq as i32).rev().collect();
+                self.cached = vec![vec![]; n_seq as usize];
                 self.engine = Some(e);
                 self.out.send(&Event::Loaded { load_ms: t0.elapsed().as_secs_f64() * 1e3, n_ctx_seq: self.n_ctx_seq, n_seq, memory: memory_of(&info) });
             }
@@ -211,10 +230,18 @@ impl NativeWorker {
                 format!("prompt ({}) + max_tokens ({max_tokens}) exceeds the planned context of {} per sequence", prompt.len(), self.n_ctx_seq),
             );
         }
-        let Some(slot) = self.free.pop() else {
+        // The idle slot holding the longest prefix of this prompt; at least the last prompt token is decoded
+        // again, since its logits pick the first output token.
+        let common = |c: &Vec<i32>| c.iter().zip(&prompt).take_while(|(a, b)| a == b).count().min(prompt.len() - 1);
+        let Some(at) = (0..self.free.len()).max_by_key(|&k| (common(&self.cached[self.free[k] as usize]), k)) else {
             return self.reject(&req, ErrorCode::Busy, "all planned sequences are in use");
         };
+        let slot = self.free.remove(at);
+        let reuse = common(&self.cached[slot as usize]);
+        let kept = self.engine.as_mut().unwrap().seq_keep(slot, reuse);
+        self.cached[slot as usize].clear();
         let engine = self.engine.as_ref().unwrap();
+        let runner_up = sampling.runner_up.unwrap_or(false);
         let mut sampler = match Sampler::new(engine, &serde_json::to_value(sampling).unwrap()) {
             Ok(s) => s,
             Err(e) => {
@@ -226,15 +253,18 @@ impl NativeWorker {
         self.seqs.push(Seq {
             req,
             slot,
+            kv: prompt[..kept].to_vec(),
             prompt,
-            prefilled: 0,
-            pos: 0,
+            prefilled: kept,
+            pos: kept as i32,
             sampler,
             max_tokens,
             emitted: 0,
             credit: 0,
             next: None,
             held: None,
+            held_alt: None,
+            runner_up,
             text: TextStream::new(stop),
             render_special: render_special.into_iter().collect(),
             t_start: Instant::now(),
@@ -244,15 +274,23 @@ impl NativeWorker {
 
     fn step(&mut self) {
         let (mut tokens, mut pos, mut seqid, mut logits) = (vec![], vec![], vec![], vec![]);
-        // (sequence index, batch row) pairs whose logits are sampled after the step.
-        let mut sample_rows: Vec<(usize, i32)> = vec![];
+        // (sequence index, batch row, draft) for the rows sampled after the step; the draft follows the row.
+        let mut sample_rows: Vec<(usize, i32, Vec<i32>)> = vec![];
         let mut decode_rows: Vec<usize> = vec![];
-        for (i, s) in self.seqs.iter().enumerate() {
-            if s.wants_decode() {
-                sample_rows.push((i, tokens.len() as i32));
-                decode_rows.push(i);
-                tokens.push(s.next.unwrap());
-                pos.push(s.pos);
+        for i in 0..self.seqs.len() {
+            if !self.seqs[i].wants_decode() {
+                continue;
+            }
+            let s = &self.seqs[i];
+            // Every drafted token must be emittable: within credit, max_tokens and the planned context.
+            let room = (s.credit as usize).min((s.max_tokens - s.emitted) as usize).min((self.n_ctx_seq as i32 - s.pos) as usize);
+            let n_draft = self.spec_n_max.min(room.saturating_sub(1));
+            let draft = if n_draft > 0 { self.engine.as_mut().unwrap().spec_draft(s.slot, s.pos, s.next.unwrap(), n_draft) } else { vec![] };
+            sample_rows.push((i, tokens.len() as i32, draft.clone()));
+            decode_rows.push(i);
+            for (k, &t) in std::iter::once(&s.next.unwrap()).chain(&draft).enumerate() {
+                tokens.push(t);
+                pos.push(s.pos + k as i32);
                 seqid.push(s.slot);
                 logits.push(1i8);
             }
@@ -262,7 +300,9 @@ impl NativeWorker {
         if budget > 0 {
             if let Some(i) = self.seqs.iter().position(|s| !s.prefill_done()) {
                 let s = &self.seqs[i];
-                let take = budget.min(s.prompt.len() - s.prefilled);
+                // Recurrent models stop one short of the end first: the state there is checkpointed for reuse.
+                let end = if self.recurrent && s.prefilled + 1 < s.prompt.len() { s.prompt.len() - 1 } else { s.prompt.len() };
+                let take = budget.min(end - s.prefilled);
                 for j in 0..take {
                     let p = s.prefilled + j;
                     tokens.push(s.prompt[p]);
@@ -271,7 +311,7 @@ impl NativeWorker {
                     logits.push((p + 1 == s.prompt.len()) as i8);
                 }
                 if s.prefilled + take == s.prompt.len() {
-                    sample_rows.push((i, tokens.len() as i32 - 1));
+                    sample_rows.push((i, tokens.len() as i32 - 1, vec![]));
                 }
                 chunk = Some((i, take));
             }
@@ -294,48 +334,82 @@ impl NativeWorker {
             return;
         }
         self.steps += 1;
-        self.decoded += decode_rows.len() as u64;
 
         for &i in &decode_rows {
             let s = &mut self.seqs[i];
             s.pos += 1;
-            s.next = None;
+            s.kv.extend(s.next.take());
         }
         if let Some((i, take)) = chunk {
             let s = &mut self.seqs[i];
+            s.kv.extend_from_slice(&s.prompt[s.prefilled..s.prefilled + take]);
             s.prefilled += take;
             s.pos = s.prefilled as i32;
             self.prefilled += take as u64;
+            if self.recurrent && s.prefilled + 1 == s.prompt.len() {
+                let slot = s.slot;
+                if !self.engine.as_mut().unwrap().seq_checkpoint(slot) {
+                    eprintln!("checkpoint of slot {slot} failed: its prompt will not be reused");
+                }
+            }
             if s.prefill_done() {
                 let ev = Event::Prefilled { req: s.req.clone(), n_prompt: s.prompt.len() as u32, ms: s.t_start.elapsed().as_secs_f64() * 1e3 };
                 self.out.send(&ev);
             }
         }
-        // Sample every row before any sequence finishes, so indices stay valid.
-        let sampled: Vec<(usize, i32)> = sample_rows
-            .iter()
-            .map(|&(i, row)| {
-                let engine = self.engine.as_mut().unwrap();
-                (i, self.seqs[i].sampler.sample(engine, row))
-            })
-            .collect();
+        // Sample every row before any sequence finishes, so indices stay valid. A drafted row keeps the
+        // accepted drafts plus the token sampled after them, and the sequence drops the rejected rest.
+        let mut sampled: Vec<(usize, Vec<i32>, Option<i32>)> = vec![];
+        let mut done: Vec<(usize, FinishReason)> = vec![];
+        for (i, row, draft) in sample_rows {
+            let engine = self.engine.as_mut().unwrap();
+            let s = &mut self.seqs[i];
+            let toks = match if draft.is_empty() { s.sampler.sample(engine, row).map(|t| vec![t]) } else { s.sampler.sample_draft(engine, row, &draft) } {
+                Ok(t) => t,
+                Err(e) => {
+                    let req = s.req.clone();
+                    self.error(Some(&req), None, ErrorCode::Backend, e.to_string());
+                    done.push((i, FinishReason::Error));
+                    continue;
+                }
+            };
+            if draft.is_empty() {
+                let alt = if s.runner_up { engine.runner_up(row, toks[0]) } else { None };
+                sampled.push((i, toks, alt));
+                continue;
+            }
+            // s.pos already moved past the verified row; accepted drafts extend the sequence.
+            s.pos += toks.len() as i32 - 1;
+            s.kv.extend_from_slice(&draft[..toks.len() - 1]);
+            if let Err(e) = engine.spec_accept(s.slot, s.pos, toks.len() - 1) {
+                let req = s.req.clone();
+                self.error(Some(&req), None, ErrorCode::Backend, e.to_string());
+                done.push((i, FinishReason::Error));
+                continue;
+            }
+            sampled.push((i, toks, None));
+        }
+        self.decoded += sampled.iter().filter(|(i, ..)| decode_rows.contains(i)).map(|(_, t, _)| t.len() as u64).sum::<u64>();
         self.step_ms.push_back(t0.elapsed().as_secs_f64() * 1e3);
         if self.step_ms.len() > 1024 {
             self.step_ms.pop_front();
         }
-        let mut done: Vec<(usize, FinishReason)> = vec![];
-        for (i, tok) in sampled {
-            if self.engine.as_ref().unwrap().is_eog(tok) {
-                // Counted like llama-server's tokens_predicted: the step that sampled it was real work.
-                let s = &mut self.seqs[i];
-                s.emitted += 1;
-                let t_us = self.start.elapsed().as_micros() as u64;
-                self.out.send(&Event::Token { req: s.req.clone(), i: s.emitted - 1, token: tok, text: String::new(), t_us });
-                done.push((i, FinishReason::Eog));
-            } else {
+        for (i, toks, alt) in sampled {
+            for tok in toks {
+                if self.engine.as_ref().unwrap().is_eog(tok) {
+                    // Counted like llama-server's tokens_predicted: the step that sampled it was real work.
+                    let s = &mut self.seqs[i];
+                    s.emitted += 1;
+                    let t_us = self.start.elapsed().as_micros() as u64;
+                    self.out.send(&Event::Token { req: s.req.clone(), i: s.emitted - 1, token: tok, text: String::new(), t_us, alt });
+                    done.push((i, FinishReason::Eog));
+                    break;
+                }
                 self.seqs[i].held = Some(tok);
+                self.seqs[i].held_alt = alt;
                 if let Some(r) = self.emit_one(i) {
                     done.push((i, r));
+                    break;
                 }
             }
         }
@@ -367,7 +441,7 @@ impl NativeWorker {
             Pushed::Text(t) => (t, false),
             Pushed::Stop(t) => (t, true),
         };
-        self.out.send(&Event::Token { req: s.req.clone(), i: s.emitted - 1, token: tok, text, t_us });
+        self.out.send(&Event::Token { req: s.req.clone(), i: s.emitted - 1, token: tok, text, t_us, alt: s.held_alt.take() });
         if stopped {
             Some(FinishReason::Stop)
         } else if s.emitted >= s.max_tokens {
@@ -391,7 +465,12 @@ impl NativeWorker {
         let mut s = self.seqs.remove(i);
         let tail = if reason == FinishReason::Stop { String::new() } else { s.text.finish() };
         self.out.send(&Event::Finished { req: s.req.clone(), reason, n_prompt: s.prompt.len() as u32, n_decoded: s.emitted, tail });
-        self.engine.as_mut().unwrap().seq_clear(s.slot);
+        // A failed step may leave the cache inconsistent with the tokens; anything else is kept for reuse.
+        if reason == FinishReason::Error {
+            self.engine.as_mut().unwrap().seq_clear(s.slot);
+        } else {
+            self.cached[s.slot as usize] = std::mem::take(&mut s.kv);
+        }
         self.free.push(s.slot);
     }
 

@@ -28,7 +28,8 @@ pub struct FluxConfig {
 #[serde(default)]
 pub struct PlanConfig {
     pub tuning_budget_s: f64,
-    /// Device memory held back per GPU beyond the backend's own accounting.
+    /// Device memory held back per GPU beyond the backend's own accounting: the CUDA context, cuBLAS
+    /// workspace, the temporary-buffer pool and graph instances (about 240 MiB measured). See `device_reserve`.
     pub device_reserve_mib: u64,
     /// Host memory left for the OS and other processes.
     pub host_reserve_mib: u64,
@@ -96,6 +97,14 @@ impl Default for FluxConfig {
             serve: ServeConfig::default(),
             engines: BTreeMap::new(),
         }
+    }
+}
+
+impl PlanConfig {
+    /// Bytes a plan leaves free on `dev`: `device_reserve_mib`, plus a quarter of what other processes held
+    /// there at plan time, for their growth afterwards (a desktop's GPU drifts by over 100 MiB).
+    pub fn device_reserve(&self, dev: &crate::hardware::BackendDevice) -> u64 {
+        (self.device_reserve_mib << 20) + dev.mem_total.saturating_sub(dev.mem_free) / 4
     }
 }
 

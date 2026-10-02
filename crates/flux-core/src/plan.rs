@@ -151,6 +151,10 @@ pub struct Speculation {
     pub kind: String,
     pub draft_model: Option<PathBuf>,
     pub n_max: u32,
+    /// The next-token heads draft only from token ids below this, which cuts the cost of their output head.
+    /// None drafts from the whole vocabulary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_vocab: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -253,6 +257,16 @@ pub struct CandidateResult {
     pub calibration: Option<Measurement>,
     pub validation: Option<Measurement>,
     pub failure: Option<String>,
+    /// What the candidate ran, so it can be served or measured again: its expert cache, placement,
+    /// micro-batch and drafting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expert_cache: Option<SplitSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<Placement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_ubatch: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculation: Option<Speculation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -279,6 +293,16 @@ pub enum QualityProfile {
 pub struct SplitSpec {
     #[serde(with = "layer_list")]
     pub layers: BTreeMap<u32, (Vec<u32>, u32)>,
+    /// Experts other GPUs serve for layers placed elsewhere, beyond those layers' own hot experts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tiers: Vec<Tier>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Tier {
+    pub device: String,
+    /// A list of `[layer, [experts]]`.
+    pub layers: Vec<(u32, Vec<u32>)>,
 }
 
 /// A list of `[layer, [order], hot]`: integer map keys do not survive the protocol's tagged enums.
@@ -297,23 +321,20 @@ mod layer_list {
     }
 }
 
-impl SplitSpec {
-    pub fn digest(&self) -> String {
-        crate::fsutil::sha256_hex(serde_json::to_string(self).expect("spec serializes").as_bytes())[..16].to_string()
-    }
-}
-
-/// Per-expert residency: the plan runs a relabeled copy of the model (`model_files`) whose most-routed
-/// experts stay with their block's GPU while the rest stay in host memory.
+/// Per-expert residency: the expert tensors of `spec`'s layers stay in host memory while a GPU cache next
+/// to each layer holds its most-routed experts. `spec` gives each layer's initial cached experts (the first
+/// `hot` of its order); the backend adapts them to the traffic while decoding.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ExpertSplit {
-    pub source: Vec<PathBuf>,
+pub struct ExpertCache {
     pub spec: SplitSpec,
     pub hot_experts: u32,
-    /// Share of routed selections on calibration prompts served from GPU memory, with this split and
+    /// Share of routed selections on calibration prompts served from GPU memory, with the initial cache and
     /// with whole expert tensors in the same memory.
     pub gpu_served: f64,
     pub gpu_served_by_tensors: f64,
+    /// Keeps residency fixed: certification and quality gates need reproducible runs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub frozen: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -334,15 +355,10 @@ pub struct Plan {
     pub decisions: Vec<Decision>,
     pub validation: Option<ValidationRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expert_split: Option<ExpertSplit>,
+    pub expert_cache: Option<ExpertCache>,
 }
 
 impl Plan {
-    /// The supplied artifact: what baselines and quality references run, even when the plan runs a split copy.
-    pub fn source_files(&self) -> &[PathBuf] {
-        self.expert_split.as_ref().map_or(&self.model_files, |s| &s.source)
-    }
-
     pub fn backend_params(&self) -> crate::backend::BackendParams {
         let (p, r) = (&self.placement, &self.runtime);
         crate::backend::BackendParams {
@@ -366,6 +382,8 @@ impl Plan {
             op_offload: r.op_offload,
             kv_unified: false,
             speculation: r.speculation.clone(),
+            expert_cache: self.expert_cache.as_ref().map(|c| c.spec.clone()),
+            expert_cache_frozen: self.expert_cache.as_ref().is_some_and(|c| c.frozen),
         }
     }
 

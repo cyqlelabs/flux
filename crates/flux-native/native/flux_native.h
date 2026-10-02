@@ -43,7 +43,8 @@ bool fx_is_eog(fx_engine * e, int32_t token);
 // {"messages":[...],"tools":[...]?,"add_generation_prompt":bool} -> {"prompt","preserved_tokens":[ids],"additional_stops":[...]}
 char * fx_apply_template(fx_engine * e, const char * request_json);
 
-// One llama_decode over n tokens; returns llama_decode's status (0 = ok).
+// One llama_decode over n tokens; returns llama_decode's status (0 = ok), -100 for a batch over n_batch,
+// -101 when the drafter fails to follow it, -102 when llama_decode throws.
 int32_t fx_decode(fx_engine * e, int32_t n, const int32_t * tokens, const int32_t * pos, const int32_t * seq, const int8_t * logits);
 // Time attribution of decode steps per device and op (engine loaded with "trace": true).
 // {"prompt":[ids],"steps":N,"seq":0} -> {"plain_step_us":[...],"traced_step_us":[...],"ops":[{"device","op","us","count"}],...}
@@ -52,6 +53,18 @@ char * fx_trace(fx_engine * e, const char * request_json);
 // (engine loaded with "trace": true): {"prefill":{layer:[count per expert]},"decode":{...}}.
 char * fx_route_stats(fx_engine * e, const char * request_json);
 void fx_seq_clear(fx_engine * e, int32_t seq);
+// Prompt reuse. Saves the sequence's recurrent state at its current end (one checkpoint per sequence).
+bool fx_seq_checkpoint(fx_engine * e, int32_t seq);
+// Keeps the sequence's first `keep` positions where its state can be recovered: by trimming (attention-only
+// models) or from the checkpoint (recurrent models), else not at all. Returns how many it kept.
+int32_t fx_seq_keep(fx_engine * e, int32_t seq, int32_t keep);
+
+// Speculation (engines loaded with a draft-mtp plan). Drafts up to n_max tokens after `last`, which sits at
+// `pos`; returns how many were written to out.
+int32_t fx_spec_draft(fx_engine * e, int32_t seq, int32_t pos, int32_t last, int32_t n_max, int32_t * out);
+// After verification: drops the sequence from `pos` on (target and drafter) and tells the drafter how many
+// draft tokens the target accepted. False when the target could not roll back.
+bool fx_spec_accept(fx_engine * e, int32_t seq, int32_t pos, int32_t n_accepted);
 
 // Sampling chain identical to llama-server's for the same settings.
 fx_sampler * fx_sampler_new(fx_engine * e, const char * sampling_json);
@@ -60,6 +73,11 @@ void fx_sampler_free(fx_sampler * s);
 void fx_sampler_accept_prompt(fx_sampler * s, int32_t token);
 // Samples from the logits of batch row `idx` and accepts the result.
 int32_t fx_sampler_sample(fx_sampler * s, fx_engine * e, int32_t idx);
+// The most likely token of row idx other than `chosen` (by raw logits), or -1.
+int32_t fx_runner_up(fx_engine * e, int32_t idx, int32_t chosen);
+// Samples rows row..row+n_draft against the draft, stopping at the first disagreement; returns the accepted
+// draft tokens plus the token sampled after them (1..n_draft+1), written to out, or -1 when sampling fails.
+int32_t fx_sampler_sample_draft(fx_sampler * s, fx_engine * e, int32_t row, const int32_t * draft, int32_t n_draft, int32_t * out);
 
 #ifdef __cplusplus
 }

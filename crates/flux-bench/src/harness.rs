@@ -118,7 +118,7 @@ pub async fn build_prompts(
 pub struct CellRun<'a> {
     pub cfg: &'a FluxConfig,
     pub model_files: &'a [PathBuf],
-    /// Every file a contestant reads (the model, and a plan's split checkpoint): evicted before each run.
+    /// Every file a contestant reads (the model files): evicted before each run.
     pub cold_files: &'a [PathBuf],
     pub cell: Cell,
     pub contestants: &'a [Contestant],
