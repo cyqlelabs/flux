@@ -2,7 +2,7 @@
 
 Flux is a measured execution planner and runtime for LLM inference. It measures your machine, searches placements of a model's layers and mixture-of-experts weights across GPUs and host memory, times the fastest candidates on real prompts, and saves the winner as an immutable plan. `flux serve` then runs that plan behind an OpenAI-compatible API.
 
-Cost models only rank and prune candidates; Flux always saves the plan that measured fastest. It runs on a pinned, patched build of [llama.cpp](https://github.com/ggml-org/llama.cpp) and can also plan for `llama-server` or any OpenAI-compatible engine you configure. The original design is in [`Flux_Inference_Proposal.pdf`](Flux_Inference_Proposal.pdf).
+Cost models only rank and prune candidates; Flux always saves the plan that measured fastest. It runs on a pinned, patched build of [llama.cpp](https://github.com/ggml-org/llama.cpp) and can also plan for `llama-server` or any OpenAI-compatible engine you configure.
 
 ```mermaid
 flowchart LR
