@@ -5,7 +5,7 @@ use crate::experts::Routes;
 use crate::layers::{layout, Layout};
 use crate::params::{backend_mapping, placement};
 use crate::run::{bench_sampling, chat_prompt, run_all, summarize, RunSummary};
-use crate::search::{prefill_s, search, Assignment, SearchInput};
+use crate::search::{prefill_s, search, units, Assignment, SearchInput};
 use anyhow::{bail, ensure, Context, Result};
 use flux_core::backend::BackendParams;
 use flux_core::config::FluxConfig;
@@ -151,20 +151,88 @@ fn total(m: &[DeviceMemory], dev: &str) -> u64 {
     m.iter().filter(|d| d.device == dev).map(|d| d.model + d.context + d.compute).sum()
 }
 
-fn ordered_subsets(gpus: &[String]) -> Vec<Vec<String>> {
+/// GPU orders past this many are cut down to the ones the finalists are drawn from.
+const MAX_ORDERS: usize = 128;
+
+/// What the placement search can tell apart about a GPU.
+struct GpuTraits {
+    name: String,
+    /// Description and total memory.
+    model: (String, u64),
+    /// Bytes for weights and state, per prompt chunk size.
+    capacity: Vec<u64>,
+    /// Seconds to upload 64 MiB from pinned host memory.
+    upload_s: f64,
+}
+
+impl GpuTraits {
+    /// Same model, room within one search quantum, and host links within 20%: an x4 slot differs from
+    /// an x16 one, measurement noise does not. Kernel rates and peer links are left out because their
+    /// noise would split identical cards.
+    fn interchangeable(&self, o: &GpuTraits) -> bool {
+        self.model == o.model
+            && self.capacity.iter().zip(&o.capacity).all(|(&a, &b)| units(a).abs_diff(units(b)) <= 1)
+            && (self.upload_s - o.upload_s).abs() <= 0.2 * self.upload_s.max(o.upload_s)
+    }
+}
+
+/// Groups GPUs the search cannot tell apart; every member of a class is interchangeable with every
+/// other. Classes and their members are listed by room, most first.
+fn gpu_classes(mut gpus: Vec<GpuTraits>) -> Vec<Vec<String>> {
+    gpus.sort_by(|a, b| b.capacity.first().cmp(&a.capacity.first()).then_with(|| a.name.cmp(&b.name)));
+    let mut classes: Vec<Vec<GpuTraits>> = vec![];
+    for g in gpus {
+        match classes.iter_mut().find(|c| c.iter().all(|m| m.interchangeable(&g))) {
+            Some(c) => c.push(g),
+            None => classes.push(vec![g]),
+        }
+    }
+    classes.into_iter().map(|c| c.into_iter().map(|g| g.name).collect()).collect()
+}
+
+/// GPU orders for the placement search: every ordered subset, taking the GPUs of a class in class
+/// order so that mirror-image orders are searched once; past `MAX_ORDERS`, the `capped_orders`.
+fn gpu_orders(classes: &[Vec<String>]) -> Vec<Vec<String>> {
+    let named = |o: &[usize]| -> Vec<String> {
+        let mut used = vec![0; classes.len()];
+        o.iter()
+            .map(|&c| {
+                used[c] += 1;
+                classes[c][used[c] - 1].clone()
+            })
+            .collect()
+    };
     let mut out = vec![vec![]];
-    let mut frontier: Vec<Vec<String>> = vec![vec![]];
-    while !frontier.is_empty() {
+    let mut frontier: Vec<Vec<usize>> = vec![vec![]];
+    while !frontier.is_empty() && out.len() <= MAX_ORDERS {
         let mut next = vec![];
         for o in &frontier {
-            for g in gpus.iter().filter(|g| !o.contains(g)) {
-                let mut x = o.clone();
-                x.push(g.clone());
-                next.push(x);
+            for (c, members) in classes.iter().enumerate() {
+                if o.iter().filter(|&&x| x == c).count() < members.len() {
+                    let mut x = o.clone();
+                    x.push(c);
+                    next.push(x);
+                }
             }
         }
-        out.extend(next.iter().cloned());
+        out.extend(next.iter().map(|o| named(o)));
         frontier = next;
+    }
+    if out.len() <= MAX_ORDERS {
+        out
+    } else {
+        capped_orders(classes)
+    }
+}
+
+/// CPU only, each class's first GPU alone, and each class ahead of the others. The search may skip
+/// any GPU of an order, so this loses candidate variety, not placements.
+fn capped_orders(classes: &[Vec<String>]) -> Vec<Vec<String>> {
+    let mut out = vec![vec![]];
+    out.extend(classes.iter().map(|c| vec![c[0].clone()]));
+    for i in 0..classes.len() {
+        let rest = classes.iter().enumerate().filter(|&(j, _)| j != i).flat_map(|(_, c)| c);
+        out.push(classes[i].iter().chain(rest).cloned().collect());
     }
     out
 }
@@ -292,11 +360,24 @@ pub async fn plan(
     let disk_gbps = report.storage.iter().filter(|s| s.direct_io).map(|s| s.gbps.p50).fold(0.0, f64::max);
 
     // Enumerate placements per GPU order, verify the best with the backend, repair overflows.
-    let gpu_names: Vec<String> = gpus.iter().map(|g| g.name.clone()).collect();
+    let classes = gpu_classes(
+        gpus.iter()
+            .map(|g| GpuTraits {
+                name: g.name.clone(),
+                model: (g.description.clone(), g.mem_total),
+                capacity: ubatches.iter().map(|&ub| capacity_for(ub)[&g.name]).collect(),
+                upload_s: cost.copy_s(CPU, &g.name, 64 << 20),
+            })
+            .collect(),
+    );
+    let orders = gpu_orders(&classes);
+    if !classes.is_empty() {
+        log(&format!("searching {} GPU orders over {}", orders.len(), classes.iter().map(|c| c.join("=")).collect::<Vec<_>>().join(", ")));
+    }
     let mut cands: Vec<Candidate> = vec![];
     let mut rejected: Vec<String> = vec![];
     let mut seen = vec![];
-    for (&ub, order) in ubatches.iter().flat_map(|ub| ordered_subsets(&gpu_names).into_iter().map(move |o| (ub, o))) {
+    for (&ub, order) in ubatches.iter().flat_map(|ub| orders.iter().cloned().map(move |o| (ub, o))) {
         let shape = Shape { ubatch: ub, ..shape };
         let host_compute = host_compute.get(&ub).copied().unwrap_or(0);
         let mut caps = capacity_for(ub);
@@ -1399,10 +1480,93 @@ mod tests {
         assert_eq!(total(&a, "CUDA1"), 100 + 10);
     }
 
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn singletons(n: usize) -> Vec<Vec<String>> {
+        (0..n).map(|i| vec![format!("G{i}")]).collect()
+    }
+
     #[test]
     fn orders_cover_every_subset_permutation() {
-        let o = ordered_subsets(&["A".into(), "B".into()]);
+        let o = gpu_orders(&singletons(2));
         assert_eq!(o.len(), 5, "{o:?}");
-        assert!(o.contains(&vec![]) && o.contains(&vec!["B".into(), "A".into()]));
+        assert!(o.contains(&vec![]) && o.contains(&names(&["G1", "G0"])));
+        assert_eq!(gpu_orders(&singletons(4)).len(), 65);
+    }
+
+    #[test]
+    fn interchangeable_gpus_are_taken_in_class_order() {
+        let o = gpu_orders(&[names(&["A1", "A2", "A3"])]);
+        assert_eq!(o, vec![vec![], names(&["A1"]), names(&["A1", "A2"]), names(&["A1", "A2", "A3"])]);
+        let eight: Vec<String> = (0..8).map(|i| format!("CUDA{i}")).collect();
+        assert_eq!(gpu_orders(&[eight]).len(), 9);
+    }
+
+    #[test]
+    fn mixed_classes_search_mirror_images_once() {
+        let o = gpu_orders(&[names(&["A1", "A2"]), names(&["B"])]);
+        assert_eq!(o.len(), 9, "{o:?}");
+        assert!(o.contains(&names(&["A1", "B", "A2"])) && o.contains(&names(&["B", "A1", "A2"])));
+        let pos = |x: &Vec<String>, g: &str| x.iter().position(|n| n == g);
+        assert!(o.iter().all(|x| pos(x, "A2").is_none_or(|p2| pos(x, "A1").is_some_and(|p1| p1 < p2))), "{o:?}");
+    }
+
+    #[test]
+    fn many_distinct_gpus_are_capped() {
+        let classes = singletons(5);
+        let o = gpu_orders(&classes);
+        assert_eq!(o.len(), 1 + 5 + 5, "{o:?}");
+        assert!(o.contains(&vec![]));
+        assert!(classes.iter().all(|c| o.contains(c)));
+        let full: Vec<&Vec<String>> = o.iter().filter(|x| x.len() == 5).collect();
+        assert_eq!(full.len(), 5);
+        assert_eq!(*full[2], names(&["G2", "G0", "G1", "G3", "G4"]));
+        let eight = gpu_orders(&singletons(8));
+        assert_eq!(eight.len(), 1 + 8 + 8);
+    }
+
+    #[test]
+    fn capped_orders_keep_classes_together() {
+        let classes: Vec<Vec<String>> = ["A", "B", "C", "D"].iter().map(|c| vec![format!("{c}1"), format!("{c}2")]).collect();
+        let o = gpu_orders(&classes);
+        assert_eq!(o.len(), 1 + 4 + 4, "{o:?}");
+        assert!(o.contains(&names(&["B1"])) && !o.contains(&names(&["B2"])));
+        assert!(o.contains(&names(&["B1", "B2", "A1", "A2", "C1", "C2", "D1", "D2"])));
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    fn traits(name: &str, model: &str, capacity: u64, upload_s: f64) -> GpuTraits {
+        GpuTraits { name: name.into(), model: (model.into(), 24 * GIB), capacity: vec![capacity, capacity + GIB], upload_s }
+    }
+
+    #[test]
+    fn identical_gpus_form_one_class_with_most_room_first() {
+        // 8 MiB more room rounds to one more search quantum; 8% slower uploads are probe noise.
+        let c = gpu_classes(vec![traits("CUDA0", "RTX 3090", 20 * GIB, 5.0e-3), traits("CUDA1", "RTX 3090", 20 * GIB + (8 << 20), 5.4e-3)]);
+        assert_eq!(c, vec![names(&["CUDA1", "CUDA0"])]);
+    }
+
+    #[test]
+    fn gpus_differing_in_room_model_or_link_stay_apart() {
+        let classes = |other: GpuTraits| gpu_classes(vec![traits("CUDA0", "RTX 3090", 20 * GIB, 5.0e-3), other]);
+        // A desktop display holding 40 MiB, an x4 slot, a different card.
+        assert_eq!(classes(traits("CUDA1", "RTX 3090", 20 * GIB - (40 << 20), 5.0e-3)), vec![names(&["CUDA0"]), names(&["CUDA1"])]);
+        assert_eq!(classes(traits("CUDA1", "RTX 3090", 20 * GIB, 15.0e-3)).len(), 2);
+        assert_eq!(classes(traits("CUDA1", "RTX 4090", 20 * GIB, 5.0e-3)).len(), 2);
+    }
+
+    #[test]
+    fn classes_hold_only_mutually_interchangeable_gpus() {
+        // Each neighbour is within a quantum of the next, but the ends are two apart.
+        let q = 16u64 << 20;
+        let c = gpu_classes(vec![
+            traits("CUDA0", "RTX 3090", 20 * GIB, 5.0e-3),
+            traits("CUDA1", "RTX 3090", 20 * GIB + q, 5.0e-3),
+            traits("CUDA2", "RTX 3090", 20 * GIB + 2 * q, 5.0e-3),
+        ]);
+        assert_eq!(c, vec![names(&["CUDA2", "CUDA1"]), names(&["CUDA0"])]);
     }
 }

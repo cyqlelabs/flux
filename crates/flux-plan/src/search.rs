@@ -40,7 +40,7 @@ pub struct Assignment {
     pub bytes: BTreeMap<String, u64>,
 }
 
-fn units(b: u64) -> usize {
+pub(crate) fn units(b: u64) -> usize {
     (b.saturating_add(QUANTUM / 2) / QUANTUM) as usize
 }
 
@@ -359,6 +359,25 @@ pub(crate) mod tests {
             shape: shape(),
             order: vec!["CUDA0".into(), "CUDA1".into()],
             capacity: HashMap::from([("CUDA0".into(), 12 * GB), ("CUDA1".into(), 6 * GB)]),
+            host_experts: false,
+            host_capacity: None,
+        };
+        let a = search(&inp).unwrap();
+        assert!(a.layer_device.iter().all(|d| d == "CUDA0"), "{:?}", a.layer_device);
+        assert_eq!(a.devices, vec!["CUDA0"]);
+    }
+
+    #[test]
+    fn skips_gpus_anywhere_in_the_order() {
+        // The planner's cap on GPU orders relies on an order also covering its subsequences.
+        let l = layout(28, GB / 4, 0);
+        let c = cost();
+        let inp = SearchInput {
+            layout: &l,
+            cost: &c,
+            shape: shape(),
+            order: vec!["CUDA1".into(), "CUDA0".into()],
+            capacity: HashMap::from([("CUDA0".into(), 12 * GB), ("CUDA1".into(), 12 * GB)]),
             host_experts: false,
             host_capacity: None,
         };
