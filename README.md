@@ -1,6 +1,6 @@
 # Flux
 
-Flux is a measured execution planner and runtime for LLM inference. It measures your machine, searches placements of a model's layers and mixture-of-experts weights across GPUs and host memory, times the fastest candidates on real prompts, and saves the winner as an immutable plan. `flux serve` then runs that plan behind an OpenAI-compatible API.
+Flux is a measured execution planner and runtime for LLM inference. It measures your GPUs and CPU, searches placements of a model's layers and mixture-of-experts weights across them, times the fastest candidates on real prompts, and saves the winner as an immutable plan. `flux serve` then runs that plan behind an OpenAI-compatible API.
 
 Cost models only rank and prune candidates; Flux always saves the plan that measured fastest. It runs on a pinned, patched build of [llama.cpp](https://github.com/ggml-org/llama.cpp) and can also plan for `llama-server` or any OpenAI-compatible engine you configure.
 
@@ -13,6 +13,17 @@ flowchart LR
     S --> SV["serve<br/>OpenAI API"]
     S --> B["bench<br/>speed, quality, soak"]
 ```
+
+## Compared with hand-tuned engines
+
+| | Flux | Hand-tuned single-model engines |
+|---|---|---|
+| Models | Any of the 148 architectures the pinned llama.cpp implements | The one model they were tuned for |
+| CPU's share of the work | Measured on your machine: RAM bandwidth per thread count and the model's own kernels | Fixed constants; an optional calibration run adjusts a few of them |
+| Layer and expert placement | Searched across the CPU and GPUs; the finalists are timed on real prompts | Fixed rules decide each token's split |
+| Several GPUs | Splits layers across GPUs and caches experts on them, in the same plan | A layer split or extra expert caches, one at a time |
+| Engine | Compares its native engine, `llama-server`, and any engine you register, then keeps the fastest | One engine |
+| Changes while serving | Watches decode speed and can replan in place | Calibration runs only when you start it |
 
 ## Requirements
 
@@ -35,6 +46,17 @@ Flux runs any GGUF file whose `general.architecture` the pinned llama.cpp implem
 | EXL3, GPTQ, AWQ, or FP8 | Register an engine that serves the format, such as TabbyAPI or vLLM, in `flux.toml` |
 
 Expert caching and the second-GPU tier apply only to mixture-of-experts models; dense models get measured layer placement. A plan cannot exceed the model's trained context. Flux has been tested end to end on Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, and MiniCPM5.
+
+## How Flux uses the CPU
+
+The CPU is a device in every plan, not a fallback for what the GPUs cannot hold. When it plans, Flux:
+
+1. Times RAM bandwidth at several thread counts and keeps the fewest threads within 10% of the best, because threads past saturation only add synchronization.
+2. Times the model's own tensor shapes and quantization types on the CPU, both for single-token decoding and for prompt chunks.
+3. Puts whole layers on the CPU, or keeps a layer's experts in RAM for the CPU to compute, then fills spare GPU memory with the experts that save the most time per byte.
+4. Runs the finalists, CPU work included, on real prompts, so the CPU's share is measured rather than assumed.
+
+While serving, the CPU computes its experts at the same time as the GPU computes the rest of the layer. Prompt chunks of 32 tokens or more copy those experts to the GPU instead, where the larger batch runs faster.
 
 ## Build
 
