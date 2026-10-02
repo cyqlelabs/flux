@@ -19,7 +19,7 @@ flowchart LR
 | | Flux | Hand-tuned single-model engines |
 |---|---|---|
 | Models | Any of the 148 architectures the pinned llama.cpp implements | The one model they were tuned for |
-| Ready to serve | In seconds: weights are memory-mapped and page-locked in the background; 15 s for Qwen3.8-Flash-Next on an RTX 2060 + RTX 3060 | Only after reading the experts into RAM; about 19 minutes for the same model on the same machine |
+| Ready to serve | In seconds: weights are memory-mapped and page-locked in the background; 15 s for Qwen3.8-Flash-Next on an RTX 2060 + RTX 3060 | Minutes: the experts are read into RAM before the first request, longest on a cold start |
 | CPU's share of the work | Measured on your machine: RAM bandwidth per thread count and the model's own kernels | Fixed constants; an optional calibration run adjusts a few of them |
 | Layer and expert placement | Searched across the CPU and GPUs; the finalists are timed on real prompts | Fixed rules decide each token's split |
 | Several GPUs | Splits layers across GPUs and caches experts on them, in the same plan | A layer split or extra expert caches, one at a time |
