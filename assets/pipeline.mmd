@@ -1,7 +1,7 @@
 %%{init: {"theme": "base", "themeVariables": {"primaryColor": "#dbeafe", "primaryTextColor": "#0f172a", "primaryBorderColor": "#2563eb", "textColor": "#0f172a", "lineColor": "#8b949e", "edgeLabelBackground": "#dbeafe"}, "flowchart": {"rankSpacing": 28, "nodeSpacing": 28, "padding": 10}}}%%
 flowchart TD
     M["Model<br/>GGUF or Hugging Face"] --> I["inspect<br/>manifest and hashes"]
-    I --> P["probe<br/>measure GPUs and CPU"]
+    I --> P["probe<br/>GPUs, CPU, and storage"]
     P --> PL["plan<br/>search, measure, save"]
     PL --> S[("Saved plan")]
     S --> SV["serve<br/>OpenAI API"]
