@@ -18,6 +18,7 @@ Cost models only rank and prune candidates; Flux always saves the plan that meas
 | Layer and expert placement | Searched across the CPU and GPUs; the finalists are timed on real prompts | Fixed rules decide each token's split |
 | Several GPUs | Splits layers across GPUs and caches experts on them, in the same plan | A layer split or extra expert caches, one at a time |
 | Engine | Compares its native engine, `llama-server`, and any engine you register, then keeps the fastest | One engine |
+| Models bigger than RAM | Measures the drive that holds the model and predicts the decode limit of reading weights from it; opt in with `--allow-storage-streaming` | A low-RAM mode chosen from the amount of RAM, without testing the drive |
 | Changes while serving | Watches decode speed and can replan in place | Calibration runs only when you start it |
 
 ## Requirements
@@ -114,6 +115,7 @@ Run `flux <command> --help` for every flag.
 | `--kv` | `f16` | KV cache type; any other type is labelled as a separate quality profile |
 | `--speculation` | off | Also measure speculative decoding |
 | `--draft-model`, `--heads` | none | Draft with a separate model, or graft next-token (MTP) heads onto the model |
+| `--allow-storage-streaming` | off | Let a plan read the weights that do not fit in RAM from the drive; without it, Flux rejects such placements and reports their decode limit |
 | `--replan`, `--reprobe` | off | Ignore the saved plan or the saved probe report |
 
 </details>
