@@ -1,0 +1,6 @@
+%%{init: {"flowchart": {"rankSpacing": 28, "nodeSpacing": 28, "padding": 10}}}%%
+flowchart TD
+    C["HTTP client"] --> F["flux<br/>API, admission, journal"]
+    F <-->|"JSON lines"| W["flux-worker"]
+    W --> N["flux-native<br/>C ABI bridge"]
+    N --> L["llama.cpp<br/>pinned and patched"]

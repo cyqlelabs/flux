@@ -1,0 +1,8 @@
+%%{init: {"flowchart": {"rankSpacing": 28, "nodeSpacing": 28, "padding": 10}}}%%
+flowchart TD
+    M["Model<br/>GGUF or Hugging Face"] --> I["inspect<br/>manifest and hashes"]
+    I --> P["probe<br/>measure GPUs and CPU"]
+    P --> PL["plan<br/>search, measure, save"]
+    PL --> S[("Saved plan")]
+    S --> SV["serve<br/>OpenAI API"]
+    S --> B["bench<br/>speed, quality, soak"]
