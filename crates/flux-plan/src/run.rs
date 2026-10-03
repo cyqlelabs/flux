@@ -61,7 +61,7 @@ pub async fn chat_prompt(worker: &Worker, corpus: &Corpus, role: Role, index: us
 pub async fn run_stream(worker: &Worker, req: &str, prompt: Vec<i32>, max_tokens: u32, sampling: Sampling) -> Result<StreamResult> {
     let n_prompt = prompt.len();
     let t0 = Instant::now();
-    let mut rx = worker.start(req, prompt, sampling, vec![], max_tokens, vec![]).await?;
+    let mut rx = worker.start(req, prompt, sampling, vec![], max_tokens, vec![], Default::default()).await?;
     worker.credit(req, max_tokens).await?;
     let mut r = StreamResult { n_prompt, ttft_s: 0.0, token_times_s: vec![], tokens: vec![], alts: vec![], finish: None, error: None, total_s: 0.0 };
     while let Some(ev) = rx.recv().await {

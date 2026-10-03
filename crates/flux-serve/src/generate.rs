@@ -4,6 +4,8 @@
 use crate::journal::Status;
 use crate::AppState;
 use flux_core::protocol::{Event, FinishReason, Sampling};
+use flux_core::worker::ChatOptions;
+use serde_json::Value;
 use tokio::sync::mpsc;
 
 /// Credit granted per top-up: generation runs at most this far ahead of the client.
@@ -11,8 +13,13 @@ const CREDIT: u32 = 16;
 const MAX_RESTARTS: u32 = 2;
 
 pub enum Piece {
-    Text { token: i32, text: String },
-    Chunk(serde_json::Value),
+    /// `deltas` are the OpenAI chat deltas of a parsed request; `text` is the raw reply text either way.
+    Text {
+        token: i32,
+        text: String,
+        deltas: Vec<Value>,
+    },
+    Chunk(Value),
 }
 
 #[derive(Debug, Clone)]
@@ -23,6 +30,8 @@ pub struct Outcome {
     pub error: Option<String>,
     /// R = (N-1)/(t_last - t_first) over this request's tokens, comparable to the plan's validated rate.
     pub decode_tps: Option<f64>,
+    /// The parsed assistant message (reasoning, content, tool calls) of a parsed chat request.
+    pub message: Option<Value>,
 }
 
 pub struct TokenJob {
@@ -32,6 +41,7 @@ pub struct TokenJob {
     pub stop: Vec<String>,
     pub max_tokens: u32,
     pub render_special: Vec<i32>,
+    pub chat: ChatOptions,
 }
 
 enum Ended {
@@ -54,12 +64,13 @@ async fn run_tokens_inner(st: &AppState, job: TokenJob, tx: mpsc::Sender<Piece>,
     let mut restarts = 0;
     loop {
         let (gen, w) = st.supervisor.current().await;
-        let committed: Vec<i32> = st.journal.get(&job.id).map(|e| e.tokens).unwrap_or_default();
+        let (committed, delivered) = st.journal.get(&job.id).map(|e| (e.tokens, e.texts.concat())).unwrap_or_default();
         let mut prompt = job.prompt.clone();
         prompt.extend(&committed);
         let remaining = job.max_tokens.saturating_sub(committed.len() as u32);
         let wreq = format!("{}#{restarts}", job.id);
-        let ended = match w.start(&wreq, prompt, job.sampling.clone(), job.stop.clone(), remaining, job.render_special.clone()).await {
+        let chat = ChatOptions { prefix: delivered, ..job.chat.clone() };
+        let ended = match w.start(&wreq, prompt, job.sampling.clone(), job.stop.clone(), remaining, job.render_special.clone(), chat).await {
             Err(_) => Ended::WorkerLost,
             Ok(mut rx) => {
                 let _ = w.credit(&wreq, CREDIT).await;
@@ -76,11 +87,11 @@ async fn run_tokens_inner(st: &AppState, job: TokenJob, tx: mpsc::Sender<Piece>,
                     match ev {
                         Some(Event::Prefilling { done, reused, ms, .. }) => st.live.prompt(&job.id, done, reused, ms),
                         Some(Event::Prefilled { n_prompt, reused, ms, .. }) => st.live.prompt(&job.id, n_prompt, reused, ms),
-                        Some(Event::Token { token, text, .. }) => {
+                        Some(Event::Token { token, text, deltas, .. }) => {
                             times.push(std::time::Instant::now());
                             st.live.token(&job.id);
                             st.journal.push(&job.id, token, &text);
-                            if tx.send(Piece::Text { token, text }).await.is_err() {
+                            if tx.send(Piece::Text { token, text, deltas }).await.is_err() {
                                 let _ = w.cancel(&wreq).await;
                                 break Ended::ClientGone;
                             }
@@ -93,9 +104,9 @@ async fn run_tokens_inner(st: &AppState, job: TokenJob, tx: mpsc::Sender<Piece>,
                         Some(Event::Error { message, .. }) if message == "worker process exited" => {}
                         Some(Event::Error { message, .. }) => error = Some(message),
                         Some(Event::Finished { reason: FinishReason::Error, .. }) if error.is_none() => break Ended::WorkerLost,
-                        Some(Event::Finished { reason, n_decoded, tail, .. }) => {
-                            if !tail.is_empty() {
-                                let _ = tx.send(Piece::Text { token: -1, text: tail }).await;
+                        Some(Event::Finished { reason, n_decoded, tail, deltas, message, .. }) => {
+                            if !tail.is_empty() || !deltas.is_empty() {
+                                let _ = tx.send(Piece::Text { token: -1, text: tail, deltas }).await;
                             }
                             break Ended::Finished(Outcome {
                                 reason: Some(reason),
@@ -103,6 +114,7 @@ async fn run_tokens_inner(st: &AppState, job: TokenJob, tx: mpsc::Sender<Piece>,
                                 n_completion: committed.len() as u32 + n_decoded,
                                 error,
                                 decode_tps: None,
+                                message,
                             });
                         }
                         Some(_) => {}
@@ -122,7 +134,14 @@ async fn run_tokens_inner(st: &AppState, job: TokenJob, tx: mpsc::Sender<Piece>,
             }
             Ended::ClientGone => {
                 st.journal.finish(&job.id, Status::Done { finish_reason: "cancelled".into() });
-                return Outcome { reason: Some(FinishReason::Cancelled), n_prompt: job.prompt.len() as u32, n_completion: 0, error: None, decode_tps: None };
+                return Outcome {
+                    reason: Some(FinishReason::Cancelled),
+                    n_prompt: job.prompt.len() as u32,
+                    n_completion: 0,
+                    error: None,
+                    decode_tps: None,
+                    message: None,
+                };
             }
             Ended::WorkerLost if restarts < MAX_RESTARTS => {
                 restarts += 1;
@@ -136,6 +155,7 @@ async fn run_tokens_inner(st: &AppState, job: TokenJob, tx: mpsc::Sender<Piece>,
                         n_completion: 0,
                         error: Some(message),
                         decode_tps: None,
+                        message: None,
                     };
                 }
             }
@@ -148,6 +168,7 @@ async fn run_tokens_inner(st: &AppState, job: TokenJob, tx: mpsc::Sender<Piece>,
                     n_completion: 0,
                     error: Some(message),
                     decode_tps: None,
+                    message: None,
                 };
             }
         }
@@ -157,7 +178,7 @@ async fn run_tokens_inner(st: &AppState, job: TokenJob, tx: mpsc::Sender<Piece>,
 /// Relays a chat-level engine's stream; such engines are restarted but not replayed.
 pub async fn run_chat(st: &AppState, id: &str, body: serde_json::Value, tx: mpsc::Sender<Piece>) -> Outcome {
     let (gen, w) = st.supervisor.current().await;
-    let fail = |m: String| Outcome { reason: Some(FinishReason::Error), n_prompt: 0, n_completion: 0, error: Some(m), decode_tps: None };
+    let fail = |m: String| Outcome { reason: Some(FinishReason::Error), n_prompt: 0, n_completion: 0, error: Some(m), decode_tps: None, message: None };
     let mut rx = match w.chat(id, body).await {
         Ok(rx) => rx,
         Err(e) => return fail(e.to_string()),
@@ -169,7 +190,7 @@ pub async fn run_chat(st: &AppState, id: &str, body: serde_json::Value, tx: mpsc
             ev = rx.recv() => ev,
             _ = tx.closed() => {
                 let _ = w.cancel(id).await;
-                return Outcome { reason: Some(FinishReason::Cancelled), n_prompt: 0, n_completion: 0, error: None, decode_tps: None };
+                return Outcome { reason: Some(FinishReason::Cancelled), n_prompt: 0, n_completion: 0, error: None, decode_tps: None, message: None };
             }
         };
         match ev {
@@ -177,7 +198,7 @@ pub async fn run_chat(st: &AppState, id: &str, body: serde_json::Value, tx: mpsc
                 st.live.token(id);
                 if tx.send(Piece::Chunk(chunk)).await.is_err() {
                     let _ = w.cancel(id).await;
-                    return Outcome { reason: Some(FinishReason::Cancelled), n_prompt: 0, n_completion: 0, error: None, decode_tps: None };
+                    return Outcome { reason: Some(FinishReason::Cancelled), n_prompt: 0, n_completion: 0, error: None, decode_tps: None, message: None };
                 }
                 outstanding -= 1;
                 if outstanding <= CREDIT / 2 {
@@ -186,7 +207,7 @@ pub async fn run_chat(st: &AppState, id: &str, body: serde_json::Value, tx: mpsc
                 }
             }
             Some(Event::Finished { reason, n_prompt, n_decoded, .. }) => {
-                return Outcome { reason: Some(reason), n_prompt, n_completion: n_decoded, error: None, decode_tps: None };
+                return Outcome { reason: Some(reason), n_prompt, n_completion: n_decoded, error: None, decode_tps: None, message: None };
             }
             Some(Event::Error { message, .. }) => {
                 if message == "worker process exited" {

@@ -40,8 +40,18 @@ int32_t fx_tokenize(fx_engine * e, const char * text, int32_t len, bool add_spec
 // Raw bytes of a token's text (may be a partial UTF-8 sequence); returns length or -(required).
 int32_t fx_token_piece(fx_engine * e, int32_t token, bool special, char * buf, int32_t cap);
 bool fx_is_eog(fx_engine * e, int32_t token);
-// {"messages":[...],"tools":[...]?,"add_generation_prompt":bool} -> {"prompt","preserved_tokens":[ids],"additional_stops":[...]}
+// {"messages":[...],"tools":[...]?,"add_generation_prompt":bool} -> {"prompt","preserved_tokens":[ids],
+// "additional_stops":[...],"parser":{...},"checkpoint"?}: "parser" is the spec for fx_chat_parser_new and
+// "checkpoint" the prompt tokens before the generation prompt.
 char * fx_apply_template(fx_engine * e, const char * request_json);
+
+// Splits a chat reply into reasoning, content and tool calls as llama-server does, for one request.
+typedef struct fx_chat_parser fx_chat_parser;
+fx_chat_parser * fx_chat_parser_new(const char * spec_json, char ** error);
+void fx_chat_parser_free(fx_chat_parser * p);
+// Appends reply text and returns {"deltas":[OpenAI chunk deltas]}; final parses the whole reply as complete
+// and adds "message" (the assistant message with reasoning_content and tool_calls).
+char * fx_chat_parser_push(fx_chat_parser * p, const char * text, int32_t len, bool final);
 
 // One llama_decode over n tokens; returns llama_decode's status (0 = ok), -100 for a batch over n_batch,
 // -101 when the drafter fails to follow it, -102 when llama_decode throws.
@@ -53,10 +63,10 @@ char * fx_trace(fx_engine * e, const char * request_json);
 // (engine loaded with "trace": true): {"prefill":{layer:[count per expert]},"decode":{...}}.
 char * fx_route_stats(fx_engine * e, const char * request_json);
 void fx_seq_clear(fx_engine * e, int32_t seq);
-// Prompt reuse. Saves the sequence's recurrent state at its current end (one checkpoint per sequence).
+// Prompt reuse. Saves the sequence's recurrent state at its current end (up to four checkpoints per sequence).
 bool fx_seq_checkpoint(fx_engine * e, int32_t seq);
 // Keeps the sequence's first `keep` positions where its state can be recovered: by trimming (attention-only
-// models) or from the checkpoint (recurrent models), else not at all. Returns how many it kept.
+// models) or from the latest checkpoint within `keep` (recurrent models), else not at all. Returns how many it kept.
 int32_t fx_seq_keep(fx_engine * e, int32_t seq, int32_t keep);
 
 // Speculation (engines loaded with a draft-mtp plan). Drafts up to n_max tokens after `last`, which sits at

@@ -73,7 +73,15 @@ impl State {
         match r {
             Request::Prefill { req, .. } | Request::Chat { req, .. } => {
                 self.error(Some(req), None, code, message);
-                self.out.send(&Event::Finished { req: req.clone(), reason: FinishReason::Error, n_prompt: 0, n_decoded: 0, tail: String::new() });
+                self.out.send(&Event::Finished {
+                    req: req.clone(),
+                    reason: FinishReason::Error,
+                    n_prompt: 0,
+                    n_decoded: 0,
+                    tail: String::new(),
+                    deltas: vec![],
+                    message: None,
+                });
             }
             Request::Tokenize { id, .. } | Request::ApplyTemplate { id, .. } | Request::Stats { id } | Request::Trace { id, .. } => {
                 self.error(None, Some(*id), code, message)
@@ -116,6 +124,8 @@ impl State {
                         prompt: v["prompt"].as_str().unwrap_or_default().to_string(),
                         preserved_tokens: vec![],
                         additional_stops: vec![],
+                        parser: None,
+                        checkpoint: None,
                     }),
                     Err(e) => self.error(None, Some(id), ErrorCode::Backend, e.to_string()),
                 }
@@ -136,7 +146,15 @@ impl State {
                 if let Some(a) = self.active.lock().unwrap().remove(&req) {
                     // Dropping the HTTP stream makes the engine cancel its task.
                     a.task.abort();
-                    self.out.send(&Event::Finished { req, reason: FinishReason::Cancelled, n_prompt: 0, n_decoded: 0, tail: String::new() });
+                    self.out.send(&Event::Finished {
+                        req,
+                        reason: FinishReason::Cancelled,
+                        n_prompt: 0,
+                        n_decoded: 0,
+                        tail: String::new(),
+                        deltas: vec![],
+                        message: None,
+                    });
                 }
             }
             Request::Stats { id } => {
@@ -222,7 +240,15 @@ impl State {
             let result = stream(&out, &http, &url, &body, &r, n_prompt, &sem, api, start).await;
             if let Err(e) = result {
                 out.send(&Event::Error { req: Some(r.clone()), id: None, code: ErrorCode::Backend, message: format!("{e:#}") });
-                out.send(&Event::Finished { req: r.clone(), reason: FinishReason::Error, n_prompt, n_decoded: 0, tail: String::new() });
+                out.send(&Event::Finished {
+                    req: r.clone(),
+                    reason: FinishReason::Error,
+                    n_prompt,
+                    n_decoded: 0,
+                    tail: String::new(),
+                    deltas: vec![],
+                    message: None,
+                });
             }
             active.lock().unwrap().remove(&r);
         });
@@ -268,7 +294,7 @@ async fn stream(
                         take_credit(out, req, credit).await?;
                         let text = if k + 1 == tokens.len() { content.to_string() } else { String::new() };
                         let t_us = start.elapsed().as_micros() as u64;
-                        out.send(&Event::Token { req: req.into(), i: emitted, token: tok, text, t_us, alt: None });
+                        out.send(&Event::Token { req: req.into(), i: emitted, token: tok, text, t_us, alt: None, deltas: vec![] });
                         emitted += 1;
                     }
                     if v["stop"].as_bool() == Some(true) {
@@ -295,7 +321,7 @@ async fn stream(
         }
     }
     let (reason, n_prompt) = finish.context("engine stream ended without a finish marker")?;
-    out.send(&Event::Finished { req: req.into(), reason, n_prompt, n_decoded: emitted, tail: String::new() });
+    out.send(&Event::Finished { req: req.into(), reason, n_prompt, n_decoded: emitted, tail: String::new(), deltas: vec![], message: None });
     Ok(())
 }
 

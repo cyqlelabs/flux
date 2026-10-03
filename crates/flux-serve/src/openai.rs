@@ -9,6 +9,7 @@ use axum::response::sse::{Event as Sse, KeepAlive, Sse as SseResponse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use flux_core::protocol::Sampling;
+use flux_core::worker::ChatOptions;
 use futures::stream::{self, Stream, StreamExt};
 use serde_json::{json, Value};
 use std::convert::Infallible;
@@ -81,6 +82,20 @@ fn chunk(api: Api, id: &str, model: &str, created: i64, text: Option<&str>, fini
     c
 }
 
+/// One streamed chunk carrying a parsed delta (reasoning, content or a tool call).
+fn delta_chunk(id: &str, model: &str, created: i64, delta: Value) -> Value {
+    json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": delta, "finish_reason": null}]})
+}
+
+/// "tool_calls" when a parsed reply ends by calling tools, as OpenAI reports it.
+fn finish_reason(o: &Outcome) -> String {
+    let calls = o.message.as_ref().and_then(|m| m["tool_calls"].as_array()).is_some_and(|c| !c.is_empty());
+    match finish_name(o.reason) {
+        f if calls && f == "stop" => "tool_calls".into(),
+        f => f,
+    }
+}
+
 fn usage(o: &Outcome) -> Value {
     json!({"prompt_tokens": o.n_prompt, "completion_tokens": o.n_completion, "total_tokens": o.n_prompt + o.n_completion})
 }
@@ -95,6 +110,7 @@ async fn token_request(
     body: Value,
     render_special: Vec<i32>,
     extra_stops: Vec<String>,
+    chat: ChatOptions,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
     let n_ctx = st.supervisor.loaded().await.n_ctx_seq as usize;
@@ -116,7 +132,8 @@ async fn token_request(
     let mut stop = stops(&body);
     stop.extend(extra_stops);
     st.live.begin(&id, prompt.len() as u32);
-    let job = TokenJob { id: id.clone(), prompt, sampling: sampling(&body), stop, max_tokens: max_tokens as u32, render_special };
+    let parsed = chat.parser.is_some();
+    let job = TokenJob { id: id.clone(), prompt, sampling: sampling(&body), stop, max_tokens: max_tokens as u32, render_special, chat };
     let (tx, rx) = mpsc::channel(32);
     let (done_tx, done_rx) = oneshot::channel();
     let (st2, id2) = (st.clone(), id.clone());
@@ -129,14 +146,15 @@ async fn token_request(
         }
         let _ = done_tx.send(o);
     });
-    respond(st, api, id, body.get("stream").and_then(Value::as_bool).unwrap_or(false), rx, done_rx).await
+    respond(st, api, id, body.get("stream").and_then(Value::as_bool).unwrap_or(false), parsed, rx, done_rx).await
 }
 
-async fn respond(st: Arc<AppState>, api: Api, id: String, stream: bool, rx: mpsc::Receiver<Piece>, done: oneshot::Receiver<Outcome>) -> Response {
+/// `parsed`: the reply arrives as chat deltas and a final message instead of plain text.
+async fn respond(st: Arc<AppState>, api: Api, id: String, stream: bool, parsed: bool, rx: mpsc::Receiver<Piece>, done: oneshot::Receiver<Outcome>) -> Response {
     let model = st.model_name.clone();
     let created = chrono::Utc::now().timestamp();
     if stream {
-        let body = sse(api, id, model, created, rx, done);
+        let body = sse(api, id, model, created, parsed, rx, done);
         return SseResponse::new(body).keep_alive(KeepAlive::default()).into_response();
     }
     let mut rx = rx;
@@ -148,20 +166,32 @@ async fn respond(st: Arc<AppState>, api: Api, id: String, stream: bool, rx: mpsc
             Piece::Chunk(c) => chunks.push(c),
         }
     }
-    let o = done.await.unwrap_or(Outcome { reason: None, n_prompt: 0, n_completion: 0, error: Some("generation task failed".into()), decode_tps: None });
+    let o = done.await.unwrap_or(Outcome { error: Some("generation task failed".into()), ..failed() });
     if let Some(e) = &o.error {
         return error(StatusCode::INTERNAL_SERVER_ERROR, "engine_error", e.clone());
     }
     if !chunks.is_empty() {
         text = chunks.iter().filter_map(|c| c["choices"][0]["delta"]["content"].as_str()).collect();
     }
-    let finish = finish_name(o.reason);
+    let finish = finish_reason(&o);
+    let message = match &o.message {
+        Some(m) => {
+            let mut m = m.clone();
+            m["role"] = json!("assistant");
+            m
+        }
+        None => json!({"role": "assistant", "content": text}),
+    };
     let choice = match api {
-        Api::Chat => json!({"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": finish}),
+        Api::Chat => json!({"index": 0, "message": message, "finish_reason": finish}),
         Api::Completion => json!({"index": 0, "text": text, "finish_reason": finish}),
     };
     let object = if api == Api::Chat { "chat.completion" } else { "text_completion" };
     Json(json!({"id": id, "object": object, "created": created, "model": model, "choices": [choice], "usage": usage(&o)})).into_response()
+}
+
+fn failed() -> Outcome {
+    Outcome { reason: None, n_prompt: 0, n_completion: 0, error: None, decode_tps: None, message: None }
 }
 
 fn sse(
@@ -169,20 +199,22 @@ fn sse(
     id: String,
     model: String,
     created: i64,
+    parsed: bool,
     rx: mpsc::Receiver<Piece>,
     done: oneshot::Receiver<Outcome>,
 ) -> impl Stream<Item = Result<Sse, Infallible>> {
     let (id2, model2) = (id.clone(), model.clone());
-    let pieces = stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|p| (p, rx)) }).map(move |p| {
-        let v = match p {
-            Piece::Text { text, .. } => chunk(api, &id, &model, created, Some(&text), None, None),
-            Piece::Chunk(c) => c,
+    let pieces = stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|p| (p, rx)) }).flat_map(move |p| {
+        let values = match p {
+            Piece::Text { deltas, .. } if parsed => deltas.into_iter().map(|d| delta_chunk(&id, &model, created, d)).collect(),
+            Piece::Text { text, .. } => vec![chunk(api, &id, &model, created, Some(&text), None, None)],
+            Piece::Chunk(c) => vec![c],
         };
-        Ok(Sse::default().data(v.to_string()))
+        stream::iter(values.into_iter().map(|v| Ok(Sse::default().data(v.to_string()))))
     });
     let tail = stream::once(async move {
-        let o = done.await.unwrap_or(Outcome { reason: None, n_prompt: 0, n_completion: 0, error: Some("generation task failed".into()), decode_tps: None });
-        let mut last = chunk(api, &id2, &model2, created, None, Some(&finish_name(o.reason)), Some(usage(&o)));
+        let o = done.await.unwrap_or(Outcome { error: Some("generation task failed".into()), ..failed() });
+        let mut last = chunk(api, &id2, &model2, created, None, Some(&finish_reason(&o)), Some(usage(&o)));
         if let Some(e) = o.error {
             last["error"] = json!({"message": e});
         }
@@ -213,7 +245,7 @@ pub async fn chat(State(st): State<Arc<AppState>>, headers: HeaderMap, Json(body
             st2.live.finish(&id2, &o);
             let _ = done_tx.send(o);
         });
-        return respond(st, Api::Chat, id, stream, rx, done_rx).await;
+        return respond(st, Api::Chat, id, stream, false, rx, done_rx).await;
     }
     let (_, w) = st.supervisor.current().await;
     let messages = body.get("messages").cloned().unwrap_or(Value::Null);
@@ -225,7 +257,8 @@ pub async fn chat(State(st): State<Arc<AppState>>, headers: HeaderMap, Json(body
         Ok(p) => p,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "engine_error", e.to_string()),
     };
-    token_request(st, Api::Chat, id, prompt, body, templated.preserved_tokens, templated.additional_stops, permit).await
+    let chat = ChatOptions { parser: templated.parser, prefix: String::new(), checkpoint: templated.checkpoint };
+    token_request(st, Api::Chat, id, prompt, body, templated.preserved_tokens, templated.additional_stops, chat, permit).await
 }
 
 pub async fn completions(State(st): State<Arc<AppState>>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
@@ -248,7 +281,7 @@ pub async fn completions(State(st): State<Arc<AppState>>, headers: HeaderMap, Js
         Some(Value::Array(a)) if a.iter().all(Value::is_i64) => a.iter().map(|v| v.as_i64().unwrap() as i32).collect(),
         _ => return error(StatusCode::BAD_REQUEST, "invalid_request_error", "prompt must be a string or an array of token ids"),
     };
-    token_request(st, Api::Completion, id, prompt, body, vec![], vec![], permit).await
+    token_request(st, Api::Completion, id, prompt, body, vec![], vec![], ChatOptions::default(), permit).await
 }
 
 pub async fn models(State(st): State<Arc<AppState>>) -> Json<Value> {

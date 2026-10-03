@@ -70,6 +70,15 @@ pub enum Request {
         /// Special tokens to render as text (the chat template's preserved tokens); others render empty.
         #[serde(default)]
         render_special: Vec<i32>,
+        /// The `parser` spec from `Templated`: replies are split into reasoning, content and tool calls.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat: Option<serde_json::Value>,
+        /// Reply text already delivered before a restart; the parser starts after it.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        chat_prefix: String,
+        /// Prompt position worth a recurrent-state checkpoint for the next request's reuse (`Templated`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkpoint: Option<u32>,
     },
     /// Grants credit for `n` more tokens; bounds how far generation may run ahead of the consumer.
     Decode {
@@ -180,6 +189,12 @@ pub enum Event {
         prompt: String,
         preserved_tokens: Vec<i32>,
         additional_stops: Vec<String>,
+        /// How to split this request's reply (passed back in `Prefill.chat`).
+        #[serde(default)]
+        parser: Option<serde_json::Value>,
+        /// Prompt tokens before the generation prompt.
+        #[serde(default)]
+        checkpoint: Option<u32>,
     },
     Prefilled {
         req: String,
@@ -207,6 +222,9 @@ pub enum Event {
         /// The runner-up of the row this token was sampled from (native engine, single-row steps).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         alt: Option<i32>,
+        /// OpenAI chat deltas this token completes, when the request is parsed (`Prefill.chat`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        deltas: Vec<serde_json::Value>,
     },
     /// One streamed chunk from a chat-level engine, relayed verbatim (OpenAI chat.completion.chunk).
     ChatChunk {
@@ -225,6 +243,11 @@ pub enum Event {
         n_decoded: u32,
         /// Text held back while it could still become a stop string, released at the end.
         tail: String,
+        /// Parsed requests: the deltas the tail completes and the whole assistant message.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        deltas: Vec<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<serde_json::Value>,
     },
     Stats {
         id: u64,

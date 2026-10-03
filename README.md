@@ -148,7 +148,7 @@ Run `flux <command> --help` for every flag.
 | Route | Purpose |
 |---|---|
 | `GET /v1/models` | List the served model |
-| `POST /v1/chat/completions` | Create chat completions, streamed or not |
+| `POST /v1/chat/completions` | Create chat completions, streamed or not; replies are split into `reasoning_content`, `content`, and `tool_calls` as llama-server does |
 | `POST /v1/completions` | Create text completions, streamed or not |
 | `GET /health` | Return 200 while admitting requests, 503 once admission closes |
 | `GET /flux/plan` | Return the plan being served |

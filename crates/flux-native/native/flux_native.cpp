@@ -22,6 +22,7 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <stdexcept>
@@ -612,14 +613,17 @@ struct fx_engine {
     bool cached = false;
     int64_t decodes = 0;
     static constexpr int64_t cache_log_every = 256;
-    // Prompt reuse: per sequence, the recurrent state saved at `n` positions.
+    // Prompt reuse: per sequence, the recurrent state saved at `n` positions, ascending by `n`. Several per
+    // sequence, so that requests sharing a shorter prefix (a new turn, a side request) still find one.
     struct checkpoint {
         int32_t n = 0;
         std::vector<uint8_t> data;
         // The drafter's pending hidden state at the same position, so drafts after reuse pair with it.
         std::vector<uint8_t> draft;
     };
-    std::map<int32_t, checkpoint> checkpoints;
+    std::map<int32_t, std::vector<checkpoint>> checkpoints;
+    static constexpr size_t max_checkpoints = 4;
+    bool checkpoint_size_logged = false;
 
     ~fx_engine() {
         if (spec) common_speculative_free(spec);
@@ -1023,6 +1027,8 @@ char * fx_apply_template(fx_engine * e, const char * request_json) {
         }
         in.add_generation_prompt = j.value("add_generation_prompt", true);
         in.use_jinja = true;
+        // As llama-server: reasoning goes to reasoning_content, in streamed deltas too.
+        in.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
         const common_chat_params cp = common_chat_templates_apply(e->tmpls.get(), in);
         json preserved = json::array();
         for (const auto & t : cp.preserved_tokens) {
@@ -1031,7 +1037,126 @@ char * fx_apply_template(fx_engine * e, const char * request_json) {
                 preserved.push_back(ids[0]);
             }
         }
-        return dup(json{{"prompt", cp.prompt}, {"preserved_tokens", preserved}, {"additional_stops", cp.additional_stops}}.dump());
+        json out = {
+            {"prompt", cp.prompt},
+            {"preserved_tokens", preserved},
+            {"additional_stops", cp.additional_stops},
+            {"parser",
+             {{"format", (int) cp.format}, {"generation_prompt", cp.generation_prompt}, {"parser", cp.parser}, {"parse_tool_calls", !in.tools.empty()}}},
+        };
+        // The end of the last message, before the generation prompt: where the next turn's prompt still agrees
+        // with this one even when the template rewrites the reply (e.g. drops its reasoning). Recurrent models
+        // checkpoint there for prompt reuse.
+        if (in.add_generation_prompt) {
+            common_chat_templates_inputs bare = in;
+            bare.add_generation_prompt = false;
+            const auto full = common_tokenize(e->vocab, cp.prompt, true, true);
+            const auto head = common_tokenize(e->vocab, common_chat_templates_apply(e->tmpls.get(), bare).prompt, true, true);
+            size_t n = 0;
+            while (n < full.size() && n < head.size() && full[n] == head[n]) {
+                n++;
+            }
+            if (n > 0 && n < full.size()) {
+                out["checkpoint"] = n;
+            }
+        }
+        return dup(out.dump());
+    } catch (const std::exception & ex) {
+        return err_json(ex.what());
+    }
+}
+
+struct fx_chat_parser {
+    common_chat_parser_params params;
+    std::string text;
+    common_chat_msg msg;
+    std::vector<std::string> tool_call_ids;
+};
+
+static std::string random_tool_call_id() {
+    static thread_local std::mt19937 rng{std::random_device{}()};
+    static const char chars[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    std::uniform_int_distribution<int> pick(0, (int) sizeof(chars) - 2);
+    std::string id = "call_";
+    for (int i = 0; i < 24; i++) {
+        id += chars[pick(rng)];
+    }
+    return id;
+}
+
+// One OpenAI chat.completion.chunk delta, shaped as llama-server's server_chat_msg_diff_to_json_oaicompat.
+static json diff_json(const common_chat_msg_diff & d) {
+    json delta = json::object();
+    if (!d.reasoning_content_delta.empty()) {
+        delta["reasoning_content"] = d.reasoning_content_delta;
+    }
+    if (!d.content_delta.empty()) {
+        delta["content"] = d.content_delta;
+    }
+    if (d.tool_call_index != std::string::npos) {
+        json call = {{"index", d.tool_call_index}};
+        if (!d.tool_call_delta.id.empty()) {
+            call["id"] = d.tool_call_delta.id;
+            call["type"] = "function";
+        }
+        if (!d.tool_call_delta.name.empty() || !d.tool_call_delta.arguments.empty()) {
+            json function = json::object();
+            if (!d.tool_call_delta.name.empty()) {
+                function["name"] = d.tool_call_delta.name;
+            }
+            if (!d.tool_call_delta.arguments.empty()) {
+                function["arguments"] = d.tool_call_delta.arguments;
+            }
+            call["function"] = function;
+        }
+        delta["tool_calls"] = json::array({call});
+    }
+    return delta;
+}
+
+fx_chat_parser * fx_chat_parser_new(const char * spec_json, char ** error) {
+    try {
+        const json s = json::parse(spec_json);
+        auto p = std::make_unique<fx_chat_parser>();
+        p->params.format = static_cast<common_chat_format>(s.at("format").get<int>());
+        p->params.generation_prompt = s.value("generation_prompt", std::string());
+        p->params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+        p->params.parse_tool_calls = s.value("parse_tool_calls", false);
+        const std::string peg = s.value("parser", std::string());
+        if (!peg.empty()) {
+            p->params.parser.load(peg);
+        }
+        return p.release();
+    } catch (const std::exception & ex) {
+        if (error) {
+            *error = dup(ex.what());
+        }
+        return nullptr;
+    }
+}
+
+void fx_chat_parser_free(fx_chat_parser * p) {
+    delete p;
+}
+
+char * fx_chat_parser_push(fx_chat_parser * p, const char * text, int32_t len, bool final) {
+    try {
+        p->text.append(text, (size_t) len);
+        // As llama-server's task_result_state::update_chat_msg: parse everything so far, send what changed.
+        json deltas = json::array();
+        common_chat_msg m = common_chat_parse(p->text, !final, p->params);
+        if (!m.empty()) {
+            m.set_tool_call_ids(p->tool_call_ids, random_tool_call_id);
+            for (const auto & d : common_chat_msg_diff::compute_diffs(p->msg, m)) {
+                deltas.push_back(diff_json(d));
+            }
+            p->msg = std::move(m);
+        }
+        json out = {{"deltas", deltas}};
+        if (final) {
+            out["message"] = json::parse(p->msg.to_json_oaicompat().dump());
+        }
+        return dup(out.dump());
     } catch (const std::exception & ex) {
         return err_json(ex.what());
     }
@@ -1239,20 +1364,30 @@ void fx_seq_clear(fx_engine * e, int32_t seq) {
 
 bool fx_seq_checkpoint(fx_engine * e, int32_t seq) {
     try {
-        auto & c = e->checkpoints[seq];
+        fx_engine::checkpoint c;
         c.data.resize(llama_state_seq_get_size_ext(e->ctx, seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
         c.n = llama_memory_seq_pos_max(llama_get_memory(e->ctx), seq) + 1;
-        if (llama_state_seq_get_data_ext(e->ctx, c.data.data(), c.data.size(), seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == c.data.size()) {
-            if (!e->spec || !common_speculative_get_state(e->spec, seq, c.draft)) {
-                c.draft.clear();
-            }
-            return true;
+        if (llama_state_seq_get_data_ext(e->ctx, c.data.data(), c.data.size(), seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != c.data.size()) {
+            return false;
         }
-        e->checkpoints.erase(seq);
-        return false;
+        if (!e->spec || !common_speculative_get_state(e->spec, seq, c.draft)) {
+            c.draft.clear();
+        }
+        if (!e->checkpoint_size_logged) {
+            e->checkpoint_size_logged = true;
+            fprintf(stderr, "prompt reuse: a checkpoint holds %.1f MiB of recurrent state (up to %zu per sequence)\n",
+                    (c.data.size() + c.draft.size()) / 1048576.0, fx_engine::max_checkpoints);
+        }
+        auto & list = e->checkpoints[seq];
+        list.erase(std::remove_if(list.begin(), list.end(), [&](const fx_engine::checkpoint & o) { return o.n == c.n; }), list.end());
+        list.push_back(std::move(c));
+        std::sort(list.begin(), list.end(), [](const fx_engine::checkpoint & a, const fx_engine::checkpoint & b) { return a.n < b.n; });
+        if (list.size() > fx_engine::max_checkpoints) {
+            list.erase(list.begin(), list.end() - fx_engine::max_checkpoints);
+        }
+        return true;
     } catch (const std::exception & ex) {
         fprintf(stderr, "checkpoint failed: %s\n", ex.what());
-        e->checkpoints.erase(seq);
         return false;
     }
 }
@@ -1274,16 +1409,21 @@ int32_t fx_seq_keep(fx_engine * e, int32_t seq, int32_t keep) {
         trim_draft(keep);
         return keep;
     }
+    // The latest checkpoint within `keep`; those past it describe positions the trim removes.
     const auto it = e->checkpoints.find(seq);
-    if (it != e->checkpoints.end() && it->second.n > 0 && it->second.n <= keep) {
-        const auto & c = it->second;
-        if (llama_state_seq_set_data_ext(e->ctx, c.data.data(), c.data.size(), seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == c.data.size() &&
-            llama_memory_seq_rm(mem, seq, c.n, -1)) {
-            trim_draft(c.n);
-            if (e->spec && !c.draft.empty()) {
-                common_speculative_set_state(e->spec, seq, c.draft);
+    if (it != e->checkpoints.end()) {
+        auto & list = it->second;
+        const auto c = std::find_if(list.rbegin(), list.rend(), [&](const fx_engine::checkpoint & o) { return o.n > 0 && o.n <= keep; });
+        if (c != list.rend() &&
+            llama_state_seq_set_data_ext(e->ctx, c->data.data(), c->data.size(), seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == c->data.size() &&
+            llama_memory_seq_rm(mem, seq, c->n, -1)) {
+            const int32_t n = c->n;
+            trim_draft(n);
+            if (e->spec && !c->draft.empty()) {
+                common_speculative_set_state(e->spec, seq, c->draft);
             }
-            return c.n;
+            list.erase(std::remove_if(list.begin(), list.end(), [&](const fx_engine::checkpoint & o) { return o.n > n; }), list.end());
+            return n;
         }
     }
     fx_seq_clear(e, seq);

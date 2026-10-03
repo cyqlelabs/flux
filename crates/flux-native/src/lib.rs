@@ -22,6 +22,10 @@ mod ffi {
     pub struct Sampler {
         _p: [u8; 0],
     }
+    #[repr(C)]
+    pub struct ChatParser {
+        _p: [u8; 0],
+    }
 
     extern "C" {
         pub fn fx_free(p: *mut c_char);
@@ -39,6 +43,9 @@ mod ffi {
         pub fn fx_token_piece(e: *mut Engine, token: i32, special: bool, buf: *mut c_char, cap: i32) -> i32;
         pub fn fx_is_eog(e: *mut Engine, token: i32) -> bool;
         pub fn fx_apply_template(e: *mut Engine, req: *const c_char) -> *mut c_char;
+        pub fn fx_chat_parser_new(spec: *const c_char, error: *mut *mut c_char) -> *mut ChatParser;
+        pub fn fx_chat_parser_free(p: *mut ChatParser);
+        pub fn fx_chat_parser_push(p: *mut ChatParser, text: *const c_char, len: i32, last: bool) -> *mut c_char;
         pub fn fx_decode(e: *mut Engine, n: i32, tokens: *const i32, pos: *const i32, seq: *const i32, logits: *const i8) -> i32;
         pub fn fx_trace(e: *mut Engine, req: *const c_char) -> *mut c_char;
         pub fn fx_route_stats(e: *mut Engine, req: *const c_char) -> *mut c_char;
@@ -277,6 +284,43 @@ impl Sampler {
 impl Drop for Sampler {
     fn drop(&mut self) {
         unsafe { ffi::fx_sampler_free(self.ptr.as_ptr()) }
+    }
+}
+
+/// Splits one chat reply into reasoning, content and tool calls as llama-server does.
+pub struct ChatParser {
+    ptr: NonNull<ffi::ChatParser>,
+}
+
+unsafe impl Send for ChatParser {}
+
+impl ChatParser {
+    /// `spec` is the `parser` object `Engine::apply_template` returned for the request.
+    pub fn new(spec: &Value) -> Result<ChatParser> {
+        let c = CString::new(spec.to_string())?;
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let p = unsafe { ffi::fx_chat_parser_new(c.as_ptr(), &mut err) };
+        match NonNull::new(p) {
+            Some(ptr) => Ok(ChatParser { ptr }),
+            None => {
+                let msg = if err.is_null() { "invalid chat parser spec".to_string() } else { unsafe { CStr::from_ptr(err) }.to_string_lossy().into_owned() };
+                if !err.is_null() {
+                    unsafe { ffi::fx_free(err) };
+                }
+                bail!("{msg}")
+            }
+        }
+    }
+
+    /// Appends reply text; returns `{"deltas": [...]}`, plus `"message"` when `last`.
+    pub fn push(&mut self, text: &str, last: bool) -> Result<Value> {
+        take_json(unsafe { ffi::fx_chat_parser_push(self.ptr.as_ptr(), text.as_ptr().cast(), text.len() as i32, last) })
+    }
+}
+
+impl Drop for ChatParser {
+    fn drop(&mut self) {
+        unsafe { ffi::fx_chat_parser_free(self.ptr.as_ptr()) }
     }
 }
 

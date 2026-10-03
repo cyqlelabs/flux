@@ -5,7 +5,8 @@ use crate::out::Out;
 use crate::text::{Pushed, TextStream};
 use anyhow::Result;
 use flux_core::protocol::{DeviceMemory, ErrorCode, Event, FinishReason, Request, Sampling, WorkerStats, PROTOCOL_VERSION};
-use flux_native::{Engine, Sampler};
+use flux_native::{ChatParser, Engine, Sampler};
+use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Instant;
@@ -17,6 +18,8 @@ struct Seq {
     prefilled: usize,
     /// Prompt tokens the slot already held from its last request.
     reused: usize,
+    /// Prompt positions where recurrent models checkpoint their state for later reuse, ascending.
+    marks: Vec<usize>,
     /// Next KV position to write.
     pos: i32,
     /// Tokens written to the slot's KV, kept for prompt reuse when the sequence finishes.
@@ -36,9 +39,24 @@ struct Seq {
     render_special: HashSet<i32>,
     t_start: Instant,
     paused_sent: bool,
+    /// Splits the reply into OpenAI deltas (reasoning, content, tool calls) when the request asked for it.
+    parser: Option<ChatParser>,
 }
 
 impl Seq {
+    /// The deltas `text` completes, and the whole message when `last`. A parser failure drops to raw content.
+    fn parse(&mut self, text: &str, last: bool) -> (Vec<Value>, Option<Value>) {
+        let Some(p) = self.parser.as_mut() else { return (vec![], None) };
+        match p.push(text, last) {
+            Ok(mut v) => (serde_json::from_value(v["deltas"].take()).unwrap_or_default(), v.get_mut("message").map(Value::take)),
+            Err(e) => {
+                eprintln!("{}: chat parser failed, streaming raw content from here: {e}", self.req);
+                self.parser = None;
+                (if text.is_empty() { vec![] } else { vec![json!({"content": text})] }, None)
+            }
+        }
+    }
+
     fn prefill_done(&self) -> bool {
         self.prefilled == self.prompt.len()
     }
@@ -121,7 +139,15 @@ impl NativeWorker {
     /// Refuses a request; every Prefill ends with exactly one Finished, even when rejected.
     fn reject(&self, req: &str, code: ErrorCode, message: impl Into<String>) {
         self.error(Some(req), None, code, message);
-        self.out.send(&Event::Finished { req: req.into(), reason: FinishReason::Error, n_prompt: 0, n_decoded: 0, tail: String::new() });
+        self.out.send(&Event::Finished {
+            req: req.into(),
+            reason: FinishReason::Error,
+            n_prompt: 0,
+            n_decoded: 0,
+            tail: String::new(),
+            deltas: vec![],
+            message: None,
+        });
     }
 
     fn handle(&mut self, r: Request) {
@@ -150,12 +176,26 @@ impl NativeWorker {
                         prompt: v["prompt"].as_str().unwrap_or_default().to_string(),
                         preserved_tokens: serde_json::from_value(v["preserved_tokens"].clone()).unwrap_or_default(),
                         additional_stops: serde_json::from_value(v["additional_stops"].clone()).unwrap_or_default(),
+                        parser: v.get("parser").cloned(),
+                        checkpoint: v["checkpoint"].as_u64().map(|n| n as u32),
                     }),
                     Err(e) => self.error(None, Some(id), ErrorCode::BadRequest, e.to_string()),
                 }
             }
-            Request::Prefill { req, prompt, sampling, stop, max_tokens, render_special } => {
-                self.prefill(req, prompt, &sampling, stop, max_tokens, render_special)
+            Request::Prefill { req, prompt, sampling, stop, max_tokens, render_special, chat, chat_prefix, checkpoint } => {
+                let parser = chat.and_then(|spec| match ChatParser::new(&spec) {
+                    Ok(mut p) => {
+                        if !chat_prefix.is_empty() && p.push(&chat_prefix, false).is_err() {
+                            return None;
+                        }
+                        Some(p)
+                    }
+                    Err(e) => {
+                        eprintln!("{req}: no chat parser, streaming raw content: {e}");
+                        None
+                    }
+                });
+                self.prefill(req, prompt, &sampling, stop, max_tokens, render_special, parser, checkpoint)
             }
             Request::Decode { req, n } => match self.seqs.iter().position(|s| s.req == req) {
                 Some(i) => {
@@ -217,7 +257,18 @@ impl NativeWorker {
         }
     }
 
-    fn prefill(&mut self, req: String, prompt: Vec<i32>, sampling: &Sampling, stop: Vec<String>, max_tokens: u32, render_special: Vec<i32>) {
+    #[allow(clippy::too_many_arguments)]
+    fn prefill(
+        &mut self,
+        req: String,
+        prompt: Vec<i32>,
+        sampling: &Sampling,
+        stop: Vec<String>,
+        max_tokens: u32,
+        render_special: Vec<i32>,
+        parser: Option<ChatParser>,
+        checkpoint: Option<u32>,
+    ) {
         if prompt.is_empty() || max_tokens == 0 {
             return self.reject(&req, ErrorCode::BadRequest, "prompt and max_tokens must be non-empty");
         }
@@ -252,6 +303,11 @@ impl NativeWorker {
             }
         };
         prompt.iter().for_each(|&t| sampler.accept_prompt(t));
+        // The end of the last message (the template's boundary) and one short of the end: a new user turn reuses
+        // the first, a continuation after tool results the second.
+        let mut marks: Vec<usize> = checkpoint.map(|c| c as usize).into_iter().chain([prompt.len() - 1]).filter(|&m| m > kept && m < prompt.len()).collect();
+        marks.sort_unstable();
+        marks.dedup();
         self.seqs.push(Seq {
             req,
             slot,
@@ -259,6 +315,7 @@ impl NativeWorker {
             prompt,
             prefilled: kept,
             reused: kept,
+            marks,
             pos: kept as i32,
             sampler,
             max_tokens,
@@ -272,6 +329,7 @@ impl NativeWorker {
             render_special: render_special.into_iter().collect(),
             t_start: Instant::now(),
             paused_sent: false,
+            parser,
         });
     }
 
@@ -303,8 +361,8 @@ impl NativeWorker {
         if budget > 0 {
             if let Some(i) = self.seqs.iter().position(|s| !s.prefill_done()) {
                 let s = &self.seqs[i];
-                // Recurrent models stop one short of the end first: the state there is checkpointed for reuse.
-                let end = if self.recurrent && s.prefilled + 1 < s.prompt.len() { s.prompt.len() - 1 } else { s.prompt.len() };
+                // Recurrent models stop at each mark first: the state there is checkpointed for reuse.
+                let end = if self.recurrent { s.marks.iter().copied().find(|&m| m > s.prefilled).unwrap_or(s.prompt.len()) } else { s.prompt.len() };
                 let take = budget.min(end - s.prefilled);
                 for j in 0..take {
                     let p = s.prefilled + j;
@@ -349,7 +407,7 @@ impl NativeWorker {
             s.prefilled += take;
             s.pos = s.prefilled as i32;
             self.prefilled += take as u64;
-            if self.recurrent && s.prefilled + 1 == s.prompt.len() {
+            if self.recurrent && s.marks.contains(&s.prefilled) {
                 let slot = s.slot;
                 if !self.engine.as_mut().unwrap().seq_checkpoint(slot) {
                     eprintln!("checkpoint of slot {slot} failed: its prompt will not be reused");
@@ -406,7 +464,7 @@ impl NativeWorker {
                     let s = &mut self.seqs[i];
                     s.emitted += 1;
                     let t_us = self.start.elapsed().as_micros() as u64;
-                    self.out.send(&Event::Token { req: s.req.clone(), i: s.emitted - 1, token: tok, text: String::new(), t_us, alt });
+                    self.out.send(&Event::Token { req: s.req.clone(), i: s.emitted - 1, token: tok, text: String::new(), t_us, alt, deltas: vec![] });
                     done.push((i, FinishReason::Eog));
                     break;
                 }
@@ -446,7 +504,8 @@ impl NativeWorker {
             Pushed::Text(t) => (t, false),
             Pushed::Stop(t) => (t, true),
         };
-        self.out.send(&Event::Token { req: s.req.clone(), i: s.emitted - 1, token: tok, text, t_us, alt: s.held_alt.take() });
+        let deltas = if text.is_empty() { vec![] } else { s.parse(&text, false).0 };
+        self.out.send(&Event::Token { req: s.req.clone(), i: s.emitted - 1, token: tok, text, t_us, alt: s.held_alt.take(), deltas });
         if stopped {
             Some(FinishReason::Stop)
         } else if s.emitted >= s.max_tokens {
@@ -469,7 +528,8 @@ impl NativeWorker {
     fn finish(&mut self, i: usize, reason: FinishReason) {
         let mut s = self.seqs.remove(i);
         let tail = if reason == FinishReason::Stop { String::new() } else { s.text.finish() };
-        self.out.send(&Event::Finished { req: s.req.clone(), reason, n_prompt: s.prompt.len() as u32, n_decoded: s.emitted, tail });
+        let (deltas, message) = s.parse(&tail, true);
+        self.out.send(&Event::Finished { req: s.req.clone(), reason, n_prompt: s.prompt.len() as u32, n_decoded: s.emitted, tail, deltas, message });
         // A failed step may leave the cache inconsistent with the tokens; anything else is kept for reuse.
         if reason == FinishReason::Error {
             self.engine.as_mut().unwrap().seq_clear(s.slot);

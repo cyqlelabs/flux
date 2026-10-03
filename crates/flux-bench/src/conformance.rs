@@ -48,7 +48,7 @@ fn conversations() -> Vec<(&'static str, Value, Option<Value>)> {
 }
 
 async fn collect(w: &Worker, req: &str, prompt: Vec<i32>, sampling: Sampling, stop: Vec<String>, n: u32) -> Result<(Vec<i32>, String, Option<FinishReason>)> {
-    let mut rx = w.start(req, prompt, sampling, stop, n, vec![]).await?;
+    let mut rx = w.start(req, prompt, sampling, stop, n, vec![], Default::default()).await?;
     w.credit(req, n).await?;
     let (mut toks, mut text, mut fin) = (vec![], String::new(), None);
     while let Some(ev) = rx.recv().await {
