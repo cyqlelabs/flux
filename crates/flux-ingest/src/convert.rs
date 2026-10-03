@@ -54,7 +54,7 @@ pub fn convert(cfg: &FluxConfig, source: &Path, outtype: &str, python: &Path, lo
     hashing::HashIndex::open(&cfg.cache_dir).hash_all(&mut files)?;
     let identity = hashing::identity(&files).context("source hashes missing")?;
     let script = cfg.llama_dir.join("convert_hf_to_gguf.py");
-    let script_sha = hashing::sha256_file(&script)?;
+    let script_sha = hashing::sha256_file(&script, &|_| {})?;
     let key = flux_core::fsutil::sha256_hex(format!("{identity}|{BACKEND_PIN}|{script_sha}|{outtype}").as_bytes());
     let dir = cfg.cache_dir.join("converted").join(&key[..16]);
     let name = source.file_name().and_then(|n| n.to_str()).unwrap_or("model");

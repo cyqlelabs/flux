@@ -5,6 +5,7 @@ use flux_core::fsutil::{read_json, write_json_atomic};
 use flux_core::model::ModelFile;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
@@ -45,12 +46,12 @@ impl HashIndex {
         self.save()
     }
 
-    /// Fills `sha256` for every file, hashing uncached files in parallel.
+    /// Fills `sha256` for every file, hashing uncached files in parallel and logging each one's progress.
     pub fn hash_all(&mut self, files: &mut [ModelFile]) -> Result<()> {
         let todo: Vec<usize> = (0..files.len()).filter(|&i| self.lookup(&files[i]).is_none()).collect();
         let shared = &*files;
         let results: Vec<(usize, Result<String>)> = std::thread::scope(|s| {
-            let handles: Vec<_> = todo.iter().map(|&i| (i, s.spawn(move || sha256_file(&shared[i].path)))).collect();
+            let handles: Vec<_> = todo.iter().map(|&i| (i, s.spawn(move || hash_logged(&shared[i])))).collect();
             handles.into_iter().map(|(i, h)| (i, h.join().expect("hash thread panicked"))).collect()
         });
         for (i, r) in results {
@@ -67,16 +68,34 @@ impl HashIndex {
     }
 }
 
-pub fn sha256_file(path: &Path) -> Result<String> {
+/// Hashing a multi-GB model takes minutes, so report every 10%.
+fn hash_logged(f: &ModelFile) -> Result<String> {
+    let name = f.path.file_name().unwrap_or_default().to_string_lossy();
+    tracing::info!("hashing {name} ({}); later runs reuse the hash", flux_core::fmt_bytes(f.size));
+    let shown = Cell::new(0);
+    sha256_file(&f.path, &|done| {
+        let pct = done * 100 / f.size.max(1);
+        if pct >= shown.get() + 10 {
+            shown.set(pct);
+            tracing::info!("hashing {name}: {pct}%");
+        }
+    })
+}
+
+/// `progress` receives the bytes hashed so far.
+pub fn sha256_file(path: &Path, progress: &dyn Fn(u64)) -> Result<String> {
     let mut f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 8 << 20];
+    let mut done = 0u64;
     loop {
         let n = f.read(&mut buf)?;
         if n == 0 {
             break;
         }
         h.update(&buf[..n]);
+        done += n as u64;
+        progress(done);
     }
     Ok(hex::encode(h.finalize()))
 }

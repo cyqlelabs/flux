@@ -57,7 +57,8 @@ pub fn graft(model: &GgufModel, heads: &GgufModel, out: &Path, progress: &dyn Fn
 /// per-layer array extended by the heads file's own entries, or else by the last trunk layer's (the
 /// loader sets the attention kind of next-token layers itself).
 fn graft_keys(kv: &mut Vec<(String, Value, Option<u32>)>, arch: &str, model: &GgufModel, heads: &GgufModel) -> Result<()> {
-    ensure!(heads.get("general.architecture").and_then(Value::as_str) == Some(arch), "the heads are not {arch} blocks");
+    let found = heads.get("general.architecture").and_then(Value::as_str).unwrap_or("no architecture");
+    ensure!(found == arch, "the heads file holds {found} tensors, not {arch} blocks; convert a Strata MTP export with scripts/strata-mtp-to-gguf.py first");
     let nextn = format!("{arch}.nextn_predict_layers");
     ensure!(model.get(&nextn).is_none(), "the model already has next-token heads");
     let n_layer = model.get(&format!("{arch}.block_count")).and_then(Value::as_u64).context("no block_count")?;

@@ -114,7 +114,7 @@ impl Client {
         ensure!(done == f.size, "{}: received {done} of {} bytes", f.path, f.size);
         if let Some(want) = &f.sha256 {
             let p = part.clone();
-            let got = tokio::task::spawn_blocking(move || crate::hashing::sha256_file(&p)).await??;
+            let got = tokio::task::spawn_blocking(move || crate::hashing::sha256_file(&p, &|_| {})).await??;
             if &got != want {
                 std::fs::remove_file(&part)?;
                 bail!("{}: sha256 {got} does not match LFS {want}; partial file removed", f.path);

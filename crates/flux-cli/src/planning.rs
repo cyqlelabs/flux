@@ -30,7 +30,14 @@ pub fn graft_heads(cfg: &FluxConfig, model: &Path, heads: &Path) -> Result<PathB
         std::fs::create_dir_all(out.parent().unwrap())?;
         let m = flux_ingest::gguf::GgufModel::open(model)?;
         let h = flux_ingest::gguf::GgufModel::open(heads)?;
-        flux_ingest::repack::graft(&m, &h, &out, &|_, _| {})?;
+        let shown = std::cell::Cell::new(0);
+        flux_ingest::repack::graft(&m, &h, &out, &|done, total| {
+            let pct = done * 100 / total.max(1);
+            if pct >= shown.get() + 10 {
+                shown.set(pct);
+                log(&format!("grafting: {pct}% of {}", fmt_bytes(total)));
+            }
+        })?;
     }
     Ok(out)
 }
