@@ -73,7 +73,7 @@ pub struct NativeWorker {
     n_batch: usize,
     /// Draft tokens per step when the plan speculates (0 otherwise).
     spec_n_max: usize,
-    /// Recurrent state: prompt reuse restores it from a checkpoint taken before the last prompt token.
+    /// Recurrent state: prompt reuse restores it from checkpoints taken at each sequence's marks.
     recurrent: bool,
     seqs: Vec<Seq>,
     free: Vec<i32>,
@@ -177,12 +177,12 @@ impl NativeWorker {
                         preserved_tokens: serde_json::from_value(v["preserved_tokens"].clone()).unwrap_or_default(),
                         additional_stops: serde_json::from_value(v["additional_stops"].clone()).unwrap_or_default(),
                         parser: v.get("parser").cloned(),
-                        checkpoint: v["checkpoint"].as_u64().map(|n| n as u32),
+                        checkpoints: serde_json::from_value(v["checkpoints"].clone()).unwrap_or_default(),
                     }),
                     Err(e) => self.error(None, Some(id), ErrorCode::BadRequest, e.to_string()),
                 }
             }
-            Request::Prefill { req, prompt, sampling, stop, max_tokens, render_special, chat, chat_prefix, checkpoint } => {
+            Request::Prefill { req, prompt, sampling, stop, max_tokens, render_special, chat, chat_prefix, checkpoints } => {
                 let parser = chat.and_then(|spec| match ChatParser::new(&spec) {
                     Ok(mut p) => {
                         if !chat_prefix.is_empty() && p.push(&chat_prefix, false).is_err() {
@@ -195,7 +195,7 @@ impl NativeWorker {
                         None
                     }
                 });
-                self.prefill(req, prompt, &sampling, stop, max_tokens, render_special, parser, checkpoint)
+                self.prefill(req, prompt, &sampling, stop, max_tokens, render_special, parser, checkpoints)
             }
             Request::Decode { req, n } => match self.seqs.iter().position(|s| s.req == req) {
                 Some(i) => {
@@ -267,7 +267,7 @@ impl NativeWorker {
         max_tokens: u32,
         render_special: Vec<i32>,
         parser: Option<ChatParser>,
-        checkpoint: Option<u32>,
+        checkpoints: Vec<u32>,
     ) {
         if prompt.is_empty() || max_tokens == 0 {
             return self.reject(&req, ErrorCode::BadRequest, "prompt and max_tokens must be non-empty");
@@ -303,9 +303,9 @@ impl NativeWorker {
             }
         };
         prompt.iter().for_each(|&t| sampler.accept_prompt(t));
-        // The end of the last message (the template's boundary) and one short of the end: a new user turn reuses
-        // the first, a continuation after tool results the second.
-        let mut marks: Vec<usize> = checkpoint.map(|c| c as usize).into_iter().chain([prompt.len() - 1]).filter(|&m| m > kept && m < prompt.len()).collect();
+        // The template's boundaries (end of the system prompt, end of the last message) and one short of the end: a
+        // side request reuses the first, a new user turn the second, a continuation after tool results the third.
+        let mut marks: Vec<usize> = checkpoints.iter().map(|&c| c as usize).chain([prompt.len() - 1]).filter(|&m| m > kept && m < prompt.len()).collect();
         marks.sort_unstable();
         marks.dedup();
         self.seqs.push(Seq {

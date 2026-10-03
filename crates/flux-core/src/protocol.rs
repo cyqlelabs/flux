@@ -76,9 +76,9 @@ pub enum Request {
         /// Reply text already delivered before a restart; the parser starts after it.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         chat_prefix: String,
-        /// Prompt position worth a recurrent-state checkpoint for the next request's reuse (`Templated`).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        checkpoint: Option<u32>,
+        /// Prompt positions worth a recurrent-state checkpoint for later requests' reuse (`Templated`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        checkpoints: Vec<u32>,
     },
     /// Grants credit for `n` more tokens; bounds how far generation may run ahead of the consumer.
     Decode {
@@ -192,9 +192,9 @@ pub enum Event {
         /// How to split this request's reply (passed back in `Prefill.chat`).
         #[serde(default)]
         parser: Option<serde_json::Value>,
-        /// Prompt tokens before the generation prompt.
+        /// Prompt tokens shared with other requests: up to the end of the system prompt and of the last message.
         #[serde(default)]
-        checkpoint: Option<u32>,
+        checkpoints: Vec<u32>,
     },
     Prefilled {
         req: String,

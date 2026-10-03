@@ -1044,22 +1044,48 @@ char * fx_apply_template(fx_engine * e, const char * request_json) {
             {"parser",
              {{"format", (int) cp.format}, {"generation_prompt", cp.generation_prompt}, {"parser", cp.parser}, {"parse_tool_calls", !in.tools.empty()}}},
         };
-        // The end of the last message, before the generation prompt: where the next turn's prompt still agrees
-        // with this one even when the template rewrites the reply (e.g. drops its reasoning). Recurrent models
-        // checkpoint there for prompt reuse.
-        if (in.add_generation_prompt) {
-            common_chat_templates_inputs bare = in;
-            bare.add_generation_prompt = false;
-            const auto full = common_tokenize(e->vocab, cp.prompt, true, true);
-            const auto head = common_tokenize(e->vocab, common_chat_templates_apply(e->tmpls.get(), bare).prompt, true, true);
-            size_t n = 0;
-            while (n < full.size() && n < head.size() && full[n] == head[n]) {
-                n++;
+        // Positions where later prompts still agree with this one, for recurrent models to checkpoint: the end of
+        // the system prompt (shared by a client's side requests) and the end of the last message (the next turn
+        // agrees up to there even when the template rewrites the reply, e.g. drops its reasoning). Each is where
+        // a variant of these messages starts to differ.
+        const auto full = common_tokenize(e->vocab, cp.prompt, true, true);
+        const auto agreed = [&](common_chat_templates_inputs variant) -> size_t {
+            try {
+                const auto other = common_tokenize(e->vocab, common_chat_templates_apply(e->tmpls.get(), variant).prompt, true, true);
+                size_t n = 0;
+                while (n < full.size() && n < other.size() && full[n] == other[n]) {
+                    n++;
+                }
+                return n < full.size() ? n : 0;
+            } catch (const std::exception &) {
+                return 0;
             }
-            if (n > 0 && n < full.size()) {
-                out["checkpoint"] = n;
+        };
+        json checkpoints = json::array();
+        size_t n_sys = 0;
+        while (n_sys < in.messages.size() && (in.messages[n_sys].role == "system" || in.messages[n_sys].role == "developer")) {
+            n_sys++;
+        }
+        if (n_sys > 0 && n_sys < in.messages.size()) {
+            common_chat_templates_inputs variant = in;
+            variant.messages.resize(n_sys);
+            common_chat_msg probe;
+            probe.role = "user";
+            probe.content = "\x01";
+            variant.messages.push_back(probe);
+            variant.add_generation_prompt = false;
+            if (const size_t n = agreed(variant); n > 0) {
+                checkpoints.push_back(n);
             }
         }
+        if (in.add_generation_prompt) {
+            common_chat_templates_inputs variant = in;
+            variant.add_generation_prompt = false;
+            if (const size_t n = agreed(variant); n > 0) {
+                checkpoints.push_back(n);
+            }
+        }
+        out["checkpoints"] = checkpoints;
         return dup(out.dump());
     } catch (const std::exception & ex) {
         return err_json(ex.what());

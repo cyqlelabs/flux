@@ -65,17 +65,17 @@ pub struct Templated {
     pub additional_stops: Vec<String>,
     /// How to split the reply into reasoning, content and tool calls (`ChatOptions::parser`).
     pub parser: Option<serde_json::Value>,
-    /// Prompt tokens before the generation prompt (`ChatOptions::checkpoint`).
-    pub checkpoint: Option<u32>,
+    /// Prompt positions worth checkpointing for reuse (`ChatOptions::checkpoints`).
+    pub checkpoints: Vec<u32>,
 }
 
-/// Chat extras of a request: reply parsing and the prompt position worth checkpointing for reuse.
+/// Chat extras of a request: reply parsing and the prompt positions worth checkpointing for reuse.
 #[derive(Debug, Clone, Default)]
 pub struct ChatOptions {
     pub parser: Option<serde_json::Value>,
     /// Reply text delivered before a worker restart; parsing resumes after it.
     pub prefix: String,
-    pub checkpoint: Option<u32>,
+    pub checkpoints: Vec<u32>,
 }
 
 impl Worker {
@@ -169,8 +169,8 @@ impl Worker {
 
     pub async fn apply_template(&self, messages: serde_json::Value, tools: Option<serde_json::Value>) -> Result<Templated> {
         match self.call(|id| Request::ApplyTemplate { id, messages, tools, add_generation_prompt: true }).await? {
-            Event::Templated { prompt, preserved_tokens, additional_stops, parser, checkpoint, .. } => {
-                Ok(Templated { prompt, preserved_tokens, additional_stops, parser, checkpoint })
+            Event::Templated { prompt, preserved_tokens, additional_stops, parser, checkpoints, .. } => {
+                Ok(Templated { prompt, preserved_tokens, additional_stops, parser, checkpoints })
             }
             ev => bail!("unexpected reply {ev:?}"),
         }
@@ -203,8 +203,8 @@ impl Worker {
         chat: ChatOptions,
     ) -> Result<mpsc::UnboundedReceiver<Event>> {
         let rx = self.route(req);
-        let ChatOptions { parser, prefix, checkpoint } = chat;
-        self.send(&Request::Prefill { req: req.into(), prompt, sampling, stop, max_tokens, render_special, chat: parser, chat_prefix: prefix, checkpoint })
+        let ChatOptions { parser, prefix, checkpoints } = chat;
+        self.send(&Request::Prefill { req: req.into(), prompt, sampling, stop, max_tokens, render_special, chat: parser, chat_prefix: prefix, checkpoints })
             .await?;
         Ok(rx)
     }

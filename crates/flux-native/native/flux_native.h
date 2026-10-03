@@ -41,8 +41,8 @@ int32_t fx_tokenize(fx_engine * e, const char * text, int32_t len, bool add_spec
 int32_t fx_token_piece(fx_engine * e, int32_t token, bool special, char * buf, int32_t cap);
 bool fx_is_eog(fx_engine * e, int32_t token);
 // {"messages":[...],"tools":[...]?,"add_generation_prompt":bool} -> {"prompt","preserved_tokens":[ids],
-// "additional_stops":[...],"parser":{...},"checkpoint"?}: "parser" is the spec for fx_chat_parser_new and
-// "checkpoint" the prompt tokens before the generation prompt.
+// "additional_stops":[...],"parser":{...},"checkpoints":[...]}: "parser" is the spec for fx_chat_parser_new and
+// "checkpoints" the prompt positions later prompts are likely to share (end of the system prompt, of the last message).
 char * fx_apply_template(fx_engine * e, const char * request_json);
 
 // Splits a chat reply into reasoning, content and tool calls as llama-server does, for one request.

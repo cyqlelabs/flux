@@ -125,7 +125,7 @@ impl State {
                         preserved_tokens: vec![],
                         additional_stops: vec![],
                         parser: None,
-                        checkpoint: None,
+                        checkpoints: vec![],
                     }),
                     Err(e) => self.error(None, Some(id), ErrorCode::Backend, e.to_string()),
                 }

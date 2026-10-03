@@ -257,7 +257,7 @@ pub async fn chat(State(st): State<Arc<AppState>>, headers: HeaderMap, Json(body
         Ok(p) => p,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "engine_error", e.to_string()),
     };
-    let chat = ChatOptions { parser: templated.parser, prefix: String::new(), checkpoint: templated.checkpoint };
+    let chat = ChatOptions { parser: templated.parser, prefix: String::new(), checkpoints: templated.checkpoints };
     token_request(st, Api::Chat, id, prompt, body, templated.preserved_tokens, templated.additional_stops, chat, permit).await
 }
 
