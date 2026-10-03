@@ -712,12 +712,9 @@ pub async fn plan(
         match trace_routes(&ctx, &base_plan(&base), corpus).await {
             Ok(routes) => {
                 // Every prompt chunk streams the host experts to the GPU once, so larger chunks process long
-                // prompts faster but leave less room for cached experts: size the cache for both chunk sizes and
+                // prompts faster but leave less room for cached experts: size the cache for every chunk size and
                 // let the measured runs, short and long, choose.
-                let mut sizes = vec![base.n_ubatch];
-                if req.n_ubatch != base.n_ubatch {
-                    sizes.push(req.n_ubatch);
-                }
+                let sizes = std::iter::once(base.n_ubatch).chain(ubatches.iter().copied().filter(|&u| u != base.n_ubatch));
                 for ub in sizes {
                     let base = match ub == base.n_ubatch {
                         true => base.clone(),
@@ -806,7 +803,8 @@ pub async fn plan(
         }
         for k in contenders {
             log(&format!("long prompt on {}", results[k].1.label));
-            match depth_run(&ctx, &base_plan(&runs[results[k].0]), corpus, depth_tokens).await {
+            let plan = base_plan(&runs[results[k].0]);
+            match depth_run(&ctx, &plan, corpus, depth_tokens).await {
                 Ok(d) => {
                     log(&format!(
                         "  {} prompt tokens at {:.0} tok/s ({:.1} s to the first token), decode {:.2} tok/s",
@@ -817,7 +815,10 @@ pub async fn plan(
                     ));
                     results[k].1.depth = Some(d);
                 }
-                Err(e) => rejected.push(format!("{}: long prompt failed: {e:#}", results[k].1.label)),
+                Err(e) => {
+                    log(&format!("  failed: {e:#} (worker log: {})", cfg.data_dir.join("logs").join(format!("plan-{}.log", plan.id)).display()));
+                    rejected.push(format!("{}: long prompt failed: {e:#}", results[k].1.label));
+                }
             }
         }
         let measured: Vec<usize> = ranked.iter().copied().filter(|&k| results[k].1.depth.is_some()).collect();
