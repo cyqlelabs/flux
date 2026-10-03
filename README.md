@@ -1,6 +1,10 @@
-# Flux
+<p align="center">
+  <img src="assets/logo.png" width="240" alt="Flux logo: five lines squeezed through a narrow waist burst out as a spray of dots">
+</p>
 
-**Squeezes every last token out of your machine.**
+<h1 align="center">Flux</h1>
+
+<p align="center"><b>Squeezes every last token out of your machine.</b></p>
 
 Flux is a measured execution planner and runtime for LLM inference. It measures your GPUs, CPU, and storage, searches placements of a model's layers and mixture-of-experts weights across them, times the fastest candidates on real prompts, and saves the winner as an immutable plan. When a model outgrows RAM, you can let the plan stream the remaining weights from an NVMe drive. `flux serve` then runs that plan behind an OpenAI-compatible API.
 
