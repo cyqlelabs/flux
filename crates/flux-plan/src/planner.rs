@@ -711,18 +711,14 @@ pub async fn plan(
         (ctx.log)(&format!("tracing expert routing on {}", base.label));
         match trace_routes(&ctx, &base_plan(&base), corpus).await {
             Ok(routes) => {
-                // Every prompt chunk streams the host experts to the GPU once, so larger chunks reach the first
-                // token sooner but leave less room for cached experts: size the cache for both chunk sizes and
-                // let the measured runs choose (decode ties go to the faster first token).
+                // Every prompt chunk streams the host experts to the GPU once, so larger chunks process long
+                // prompts faster but leave less room for cached experts: size the cache for both chunk sizes and
+                // let the measured runs, short and long, choose.
                 let mut sizes = vec![base.n_ubatch];
                 if req.n_ubatch != base.n_ubatch {
                     sizes.push(req.n_ubatch);
                 }
-                for (n, ub) in sizes.into_iter().enumerate() {
-                    // The second chunk size is a refinement: only within the budget.
-                    if n > 0 && t_start.elapsed() >= budget {
-                        break;
-                    }
+                for ub in sizes {
                     let base = match ub == base.n_ubatch {
                         true => base.clone(),
                         false => match ctx.measure(&base.placement, ub).await {
@@ -793,6 +789,44 @@ pub async fn plan(
         "every candidate failed to run:\n  {}",
         results.iter().map(|r| format!("{}: {}", r.1.label, r.1.failure.clone().unwrap_or_default())).collect::<Vec<_>>().join("\n  ")
     );
+    // Long prompts: one request a quarter of the planned context deep, so the choice also holds for clients that
+    // send long prompts. The contenders are the two best short-prompt runs and the best of every other chunk
+    // size, the setting long prompts expose; ranking them needs no assumption about the mix of requests.
+    let depth_tokens = (n_ctx_seq / 4).min(n_ctx_seq.saturating_sub(2 * req.decode_tokens));
+    let deep = matches!(req.workload.objective, Objective::Interactive) && depth_tokens >= 4 * req.prompt_tokens;
+    if deep {
+        let mut contenders: Vec<usize> = ranked.iter().copied().take(2).collect();
+        for &k in &ranked {
+            if contenders.len() >= MAX_CONTENDERS {
+                break;
+            }
+            if !contenders.iter().any(|&c| runs[results[c].0].n_ubatch == runs[results[k].0].n_ubatch) {
+                contenders.push(k);
+            }
+        }
+        for k in contenders {
+            log(&format!("long prompt on {}", results[k].1.label));
+            match depth_run(&ctx, &base_plan(&runs[results[k].0]), corpus, depth_tokens).await {
+                Ok(d) => {
+                    log(&format!(
+                        "  {} prompt tokens at {:.0} tok/s ({:.1} s to the first token), decode {:.2} tok/s",
+                        d.prompt_tokens,
+                        d.prefill_tps,
+                        d.ttft_ms / 1e3,
+                        d.decode_tps
+                    ));
+                    results[k].1.depth = Some(d);
+                }
+                Err(e) => rejected.push(format!("{}: long prompt failed: {e:#}", results[k].1.label)),
+            }
+        }
+        let measured: Vec<usize> = ranked.iter().copied().filter(|&k| results[k].1.depth.is_some()).collect();
+        if !measured.is_empty() {
+            ranked = measured;
+            robust(&mut ranked, &|k| results[k].2.clone().unwrap(), &|k| results[k].1.depth.clone().unwrap());
+        }
+    }
+    let deep = deep && results[ranked[0]].1.depth.is_some();
     let mut validated: Vec<(usize, RunSummary)> = vec![];
     for &k in ranked.iter().take(2) {
         log(&format!("validating {}", results[k].1.label));
@@ -805,7 +839,11 @@ pub async fn plan(
         }
     }
     let mut finals: Vec<usize> = (0..validated.len()).collect();
-    order(&mut finals, &|i| validated[i].1.clone());
+    if deep {
+        robust(&mut finals, &|i| validated[i].1.clone(), &|i| results[validated[i].0].1.depth.clone().unwrap());
+    } else {
+        order(&mut finals, &|i| validated[i].1.clone());
+    }
     let best = finals.first().map_or(ranked[0], |&i| validated[i].0);
     let chosen = &runs[results[best].0];
     let validation = ValidationRecord {
@@ -826,6 +864,10 @@ pub async fn plan(
             .collect(),
         chosen: chosen.label.clone(),
         reason: match req.workload.objective {
+            Objective::Interactive if deep => format!(
+                "best worst case over decode rate and first-token time on short prompts ({} tokens) and on a long one ({depth_tokens} tokens), each relative to the best candidate there (within 3% are ties, won by the higher geometric mean)",
+                req.prompt_tokens
+            ),
             Objective::Interactive => {
                 "highest median single-stream decode rate on validation prompts (rates within 3% are ties, won by the faster first token)".into()
             }
@@ -1204,7 +1246,7 @@ async fn speculate(
 }
 
 fn failed_result(c: &Candidate, why: String) -> CandidateResult {
-    CandidateResult { label: c.label.clone(), predicted_token_ms: c.predicted_decode_s * 1e3, calibration: None, validation: None, failure: Some(why), expert_cache: None, placement: None, n_ubatch: None, speculation: None }
+    CandidateResult { label: c.label.clone(), predicted_token_ms: c.predicted_decode_s * 1e3, calibration: None, validation: None, failure: Some(why), expert_cache: None, placement: None, n_ubatch: None, speculation: None, depth: None }
 }
 
 /// Calibrates one candidate. With `reference` (greedy output of the same plan without drafting, for
@@ -1240,7 +1282,7 @@ async fn calibrate(ctx: &Ctx<'_>, c: &Candidate, plan: &Plan, reference: Option<
     match measured_run(ctx, plan, corpus, Role::Calibration, ctx.cfg.plan.calibration_prompts, devices).await {
         Ok((m, s)) => {
             (ctx.log)(&format!("  decode {:.2} tok/s p50, TTFT {:.0} ms p50", s.decode_tps.p50, s.ttft_ms.p50));
-            (CandidateResult { label: c.label.clone(), predicted_token_ms: c.predicted_decode_s * 1e3, calibration: Some(m), validation: None, failure: None, expert_cache: None, placement: None, n_ubatch: None, speculation: None }, Some(s))
+            (CandidateResult { label: c.label.clone(), predicted_token_ms: c.predicted_decode_s * 1e3, calibration: Some(m), validation: None, failure: None, expert_cache: None, placement: None, n_ubatch: None, speculation: None, depth: None }, Some(s))
         }
         Err(e) => (failed(format!("{e:#}")), None),
     }
@@ -1273,6 +1315,65 @@ async fn greedy_tokens(ctx: &Ctx<'_>, plan: &Plan, corpus: &Corpus) -> Result<Ve
     .await;
     w.shutdown().await;
     out
+}
+
+/// Contenders measured at depth, besides the two best short-prompt runs.
+const MAX_CONTENDERS: usize = 4;
+
+/// Orders candidates by their worst condition, each condition's rate taken relative to the best candidate there:
+/// decode and first-token time on short prompts, prefill and decode on the long one. No condition is assumed
+/// more common than another. Within 3% of the best worst case, the higher geometric mean wins.
+fn robust(ks: &mut [usize], short: &dyn Fn(usize) -> RunSummary, deep: &dyn Fn(usize) -> DepthMeasurement) {
+    let rates = |k: usize| {
+        let (s, d) = (short(k), deep(k));
+        [s.decode_tps.p50, 1e3 / s.ttft_ms.p50.max(1e-9), d.prefill_tps, d.decode_tps]
+    };
+    let all: Vec<[f64; 4]> = ks.iter().map(|&k| rates(k)).collect();
+    let top: Vec<f64> = (0..4).map(|c| all.iter().map(|r| r[c]).fold(0.0, f64::max).max(1e-12)).collect();
+    let score: HashMap<usize, (f64, f64)> = ks
+        .iter()
+        .zip(&all)
+        .map(|(&k, r)| {
+            let rel: Vec<f64> = r.iter().zip(&top).map(|(v, t)| v / t).collect();
+            let worst = rel.iter().copied().fold(f64::MAX, f64::min);
+            let mean = rel.iter().map(|x| x.max(1e-12).ln()).sum::<f64>() / rel.len() as f64;
+            (k, (worst, mean))
+        })
+        .collect();
+    let best_worst = score.values().map(|s| s.0).fold(0.0, f64::max);
+    let near = |k: usize| score[&k].0 >= best_worst - 0.03;
+    ks.sort_by(|&a, &b| {
+        near(b).cmp(&near(a)).then_with(|| match near(a) && near(b) {
+            true => score[&b].1.total_cmp(&score[&a].1),
+            false => score[&b].0.total_cmp(&score[&a].0),
+        })
+    });
+}
+
+/// One long request on a candidate: prefill rate and decode rate at that depth.
+async fn depth_run(ctx: &Ctx<'_>, plan: &Plan, corpus: &Corpus, n_tokens: u32) -> Result<DepthMeasurement> {
+    let logs = ctx.cfg.data_dir.join("logs");
+    std::fs::create_dir_all(&logs)?;
+    let w = Worker::spawn(&plan.engine, Some(&logs.join(format!("plan-{}.log", plan.id)))).await?;
+    let result = async {
+        tokio::time::timeout(Duration::from_secs(1800), w.load(plan)).await.context("load timed out")??;
+        let warm = chat_prompt(&w, corpus, Role::Calibration, 999, 32).await?;
+        crate::run::run_stream(&w, "warmup", warm, 8, bench_sampling()).await?;
+        let p = chat_prompt(&w, corpus, Role::Calibration, 500, n_tokens as usize).await?;
+        let r = crate::run::run_stream(&w, "depth", p, ctx.req.decode_tokens, bench_sampling()).await?;
+        if let Some(e) = r.error {
+            bail!("{e}");
+        }
+        Ok(DepthMeasurement {
+            prompt_tokens: r.n_prompt as u32,
+            ttft_ms: r.ttft_s * 1e3,
+            prefill_tps: r.n_prompt as f64 / r.ttft_s.max(1e-9),
+            decode_tps: r.decode_rate().context("too few tokens to time decoding")?,
+        })
+    }
+    .await;
+    w.shutdown().await;
+    result
 }
 
 /// One measured session: load, warm up, run prompts, record distributions and peak memory.

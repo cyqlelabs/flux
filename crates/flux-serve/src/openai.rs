@@ -142,7 +142,7 @@ async fn token_request(
         drop(permit);
         st2.live.finish(&id2, &o);
         if let Some(tps) = o.decode_tps {
-            crate::monitor::observe_rate(&st2, tps);
+            crate::monitor::observe_rate(&st2, tps, o.n_prompt);
         }
         let _ = done_tx.send(o);
     });

@@ -250,6 +250,26 @@ pub struct Measurement {
     pub peak_host_rss: u64,
 }
 
+/// One long request on a candidate: a prompt a quarter of the planned context, then decoding at that depth.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DepthMeasurement {
+    pub prompt_tokens: u32,
+    pub ttft_ms: f64,
+    /// Prompt tokens per second of time to first token.
+    pub prefill_tps: f64,
+    pub decode_tps: f64,
+}
+
+impl DepthMeasurement {
+    /// Expected decode rate at `depth` cached tokens, from the short-prompt rate and this one: time per token
+    /// grows linearly with depth (attention reads every cached position), clamped at twice the measured depth.
+    pub fn decode_tps_at(&self, short_tps: f64, depth: u32) -> f64 {
+        let (t0, t1) = (1.0 / short_tps.max(1e-9), 1.0 / self.decode_tps.max(1e-9));
+        let x = (depth as f64 / self.prompt_tokens.max(1) as f64).min(2.0);
+        1.0 / (t0 + (t1 - t0) * x).max(1e-9)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CandidateResult {
     pub label: String,
@@ -267,6 +287,9 @@ pub struct CandidateResult {
     pub n_ubatch: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speculation: Option<Speculation>,
+    /// The long-prompt measurement, for candidates that reached the final comparison.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<DepthMeasurement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

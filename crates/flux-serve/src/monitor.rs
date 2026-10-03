@@ -2,6 +2,7 @@
 //! decode-rate drift against the plan's validated rate is tracked with hysteresis.
 
 use crate::AppState;
+use flux_core::plan::DepthMeasurement;
 use flux_plan::store::DriftMonitor;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -72,19 +73,31 @@ pub fn spawn(st: Arc<AppState>) {
     });
 }
 
-/// Feeds a finished request's decode rate. Once drift is established, replans automatically when
-/// the configured horizon makes it pay (`should_retune`), otherwise logs once.
-pub fn observe_rate(st: &Arc<AppState>, tps: f64) {
+/// Feeds a finished request's decode rate at `depth` prompt tokens. The rate is compared with what the plan
+/// measured at that depth, so long-context requests do not read as drift. Once drift is established, replans
+/// automatically when the configured horizon makes it pay (`should_retune`), otherwise logs once.
+pub fn observe_rate(st: &Arc<AppState>, tps: f64, depth: u32) {
     let mut d = st.drift.lock().unwrap();
     d.recent_tps = if d.recent_tps == 0.0 { tps } else { 0.8 * d.recent_tps + 0.2 * tps };
+    let expected = d.depth.as_ref().map_or(d.baseline_tps, |m| m.decode_tps_at(d.baseline_tps, depth));
+    let ratio = if expected > 0.0 { tps / expected } else { 1.0 };
+    d.recent_ratio = if d.recent_ratio == 0.0 { ratio } else { 0.8 * d.recent_ratio + 0.2 * ratio };
+    let baseline = d.baseline_tps;
     let Some(m) = d.monitor.as_mut() else { return };
-    if !m.observe(tps) || d.drifted {
+    if !m.observe(ratio * baseline) || d.drifted {
         return;
     }
     d.drifted = true;
     let horizon = st.cfg.serve.retune_horizon_tokens as f64;
-    let pays = horizon > 0.0 && st.replanner.is_some() && flux_plan::store::should_retune(d.recent_tps, d.baseline_tps, horizon, d.retune_cost_s);
-    tracing::warn!(tps = d.recent_tps, baseline = d.baseline_tps, retune_cost_s = d.retune_cost_s, pays, "decode rate drifted below the plan's validated rate");
+    let recent = d.recent_ratio * d.baseline_tps;
+    let pays = horizon > 0.0 && st.replanner.is_some() && flux_plan::store::should_retune(recent, d.baseline_tps, horizon, d.retune_cost_s);
+    tracing::warn!(
+        tps = recent,
+        baseline = d.baseline_tps,
+        retune_cost_s = d.retune_cost_s,
+        pays,
+        "decode rate drifted below the plan's validated rate at the requests' depth"
+    );
     if pays {
         let st = st.clone();
         tokio::spawn(async move {
@@ -99,18 +112,24 @@ pub fn observe_rate(st: &Arc<AppState>, tps: f64) {
 pub struct Drift {
     pub monitor: Option<DriftMonitor>,
     pub baseline_tps: f64,
+    /// The plan's long-prompt measurement, which sets the expected rate at depth.
+    pub depth: Option<DepthMeasurement>,
     pub recent_tps: f64,
+    /// Recent rates over the rate the plan measured at the same depth (1 = as validated).
+    pub recent_ratio: f64,
     /// Planning plus loading time, what a retune is expected to cost.
     pub retune_cost_s: f64,
     pub drifted: bool,
 }
 
 impl Drift {
-    pub fn new(baseline_tps: Option<f64>, retune_cost_s: f64) -> Drift {
+    pub fn new(baseline_tps: Option<f64>, depth: Option<DepthMeasurement>, retune_cost_s: f64) -> Drift {
         Drift {
             monitor: baseline_tps.map(|b| DriftMonitor::new(b, 0.15, 5)),
             baseline_tps: baseline_tps.unwrap_or(0.0),
+            depth,
             recent_tps: 0.0,
+            recent_ratio: 0.0,
             retune_cost_s,
             drifted: false,
         }

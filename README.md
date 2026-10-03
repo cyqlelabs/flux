@@ -82,7 +82,7 @@ flux plan path/to/model.gguf --ctx 16384
 flux serve <plan-id>
 ```
 
-The first `flux plan` probes the hardware, downloads the WikiText-2 prompt corpus, and then times the finalist placements within a tuning budget of 600 seconds (`--budget-s` changes it). Drafting and the GPU expert cache then build on the fastest placement, however long the finalists took. Later runs for the same model, machine, and workload reuse the saved plan; pass `--replan` to measure again. `flux serve` accepts any unique prefix of a plan id, and `flux plans` lists them.
+The first `flux plan` probes the hardware, downloads the WikiText-2 prompt corpus, and then times the finalist placements within a tuning budget of 600 seconds (`--budget-s` changes it). Drafting and the GPU expert cache then build on the fastest placement, however long the finalists took. The best few then run one long prompt, a quarter of the planned context, and Flux keeps the plan whose worst case across short and long prompts is closest to the best, so no prompt length is assumed. Later runs for the same model, machine, and workload reuse the saved plan; pass `--replan` to measure again. `flux serve` accepts any unique prefix of a plan id, and `flux plans` lists them.
 
 The server listens on `127.0.0.1:8090`:
 

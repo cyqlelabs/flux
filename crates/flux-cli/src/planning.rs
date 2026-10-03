@@ -196,12 +196,16 @@ pub fn print_plan(p: &Plan) {
             let m = c.validation.as_ref().or(c.calibration.as_ref());
             match (m, &c.failure) {
                 (Some(m), _) => println!(
-                    "  {:<60} predicted {:>6.1} ms/tok · measured {:>6.2} tok/s p50 ({:.2} min) · TTFT {:>6.0} ms{}",
+                    "  {:<60} predicted {:>6.1} ms/tok · measured {:>6.2} tok/s p50 ({:.2} min) · TTFT {:>6.0} ms{}{}",
                     c.label,
                     c.predicted_token_ms,
                     m.decode_tps.p50,
                     m.decode_tps.min,
                     m.ttft_ms.p50,
+                    c.depth.as_ref().map_or(String::new(), |d| format!(
+                        " · {}-token prompt at {:.0} tok/s, decode {:.2} tok/s",
+                        d.prompt_tokens, d.prefill_tps, d.decode_tps
+                    )),
                     if c.validation.is_some() { " · validated" } else { "" }
                 ),
                 (None, Some(f)) => println!("  {:<60} {f}", c.label),
