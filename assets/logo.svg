@@ -1,21 +1,20 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="28 140 456 232" width="456" height="232">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="8 104 500 300" width="500" height="300">
   <title>Flux</title>
   <defs>
-    <linearGradient id="heat" gradientUnits="userSpaceOnUse" x1="48" y1="0" x2="464" y2="0">
-      <stop offset="0" stop-color="#F97316"/>
-      <stop offset="1" stop-color="#E11D48"/>
-    </linearGradient>
+    <mask id="ribs">
+      <rect x="0" y="0" width="512" height="512" fill="#fff"/>
+      <g fill="none" stroke="#000" stroke-width="10" stroke-linecap="round">
+        <path d="M256 180 V272"/>
+        <path d="M238 188 Q222 230 214 272"/>
+        <path d="M274 188 Q290 230 298 272"/>
+      </g>
+    </mask>
   </defs>
-  <g fill="none" stroke="url(#heat)" stroke-width="18" stroke-linecap="round">
-    <path d="M48 164 C150 164 196 234 256 234"/>
-    <path d="M256 234 C316 234 362 164 464 164" stroke-dasharray="0 30" stroke-dashoffset="2"/>
-    <path d="M48 210 C150 210 196 245 256 245"/>
-    <path d="M256 245 C316 245 362 210 464 210" stroke-dasharray="0 30" stroke-dashoffset="2"/>
-    <path d="M48 256 C150 256 196 256 256 256"/>
-    <path d="M256 256 C316 256 362 256 464 256" stroke-dasharray="0 30" stroke-dashoffset="2"/>
-    <path d="M48 302 C150 302 196 267 256 267"/>
-    <path d="M256 267 C316 267 362 302 464 302" stroke-dasharray="0 30" stroke-dashoffset="2"/>
-    <path d="M48 348 C150 348 196 278 256 278"/>
-    <path d="M256 278 C316 278 362 348 464 348" stroke-dasharray="0 30" stroke-dashoffset="2"/>
+  <g fill="#F97316" stroke="#F97316" stroke-linejoin="round">
+    <path mask="url(#ribs)" stroke="none" d="M160 280 C160 212 224 150 256 118 C288 150 352 212 352 280 Z"/>
+    <path stroke-width="8" d="M26 283 L78 290 L78 308 Z"/>
+    <rect stroke="none" x="64" y="290" width="436" height="18" rx="9"/>
+    <path stroke="none" d="M80 313 H432 A176 72 0 0 1 80 313 Z"/>
+    <path stroke="none" d="M30 318 C30 318 17 339 17 349 A13 13 0 0 0 43 349 C43 339 30 318 30 318 Z"/>
   </g>
 </svg>

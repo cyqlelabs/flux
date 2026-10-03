@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" width="240" alt="Flux logo: five lines squeezed through a narrow waist burst out as a spray of dots">
+  <img src="assets/logo.png" width="220" alt="Flux logo: a manual citrus squeezer with a drop falling from its spout">
 </p>
 
 <h1 align="center">Flux</h1>
