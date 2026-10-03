@@ -1516,10 +1516,11 @@ fn explain(
             .map(|(_, s)| s.as_ref().unwrap().decode_tps.p50)
             .fold(None, |m: Option<f64>, r| Some(m.map_or(r, |m| m.max(r))))
     };
-    let cache_rate = rate_of(&|c: &Candidate| c.cache.is_some());
+    // Without drafting on either side; the speculation decision reports what drafting adds.
+    let cache_rate = rate_of(&|c: &Candidate| c.cache.is_some() && c.speculation.is_none());
     let tensor_rate = rate_of(&|c: &Candidate| c.cache.is_none() && c.speculation.is_none());
     if lay.n_expert > 0 {
-        let cache = measured.iter().find_map(|(c, _)| c.cache.as_ref());
+        let cache = chosen.cache.as_ref().or_else(|| measured.iter().find_map(|(c, _)| c.cache.as_ref()));
         plan.decisions.push(Decision {
             resource: "routed experts".into(),
             used: chosen.cache.is_some(),
