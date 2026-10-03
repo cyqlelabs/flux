@@ -675,11 +675,9 @@ pub async fn plan(
     // Whether drafting certified (rollback reproduces the plain greedy output) on the plain placement.
     let mut spec_certified = false;
     let plain_best = best(&results, &runs, &|c| c.engine == EngineKind::Native && c.speculation.is_none() && c.cache.is_none());
-    let over_budget = || format!("({:.0} s of {:.0} s; raise --budget-s)", t_start.elapsed().as_secs_f64(), cfg.plan.tuning_budget_s);
-    if native_mtp && plain_best.is_some() && t_start.elapsed() >= budget {
-        rejected.push(format!("{SPECULATION_SKIPPED} {}", over_budget()));
-    }
-    if let (true, Some((base, outputs))) = (native_mtp && t_start.elapsed() < budget, plain_best) {
+    // The budget caps the placement finalists above; the stages that build on the fastest one run once
+    // regardless, because on MoE models they are worth more than any placement (15 -> 49 tok/s on Flash-Next).
+    if let (true, Some((base, outputs))) = (native_mtp, plain_best) {
         match reference_tokens(&ctx, &base_plan(&base), hybrid, corpus).await {
             Ok(reference) => {
                 let mut best: Option<(u32, f64)> = None;
@@ -709,10 +707,7 @@ pub async fn plan(
             && c.assignment.on_cpu.iter().zip(&c.assignment.layer_device).any(|(h, d)| d != CPU && h.contains(&true))
     };
     let cache_base = best(&results, &runs, &cacheable);
-    if req.expert_residency && lay.n_expert > 0 && cache_base.is_some() && t_start.elapsed() >= budget {
-        rejected.push(format!("{CACHE_SKIPPED} {}", over_budget()));
-    }
-    if let (true, Some((base, _))) = (req.expert_residency && lay.n_expert > 0 && t_start.elapsed() < budget, cache_base) {
+    if let (true, Some((base, _))) = (req.expert_residency && lay.n_expert > 0, cache_base) {
         (ctx.log)(&format!("tracing expert routing on {}", base.label));
         match trace_routes(&ctx, &base_plan(&base), corpus).await {
             Ok(routes) => {
@@ -723,8 +718,9 @@ pub async fn plan(
                 if req.n_ubatch != base.n_ubatch {
                     sizes.push(req.n_ubatch);
                 }
-                for ub in sizes {
-                    if t_start.elapsed() >= budget {
+                for (n, ub) in sizes.into_iter().enumerate() {
+                    // The second chunk size is a refinement: only within the budget.
+                    if n > 0 && t_start.elapsed() >= budget {
                         break;
                     }
                     let base = match ub == base.n_ubatch {
@@ -771,7 +767,7 @@ pub async fn plan(
                             results.push((runs.len() - 1, result, summary));
                             // Hot experts on the GPU also make verification cheaper: every extra token in the batch
                             // mostly reuses resident experts. Draft on the cache with the best measured draft length.
-                            if native_mtp && spec_certified && calibrated && t_start.elapsed() < budget {
+                            if native_mtp && spec_certified && calibrated {
                                 match reference_tokens(&ctx, &base_plan(&c), hybrid, corpus).await {
                                     Ok(reference) => {
                                         let (s, result, summary) = speculate(&ctx, &c, spec_n_max, vocab, &lay, facts.n_layer as usize, &base_plan, reference.as_deref(), &gpus, corpus, &devices).await;
@@ -1039,10 +1035,6 @@ fn draft_vocab(outputs: &[i32], n_vocab: u32) -> Option<u32> {
 
 /// Generated tokens traced per calibration prompt for routing counts.
 const ROUTE_TOKENS: u32 = 256;
-
-/// Stages that build on the best measured placement start only within the tuning budget; these record a skip.
-const SPECULATION_SKIPPED: &str = "native drafting skipped: tuning budget spent";
-const CACHE_SKIPPED: &str = "per-expert residency skipped: tuning budget spent";
 
 /// Routing counts per layer and expert over tokens generated for the calibration prompts.
 async fn trace_routes(ctx: &Ctx<'_>, plan: &Plan, corpus: &Corpus) -> Result<Routes> {
@@ -1438,7 +1430,6 @@ fn explain(
                     if chosen.cache.is_some() { "" } else { "; not faster" }
                 ),
                 (Some(_), _, _) => "per-expert cache candidate failed to run".into(),
-                _ if rejected.iter().any(|r| r.starts_with(CACHE_SKIPPED)) => format!("whole expert tensors; {CACHE_SKIPPED} (raise --budget-s)"),
                 _ => "whole expert tensors; per-expert residency not applicable (see candidates)".into(),
             },
         });
@@ -1452,7 +1443,6 @@ fn explain(
             (Some(sp), Some(s), Some(p)) => format!("{} with {} drafted tokens: {s:.2} tok/s vs {p:.2} tok/s without", sp.kind, sp.n_max),
             (None, Some(s), Some(p)) => format!("measured {s:.2} tok/s with drafting vs {p:.2} tok/s without; not faster"),
             _ if measured.iter().any(|(c, _)| c.speculation.is_some()) => "drafting candidates failed or were not certified".into(),
-            _ if rejected.iter().any(|r| r.starts_with(SPECULATION_SKIPPED)) => format!("{SPECULATION_SKIPPED} (raise --budget-s)"),
             _ => "not measured (opt-in with --speculation; needs next-token heads or a draft model)".into(),
         },
     });

@@ -83,12 +83,13 @@ enum Cmd {
         prompt_tokens: u32,
         #[arg(long, default_value_t = 64)]
         decode_tokens: u32,
-        /// Tuning budget in seconds (default from flux.toml).
+        /// Seconds for timing placement finalists (default from flux.toml); drafting and the expert cache then
+        /// build on the fastest one regardless.
         #[arg(long)]
         budget_s: Option<f64>,
         #[arg(long)]
         allow_storage_streaming: bool,
-        /// Also measure speculative decoding (model's next-token heads or --draft-model; llama-server engine).
+        /// Also measure speculative decoding with --draft-model; models with next-token heads are measured anyway.
         #[arg(long)]
         speculation: bool,
         /// Separate draft model for --speculation.
@@ -214,8 +215,9 @@ async fn main() -> Result<()> {
                 Some(h) => planning::graft_heads(&cfg, &model, h)?,
                 None => model,
             };
-            let speculation = speculation || heads.is_some();
             let m = planning::inspect_hashed(&cfg, &model)?;
+            // Drafting is measured whenever the model carries next-token heads, and kept only where it wins.
+            let speculation = speculation || m.facts.as_ref().is_some_and(|f| f.n_layer_nextn > 0);
             let report = planning::probe_report(&cfg, Some(&m), false, reprobe).await?;
             if !replan {
                 if let Some(p) = planning::lookup(&cfg, &m, &report, ctx, concurrency).await {

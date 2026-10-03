@@ -82,7 +82,7 @@ flux plan path/to/model.gguf --ctx 16384
 flux serve <plan-id>
 ```
 
-The first `flux plan` probes the hardware, downloads the WikiText-2 prompt corpus, and then times the finalist placements within a tuning budget of 600 seconds (`--budget-s` changes it). Later runs for the same model, machine, and workload reuse the saved plan; pass `--replan` to measure again. `flux serve` accepts any unique prefix of a plan id, and `flux plans` lists them.
+The first `flux plan` probes the hardware, downloads the WikiText-2 prompt corpus, and then times the finalist placements within a tuning budget of 600 seconds (`--budget-s` changes it). Drafting and the GPU expert cache then build on the fastest placement, however long the finalists took. Later runs for the same model, machine, and workload reuse the saved plan; pass `--replan` to measure again. `flux serve` accepts any unique prefix of a plan id, and `flux plans` lists them.
 
 The server listens on `127.0.0.1:8090`:
 
@@ -119,7 +119,7 @@ Run `flux <command> --help` for every flag.
 | `--serving-p95-ms` | off | Optimize aggregate tokens per second under this p95 per-token latency |
 | `--engines` | `native,llama-server` | Engines to compare, including any named in `flux.toml` |
 | `--kv` | `f16` | KV cache type; any other type is labelled as a separate quality profile |
-| `--speculation` | off | Also measure speculative decoding |
+| `--speculation` | off | Also measure drafting with `--draft-model`; models with next-token heads are measured without it |
 | `--draft-model`, `--heads` | none | Draft with a separate model, or graft next-token (MTP) heads onto the model |
 | `--allow-storage-streaming` | off | Let a plan read the weights that do not fit in RAM from the drive; without it, Flux rejects such placements and reports their decode limit |
 | `--replan`, `--reprobe` | off | Ignore the saved plan or the saved probe report |
