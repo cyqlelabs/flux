@@ -157,7 +157,7 @@ async fn stats(State(st): State<Arc<AppState>>) -> Response {
             "rejected": st.admission.rejected.load(std::sync::atomic::Ordering::Relaxed),
         },
         "journal_running": st.journal.running(),
-        "drift": {"baseline_tps": d.baseline_tps, "drifted": d.drifted},
+        "drift": {"baseline_tps": d.baseline_tps, "recent_tps": d.recent_tps, "drifted": d.drifted},
         "worker": worker,
     }))
     .into_response()
