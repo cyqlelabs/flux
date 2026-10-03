@@ -4,6 +4,7 @@
 pub mod admission;
 pub mod generate;
 pub mod journal;
+pub mod live;
 pub mod monitor;
 pub mod openai;
 pub mod supervisor;
@@ -37,6 +38,7 @@ pub struct AppState {
     /// Admission closes when MemAvailable falls below this (MiB); adjustable at run time.
     pub min_available_mib: std::sync::atomic::AtomicU64,
     pub drift: Mutex<monitor::Drift>,
+    pub live: live::Live,
     pub model_name: String,
     /// `tokens` or `chat`, from the worker's hello.
     pub level: String,
@@ -70,6 +72,7 @@ pub async fn build(cfg: FluxConfig, plan: Plan, replanner: Option<Replanner>) ->
         pressure_closed: AtomicBool::new(false),
         min_available_mib: std::sync::atomic::AtomicU64::new(cfg.serve.min_available_mib),
         drift: Mutex::new(drift),
+        live: live::Live::default(),
         model_name,
         level,
         concurrency,
@@ -158,6 +161,7 @@ async fn stats(State(st): State<Arc<AppState>>) -> Response {
         },
         "journal_running": st.journal.running(),
         "drift": {"baseline_tps": d.baseline_tps, "recent_tps": d.recent_tps, "drifted": d.drifted},
+        "requests": st.live.snapshot(),
         "worker": worker,
     }))
     .into_response()

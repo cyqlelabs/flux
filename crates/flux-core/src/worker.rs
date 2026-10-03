@@ -234,7 +234,9 @@ async fn read_events(stdout: tokio::process::ChildStdout, routes: Arc<Mutex<Rout
         let Ok(ev) = serde_json::from_str::<Event>(&line) else { continue };
         let mut r = routes.lock().unwrap();
         let (req, id) = match &ev {
-            Event::Prefilled { req, .. } | Event::Token { req, .. } | Event::ChatChunk { req, .. } | Event::Paused { req } => (Some(req.clone()), None),
+            Event::Prefilled { req, .. } | Event::Prefilling { req, .. } | Event::Token { req, .. } | Event::ChatChunk { req, .. } | Event::Paused { req } => {
+                (Some(req.clone()), None)
+            }
             Event::Finished { req, .. } => (Some(req.clone()), None),
             Event::Tokens { id, .. } | Event::Templated { id, .. } | Event::Stats { id, .. } | Event::Traced { id, .. } => (None, Some(*id)),
             Event::Error { req, id, .. } => (req.clone(), *id),

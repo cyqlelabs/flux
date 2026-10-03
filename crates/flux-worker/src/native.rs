@@ -15,6 +15,8 @@ struct Seq {
     slot: i32,
     prompt: Vec<i32>,
     prefilled: usize,
+    /// Prompt tokens the slot already held from its last request.
+    reused: usize,
     /// Next KV position to write.
     pos: i32,
     /// Tokens written to the slot's KV, kept for prompt reuse when the sequence finishes.
@@ -256,6 +258,7 @@ impl NativeWorker {
             kv: prompt[..kept].to_vec(),
             prompt,
             prefilled: kept,
+            reused: kept,
             pos: kept as i32,
             sampler,
             max_tokens,
@@ -352,10 +355,12 @@ impl NativeWorker {
                     eprintln!("checkpoint of slot {slot} failed: its prompt will not be reused");
                 }
             }
-            if s.prefill_done() {
-                let ev = Event::Prefilled { req: s.req.clone(), n_prompt: s.prompt.len() as u32, ms: s.t_start.elapsed().as_secs_f64() * 1e3 };
-                self.out.send(&ev);
-            }
+            let (req, ms, reused) = (s.req.clone(), s.t_start.elapsed().as_secs_f64() * 1e3, s.reused as u32);
+            let ev = match s.prefill_done() {
+                true => Event::Prefilled { req, n_prompt: s.prompt.len() as u32, ms, reused },
+                false => Event::Prefilling { req, done: s.prefilled as u32, total: s.prompt.len() as u32, reused, ms },
+            };
+            self.out.send(&ev);
         }
         // Sample every row before any sequence finishes, so indices stay valid. A drafted row keeps the
         // accepted drafts plus the token sampled after them, and the sequence drops the rejected rest.

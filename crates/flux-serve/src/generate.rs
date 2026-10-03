@@ -74,8 +74,11 @@ async fn run_tokens_inner(st: &AppState, job: TokenJob, tx: mpsc::Sender<Piece>,
                         }
                     };
                     match ev {
+                        Some(Event::Prefilling { done, reused, ms, .. }) => st.live.prompt(&job.id, done, reused, ms),
+                        Some(Event::Prefilled { n_prompt, reused, ms, .. }) => st.live.prompt(&job.id, n_prompt, reused, ms),
                         Some(Event::Token { token, text, .. }) => {
                             times.push(std::time::Instant::now());
+                            st.live.token(&job.id);
                             st.journal.push(&job.id, token, &text);
                             if tx.send(Piece::Text { token, text }).await.is_err() {
                                 let _ = w.cancel(&wreq).await;
@@ -171,6 +174,7 @@ pub async fn run_chat(st: &AppState, id: &str, body: serde_json::Value, tx: mpsc
         };
         match ev {
             Some(Event::ChatChunk { chunk, .. }) => {
+                st.live.token(id);
                 if tx.send(Piece::Chunk(chunk)).await.is_err() {
                     let _ = w.cancel(id).await;
                     return Outcome { reason: Some(FinishReason::Cancelled), n_prompt: 0, n_completion: 0, error: None, decode_tps: None };

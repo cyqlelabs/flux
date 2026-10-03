@@ -13,24 +13,10 @@ use futures::stream::{self, Stream, StreamExt};
 use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 pub fn error(status: StatusCode, kind: &str, message: impl Into<String>) -> Response {
     (status, Json(json!({"error": {"message": message.into(), "type": kind, "code": status.as_u16()}}))).into_response()
-}
-
-/// One line per finished request, so the `flux serve` terminal shows live prompt and decode rates. The prompt
-/// time is what remains of the request once its decode span is taken out.
-fn log_outcome(id: &str, o: &Outcome, elapsed: Duration) {
-    if let Some(e) = &o.error {
-        tracing::warn!("{id}: failed after {} generated tokens: {e}", o.n_completion);
-        return;
-    }
-    let decode_s = o.decode_tps.filter(|&r| r > 0.0).map_or(0.0, |r| o.n_completion.saturating_sub(1) as f64 / r);
-    let prompt_s = (elapsed.as_secs_f64() - decode_s).max(1e-3);
-    let decode = o.decode_tps.map_or(String::new(), |r| format!(" at {r:.1} tok/s"));
-    tracing::info!("{id}: {} prompt tokens in {prompt_s:.1} s ({:.0} tok/s), {} generated{decode}", o.n_prompt, o.n_prompt as f64 / prompt_s, o.n_completion);
 }
 
 fn rejection(r: Rejection) -> Response {
@@ -129,15 +115,15 @@ async fn token_request(
     }
     let mut stop = stops(&body);
     stop.extend(extra_stops);
+    st.live.begin(&id, prompt.len() as u32);
     let job = TokenJob { id: id.clone(), prompt, sampling: sampling(&body), stop, max_tokens: max_tokens as u32, render_special };
     let (tx, rx) = mpsc::channel(32);
     let (done_tx, done_rx) = oneshot::channel();
     let (st2, id2) = (st.clone(), id.clone());
-    let started = Instant::now();
     tokio::spawn(async move {
         let o = run_tokens(&st2, job, tx).await;
         drop(permit);
-        log_outcome(&id2, &o, started.elapsed());
+        st2.live.finish(&id2, &o);
         if let Some(tps) = o.decode_tps {
             crate::monitor::observe_rate(&st2, tps);
         }
@@ -220,11 +206,11 @@ pub async fn chat(State(st): State<Arc<AppState>>, headers: HeaderMap, Json(body
         let (tx, rx) = mpsc::channel(32);
         let (done_tx, done_rx) = oneshot::channel();
         let (st2, id2) = (st.clone(), id.clone());
-        let started = Instant::now();
+        st.live.begin(&id, 0);
         tokio::spawn(async move {
             let o = run_chat(&st2, &id2, body, tx).await;
             drop(permit);
-            log_outcome(&id2, &o, started.elapsed());
+            st2.live.finish(&id2, &o);
             let _ = done_tx.send(o);
         });
         return respond(st, Api::Chat, id, stream, rx, done_rx).await;

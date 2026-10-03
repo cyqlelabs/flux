@@ -258,7 +258,7 @@ async fn stream(
             let v: serde_json::Value = serde_json::from_str(data)?;
             if first {
                 first = false;
-                out.send(&Event::Prefilled { req: req.into(), n_prompt, ms: t0.elapsed().as_secs_f64() * 1e3 });
+                out.send(&Event::Prefilled { req: req.into(), n_prompt, ms: t0.elapsed().as_secs_f64() * 1e3, reused: 0 });
             }
             match api {
                 Api::LlamaServer => {

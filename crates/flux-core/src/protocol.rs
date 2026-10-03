@@ -185,6 +185,17 @@ pub enum Event {
         req: String,
         n_prompt: u32,
         ms: f64,
+        /// Prompt tokens served from the slot's cached prefix instead of being processed again.
+        #[serde(default)]
+        reused: u32,
+    },
+    /// Prompt progress after each chunk short of the end; `Prefilled` follows the last one.
+    Prefilling {
+        req: String,
+        done: u32,
+        total: u32,
+        reused: u32,
+        ms: f64,
     },
     /// `text` is the valid UTF-8 completed by this token; it may be empty while a character is split across tokens.
     Token {
