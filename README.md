@@ -191,7 +191,7 @@ Plans, probe reports, logs, and benchmark results live in `$XDG_DATA_HOME/flux`,
 |---|---|
 | `FLUX_CONFIG` | Path of `flux.toml` |
 | `FLUX_LOG` | Tracing filter for `flux` (default `info`) |
-| `FLUX_NATIVE_LOG` | Minimum ggml log level the bridge prints (default warn) |
+| `FLUX_NATIVE_LOG` | Minimum ggml log level the bridge prints: debug, info, warn (default) or error |
 | `FLUX_WORKER` | Path of the worker binary (default: `flux-worker` next to `flux`) |
 | `FLUX_MOE_HOST_PROFILE=1` | Time host (CPU) expert work per step |
 | `FLUX_CUDA_OP_PROFILE=1` | Time each CUDA operation |

@@ -75,7 +75,7 @@ The default build compiles only the CPU and CUDA backends. Edits to Metal, Vulka
 | Variable | Effect |
 |---|---|
 | `FLUX_LOG` | Tracing filter for `flux` (default `info`) |
-| `FLUX_NATIVE_LOG` | Minimum ggml log level printed by the bridge (default warn) |
+| `FLUX_NATIVE_LOG` | Minimum ggml log level printed by the bridge: debug, info, warn (default) or error |
 | `FLUX_WORKER` | Path of the worker binary; by default, `flux-worker` next to `flux` |
 | `FLUX_MOE_HOST_PROFILE=1` | Per-step timing of host (CPU) expert work |
 | `FLUX_CUDA_OP_PROFILE=1` | Per-op CUDA timing |

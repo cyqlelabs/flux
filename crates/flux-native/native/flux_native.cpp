@@ -27,6 +27,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <strings.h>
 #include <thread>
 #include <vector>
 
@@ -47,7 +48,16 @@ char * err_json(const std::string & msg) {
 void log_cb(ggml_log_level level, const char * text, void *) {
     static const int min_level = [] {
         const char * v = getenv("FLUX_NATIVE_LOG");
-        return v ? atoi(v) : GGML_LOG_LEVEL_WARN;
+        if (!v) {
+            return (int) GGML_LOG_LEVEL_WARN;
+        }
+        for (const auto & [name, level] : {std::pair{"debug", GGML_LOG_LEVEL_DEBUG}, std::pair{"info", GGML_LOG_LEVEL_INFO},
+                                           std::pair{"warn", GGML_LOG_LEVEL_WARN}, std::pair{"error", GGML_LOG_LEVEL_ERROR}}) {
+            if (strcasecmp(v, name) == 0) {
+                return (int) level;
+            }
+        }
+        return atoi(v);
     }();
     if (level >= min_level || level == GGML_LOG_LEVEL_CONT) {
         fputs(text, stderr);
