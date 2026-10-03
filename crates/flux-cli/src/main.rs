@@ -221,6 +221,7 @@ async fn main() -> Result<()> {
                 if let Some(p) = planning::lookup(&cfg, &m, &report, ctx, concurrency).await {
                     planning::log("a plan for this profile key exists (use --replan to measure again)");
                     planning::print_plan(&p);
+                    planning::print_next(&cfg, &p);
                     return Ok(());
                 }
             }
@@ -260,6 +261,7 @@ async fn main() -> Result<()> {
             let path = planning::save(&cfg, &plan)?;
             planning::print_plan(&plan);
             println!("saved       {}", path.display());
+            planning::print_next(&cfg, &plan);
         }
         Cmd::Plans => {
             for p in planning::store(&cfg).list() {

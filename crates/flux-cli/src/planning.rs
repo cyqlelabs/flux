@@ -140,6 +140,11 @@ pub async fn lookup(cfg: &FluxConfig, m: &ModelManifest, r: &ProbeReport, n_ctx:
     PlanStore::new(&cfg.plans_dir()).lookup(&key)
 }
 
+/// The command that serves a plan, printed once `flux plan` has one.
+pub fn print_next(cfg: &FluxConfig, p: &Plan) {
+    println!("next        flux serve {}  (OpenAI API at http://{}:{}/v1)", p.id, cfg.serve.host, cfg.serve.port);
+}
+
 pub fn print_plan(p: &Plan) {
     println!("plan        {} · {} · {}", p.id, p.engine, p.created.format("%Y-%m-%d %H:%M"));
     println!("model       {} ({})", p.model_files[0].display(), p.architecture);
