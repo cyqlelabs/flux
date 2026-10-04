@@ -140,7 +140,13 @@ fn apportion_meta(measured: Vec<DeviceMemory>, p: &Placement) -> Vec<DeviceMemor
                     x.compute += share(m.compute);
                     x.staging += share(m.staging);
                 }
-                None => out.push(DeviceMemory { device: d.clone(), model: share(m.model), context: share(m.context), compute: share(m.compute), staging: share(m.staging) }),
+                None => out.push(DeviceMemory {
+                    device: d.clone(),
+                    model: share(m.model),
+                    context: share(m.context),
+                    compute: share(m.compute),
+                    staging: share(m.staging),
+                }),
             }
         }
     }
@@ -153,6 +159,9 @@ fn total(m: &[DeviceMemory], dev: &str) -> u64 {
 
 /// GPU orders past this many are cut down to the ones the finalists are drawn from.
 const MAX_ORDERS: usize = 128;
+
+/// Prompt tokens the worker hands the backend per step.
+const PROMPT_BATCH: u32 = 8192;
 
 /// What the placement search can tell apart about a GPU.
 struct GpuTraits {
@@ -297,7 +306,9 @@ pub async fn plan(
 
     let threads = report.decode_cpu_bandwidth().map_or(report.inventory.cpu.cores, |b| b.threads);
     let runtime = RuntimeParams {
-        n_batch: 2048,
+        // Prompt chunks grow past n_ubatch while the attention reads few cells (the backend measures how far), up to
+        // the batch the worker hands it.
+        n_batch: PROMPT_BATCH.min(n_ctx_seq).max(req.n_ubatch),
         n_ubatch: req.n_ubatch,
         n_threads: threads,
         n_threads_batch: report.inventory.cpu.threads,
@@ -683,7 +694,8 @@ pub async fn plan(
                 let mut best: Option<(u32, f64)> = None;
                 let vocab = draft_vocab(&outputs.tokens, lay.n_vocab);
                 for n_max in [3, 4] {
-                    let (c, result, summary) = speculate(&ctx, &base, n_max, vocab, &lay, facts.n_layer as usize, &base_plan, reference.as_deref(), &gpus, corpus, &devices).await;
+                    let (c, result, summary) =
+                        speculate(&ctx, &base, n_max, vocab, &lay, facts.n_layer as usize, &base_plan, reference.as_deref(), &gpus, corpus, &devices).await;
                     if let Some(x) = summary.as_ref().map(&score) {
                         if best.is_none_or(|(_, b)| x > b) {
                             best = Some((n_max, x));
@@ -707,76 +719,107 @@ pub async fn plan(
             && c.assignment.on_cpu.iter().zip(&c.assignment.layer_device).any(|(h, d)| d != CPU && h.contains(&true))
     };
     let cache_base = best(&results, &runs, &cacheable);
-    if let (true, Some((base, _))) = (req.expert_residency && lay.n_expert > 0, cache_base) {
-        (ctx.log)(&format!("tracing expert routing on {}", base.label));
-        match trace_routes(&ctx, &base_plan(&base), corpus).await {
-            Ok(routes) => {
-                // Every prompt chunk streams the host experts to the GPU once, so larger chunks process long
-                // prompts faster but leave less room for cached experts: size the cache for every chunk size and
-                // let the measured runs, short and long, choose.
-                let sizes = std::iter::once(base.n_ubatch).chain(ubatches.iter().copied().filter(|&u| u != base.n_ubatch));
-                for ub in sizes {
-                    let base = match ub == base.n_ubatch {
-                        true => base.clone(),
-                        false => match ctx.measure(&base.placement, ub).await {
-                            Ok(measured) => Candidate {
-                                label: base.placement.describe(),
-                                n_ubatch: ub,
-                                host_compute: measured.iter().filter(|d| d.device == CPU).map(|d| d.compute).sum(),
-                                measured,
-                                ..base.clone()
-                            },
-                            Err(e) => {
-                                rejected.push(format!("per-expert residency on {} with ubatch {ub}: {e:#}", base.label));
-                                continue;
-                            }
-                        },
-                    };
-                    let shape = Shape { ubatch: ub, ..shape };
-                    // Drafting on the cache later loads the heads, their draft context and the rollback snapshots:
-                    // measure what that adds on the base placement and keep it free.
-                    let mut head_room: HashMap<String, u64> = HashMap::new();
-                    if native_mtp {
-                        let params = BackendParams {
-                            speculation: Some(Speculation { kind: "draft-mtp".into(), draft_model: None, n_max: spec_n_max, draft_vocab: None }),
-                            ..ctx.params(&ctx.manifest.files[0].path, &base.placement, ub)
-                        };
-                        match ctx.measure_params(&params).await {
-                            Ok(m) => {
-                                for g in &gpus {
-                                    head_room.insert(g.name.clone(), total(&m, &g.name).saturating_sub(total(&base.measured, &g.name)) + SPEC_MARGIN);
-                                }
-                            }
-                            Err(e) => rejected.push(format!("speculation on the expert cache: memory measurement with the heads failed: {e:#}")),
-                        }
-                    }
-                    match expert_cache(&ctx, &base, &lay, &cost, &shape, &gpus, &routes, facts.n_layer as usize, &head_room).await {
-                        Ok(Some(c)) => {
-                            log(&format!("calibrating {} (predicted {:.2} ms/token)", c.label, c.predicted_decode_s * 1e3));
-                            let (result, summary) = calibrate(&ctx, &c, &base_plan(&c), None, corpus, &devices).await;
-                            let calibrated = summary.is_some();
-                            let vocab = summary.as_ref().and_then(|s| draft_vocab(&s.tokens, lay.n_vocab));
-                            runs.push(c.clone());
-                            results.push((runs.len() - 1, result, summary));
-                            // Hot experts on the GPU also make verification cheaper: every extra token in the batch
-                            // mostly reuses resident experts. Draft on the cache with the best measured draft length.
-                            if native_mtp && spec_certified && calibrated {
-                                match reference_tokens(&ctx, &base_plan(&c), hybrid, corpus).await {
-                                    Ok(reference) => {
-                                        let (s, result, summary) = speculate(&ctx, &c, spec_n_max, vocab, &lay, facts.n_layer as usize, &base_plan, reference.as_deref(), &gpus, corpus, &devices).await;
-                                        runs.push(s);
-                                        results.push((runs.len() - 1, result, summary));
-                                    }
-                                    Err(e) => rejected.push(format!("speculation on {}: greedy reference failed: {e:#}", c.label)),
-                                }
-                            }
-                        }
-                        Ok(None) => rejected.push(format!("per-expert residency on {}: no block would split", base.label)),
-                        Err(e) => rejected.push(format!("per-expert residency on {}: {e:#}", base.label)),
-                    }
+    // Also the best base on another set of GPUs, at its own chunk size: a GPU that holds layers bounds prompt chunks
+    // with its compute buffers, which the short prompts and cache-less decode ranked so far do not show.
+    let gpu_set = |c: &Candidate| -> Vec<String> {
+        let mut s: Vec<String> = c.assignment.layer_device.iter().filter(|d| d.as_str() != CPU).cloned().collect();
+        s.sort();
+        s.dedup();
+        s
+    };
+    let other_base = cache_base.as_ref().and_then(|(b, _)| best(&results, &runs, &|c| cacheable(c) && gpu_set(c) != gpu_set(b)));
+    let mut routes: Option<Routes> = None;
+    let bases = cache_base.into_iter().map(|(b, _)| (b, true)).chain(other_base.map(|(b, _)| (b, false)));
+    for (base, every_size) in bases.filter(|_| req.expert_residency && lay.n_expert > 0) {
+        // Routing is the model's; one trace serves every base.
+        if routes.is_none() {
+            (ctx.log)(&format!("tracing expert routing on {}", base.label));
+            match trace_routes(&ctx, &base_plan(&base), corpus).await {
+                Ok(r) => routes = Some(r),
+                Err(e) => {
+                    rejected.push(format!("per-expert residency on {}: tracing expert routing failed: {e:#}", base.label));
+                    break;
                 }
             }
-            Err(e) => rejected.push(format!("per-expert residency on {}: tracing expert routing failed: {e:#}", base.label)),
+        }
+        let routes = routes.as_ref().unwrap();
+        // Every prompt chunk streams the host experts to the GPU once, so larger chunks process long
+        // prompts faster but leave less room for cached experts: size the cache for every chunk size and
+        // let the measured runs, short and long, choose.
+        let others = ubatches.iter().copied().filter(|&u| every_size && u != base.n_ubatch);
+        let sizes: Vec<u32> = std::iter::once(base.n_ubatch).chain(others).collect();
+        for ub in sizes {
+            let base = match ub == base.n_ubatch {
+                true => base.clone(),
+                false => match ctx.measure(&base.placement, ub).await {
+                    Ok(measured) => Candidate {
+                        label: base.placement.describe(),
+                        n_ubatch: ub,
+                        host_compute: measured.iter().filter(|d| d.device == CPU).map(|d| d.compute).sum(),
+                        measured,
+                        ..base.clone()
+                    },
+                    Err(e) => {
+                        rejected.push(format!("per-expert residency on {} with ubatch {ub}: {e:#}", base.label));
+                        continue;
+                    }
+                },
+            };
+            let shape = Shape { ubatch: ub, ..shape };
+            // Drafting on the cache later loads the heads, their draft context and the rollback snapshots:
+            // measure what that adds on the base placement and keep it free.
+            let mut head_room: HashMap<String, u64> = HashMap::new();
+            if native_mtp {
+                let params = BackendParams {
+                    speculation: Some(Speculation { kind: "draft-mtp".into(), draft_model: None, n_max: spec_n_max, draft_vocab: None }),
+                    ..ctx.params(&ctx.manifest.files[0].path, &base.placement, ub)
+                };
+                match ctx.measure_params(&params).await {
+                    Ok(m) => {
+                        for g in &gpus {
+                            head_room.insert(g.name.clone(), total(&m, &g.name).saturating_sub(total(&base.measured, &g.name)) + SPEC_MARGIN);
+                        }
+                    }
+                    Err(e) => rejected.push(format!("speculation on the expert cache: memory measurement with the heads failed: {e:#}")),
+                }
+            }
+            match expert_cache(&ctx, &base, &lay, &cost, &shape, &gpus, routes, facts.n_layer as usize, &head_room).await {
+                Ok(Some(c)) => {
+                    log(&format!("calibrating {} (predicted {:.2} ms/token)", c.label, c.predicted_decode_s * 1e3));
+                    let (result, summary) = calibrate(&ctx, &c, &base_plan(&c), None, corpus, &devices).await;
+                    let calibrated = summary.is_some();
+                    let vocab = summary.as_ref().and_then(|s| draft_vocab(&s.tokens, lay.n_vocab));
+                    runs.push(c.clone());
+                    results.push((runs.len() - 1, result, summary));
+                    // Hot experts on the GPU also make verification cheaper: every extra token in the batch
+                    // mostly reuses resident experts. Draft on the cache with the best measured draft length.
+                    if native_mtp && spec_certified && calibrated {
+                        match reference_tokens(&ctx, &base_plan(&c), hybrid, corpus).await {
+                            Ok(reference) => {
+                                let (s, result, summary) = speculate(
+                                    &ctx,
+                                    &c,
+                                    spec_n_max,
+                                    vocab,
+                                    &lay,
+                                    facts.n_layer as usize,
+                                    &base_plan,
+                                    reference.as_deref(),
+                                    &gpus,
+                                    corpus,
+                                    &devices,
+                                )
+                                .await;
+                                runs.push(s);
+                                results.push((runs.len() - 1, result, summary));
+                            }
+                            Err(e) => rejected.push(format!("speculation on {}: greedy reference failed: {e:#}", c.label)),
+                        }
+                    }
+                }
+                Ok(None) => rejected.push(format!("per-expert residency on {}: no block would split", base.label)),
+                Err(e) => rejected.push(format!("per-expert residency on {}: {e:#}", base.label)),
+            }
         }
     }
     let mut ranked: Vec<usize> = (0..results.len()).filter(|&k| results[k].2.is_some()).collect();
@@ -788,7 +831,7 @@ pub async fn plan(
     );
     // Long prompts: one request a quarter of the planned context deep, so the choice also holds for clients that
     // send long prompts. The contenders are the two best short-prompt runs and the best of every other chunk
-    // size, the setting long prompts expose; ranking them needs no assumption about the mix of requests.
+    // size and GPU set, the settings long prompts expose; ranking them needs no assumption about the mix of requests.
     let depth_tokens = (n_ctx_seq / 4).min(n_ctx_seq.saturating_sub(2 * req.decode_tokens));
     let deep = matches!(req.workload.objective, Objective::Interactive) && depth_tokens >= 4 * req.prompt_tokens;
     if deep {
@@ -797,7 +840,8 @@ pub async fn plan(
             if contenders.len() >= MAX_CONTENDERS {
                 break;
             }
-            if !contenders.iter().any(|&c| runs[results[c].0].n_ubatch == runs[results[k].0].n_ubatch) {
+            let run = |c: usize| &runs[results[c].0];
+            if !contenders.iter().any(|&c| run(c).n_ubatch == run(k).n_ubatch && gpu_set(run(c)) == gpu_set(run(k))) {
                 contenders.push(k);
             }
         }
@@ -1002,7 +1046,10 @@ async fn expert_cache(
             // The pools of the blocks on this device will hold its prefill staging (see `add_cache`).
             let holds = base.assignment.layer_device.iter().any(|d| d == &g.name);
             let staging: u64 = if holds { base.measured.iter().filter(|m| m.device == g.name).map(|m| m.staging).sum() } else { 0 };
-            let keep = ctx.cfg.plan.device_reserve(g) + total(&base.measured, &g.name).saturating_sub(staging) + (128 << 20) + extra_room.get(&g.name).copied().unwrap_or(0);
+            let keep = ctx.cfg.plan.device_reserve(g)
+                + total(&base.measured, &g.name).saturating_sub(staging)
+                + (128 << 20)
+                + extra_room.get(&g.name).copied().unwrap_or(0);
             (g.name.clone(), g.mem_free as i64 - keep as i64)
         })
         .collect();
@@ -1159,7 +1206,11 @@ async fn speculate(
             (_, Some(x)) => format!("native + draft-mtp {n_max}: {} · ubatch {} · {} cached experts", c.placement.describe(), c.n_ubatch, x.hot_experts),
             (_, None) => format!("native + draft-mtp {n_max}: {} · ubatch {}", c.placement.describe(), c.n_ubatch),
         };
-        let params = BackendParams { speculation: c.speculation.clone(), expert_cache: c.cache.as_ref().map(|x| x.spec.clone()), ..ctx.params(&ctx.manifest.files[0].path, &c.placement, c.n_ubatch) };
+        let params = BackendParams {
+            speculation: c.speculation.clone(),
+            expert_cache: c.cache.as_ref().map(|x| x.spec.clone()),
+            ..ctx.params(&ctx.manifest.files[0].path, &c.placement, c.n_ubatch)
+        };
         let mut m = match ctx.measure_params(&params).await {
             Ok(m) => m,
             Err(e) => return (c.clone(), failed_result(&c, format!("memory measurement with the heads failed: {e:#}")), None),
@@ -1177,7 +1228,10 @@ async fn speculate(
             break;
         }
         if attempt == 2 {
-            let why = format!("does not fit with the heads loaded ({})", over.iter().map(|(d, b)| format!("{d} over by {}", fmt_bytes(*b))).collect::<Vec<_>>().join(", "));
+            let why = format!(
+                "does not fit with the heads loaded ({})",
+                over.iter().map(|(d, b)| format!("{d} over by {}", fmt_bytes(*b))).collect::<Vec<_>>().join(", ")
+            );
             (ctx.log)(&format!("skipping {}: {why}", c.label));
             return (c.clone(), failed_result(&c, why), None);
         }
@@ -1253,12 +1307,30 @@ async fn speculate(
 }
 
 fn failed_result(c: &Candidate, why: String) -> CandidateResult {
-    CandidateResult { label: c.label.clone(), predicted_token_ms: c.predicted_decode_s * 1e3, calibration: None, validation: None, failure: Some(why), expert_cache: None, placement: None, n_ubatch: None, speculation: None, depth: None }
+    CandidateResult {
+        label: c.label.clone(),
+        predicted_token_ms: c.predicted_decode_s * 1e3,
+        calibration: None,
+        validation: None,
+        failure: Some(why),
+        expert_cache: None,
+        placement: None,
+        n_ubatch: None,
+        speculation: None,
+        depth: None,
+    }
 }
 
 /// Calibrates one candidate. With `reference` (greedy output of the same plan without drafting, for
 /// hybrid models) drafting is first certified to roll recurrent state back exactly.
-async fn calibrate(ctx: &Ctx<'_>, c: &Candidate, plan: &Plan, reference: Option<&[Greedy]>, corpus: &Corpus, devices: &[BackendDevice]) -> (CandidateResult, Option<RunSummary>) {
+async fn calibrate(
+    ctx: &Ctx<'_>,
+    c: &Candidate,
+    plan: &Plan,
+    reference: Option<&[Greedy]>,
+    corpus: &Corpus,
+    devices: &[BackendDevice],
+) -> (CandidateResult, Option<RunSummary>) {
     let failed = |why: String| failed_result(c, why);
     if let Some(a) = reference {
         // Verification batches round differently from single-token steps, so greedy output may flip at a
@@ -1289,7 +1361,21 @@ async fn calibrate(ctx: &Ctx<'_>, c: &Candidate, plan: &Plan, reference: Option<
     match measured_run(ctx, plan, corpus, Role::Calibration, ctx.cfg.plan.calibration_prompts, devices).await {
         Ok((m, s)) => {
             (ctx.log)(&format!("  decode {:.2} tok/s p50, TTFT {:.0} ms p50", s.decode_tps.p50, s.ttft_ms.p50));
-            (CandidateResult { label: c.label.clone(), predicted_token_ms: c.predicted_decode_s * 1e3, calibration: Some(m), validation: None, failure: None, expert_cache: None, placement: None, n_ubatch: None, speculation: None, depth: None }, Some(s))
+            (
+                CandidateResult {
+                    label: c.label.clone(),
+                    predicted_token_ms: c.predicted_decode_s * 1e3,
+                    calibration: Some(m),
+                    validation: None,
+                    failure: None,
+                    expert_cache: None,
+                    placement: None,
+                    n_ubatch: None,
+                    speculation: None,
+                    depth: None,
+                },
+                Some(s),
+            )
         }
         Err(e) => (failed(format!("{e:#}")), None),
     }
@@ -1311,7 +1397,8 @@ async fn greedy_tokens(ctx: &Ctx<'_>, plan: &Plan, corpus: &Corpus) -> Result<Ve
         let mut v = vec![];
         for i in 0..2 {
             let p = chat_prompt(&w, corpus, Role::Validation, 50 + i, 256).await?;
-            let r = crate::run::run_stream(&w, &format!("cert-{i}"), p, 48, flux_core::protocol::Sampling { runner_up: Some(true), ..bench_sampling() }).await?;
+            let r =
+                crate::run::run_stream(&w, &format!("cert-{i}"), p, 48, flux_core::protocol::Sampling { runner_up: Some(true), ..bench_sampling() }).await?;
             if let Some(e) = r.error {
                 bail!("{e}");
             }

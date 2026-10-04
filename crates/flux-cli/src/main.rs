@@ -79,8 +79,9 @@ enum Cmd {
         /// KV cache type; anything but f16 is a separately labelled quality profile.
         #[arg(long, default_value = "f16")]
         kv: String,
-        /// Largest prompt chunk to try (at most the worker's 2048-token batch). Each chunk streams host-resident
-        /// experts to the GPU once, so larger chunks process long prompts faster; smaller chunks are tried too.
+        /// Largest prompt chunk at full context to try; smaller ones are tried too. Each chunk streams host-resident
+        /// experts to the GPU once, so larger chunks process long prompts faster. Early in a prompt, when the
+        /// attention reads few cells, chunks grow within the same compute buffers, up to an 8192-token batch.
         #[arg(long, default_value_t = 2048)]
         ubatch: u32,
         #[arg(long, default_value_t = 512)]
