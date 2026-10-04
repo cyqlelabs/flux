@@ -1,3 +1,29 @@
+diff --git a/common/chat.cpp b/common/chat.cpp
+index 743ecde0a..5b8f496f4 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -1276,12 +1276,17 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
+                     (is_required ? required_args : optional_args).push_back(arg_rule);
+                 });
+ 
+-                // Accept required arguments in any order, as Qwen does not always adhere to the
+-                // order provided.
+-                auto args = p.permute("tool-" + name + "-args", required_args);
++                // Accept arguments in any order, as Qwen does not always adhere to the order provided:
++                // required ones permuted, optional ones before, between and after them. Unconstrained
++                // sampling (no grammar) emits e.g. `limit` before the required `pattern`.
++                auto optional = p.eps();
+                 if (!optional_args.empty()) {
+-                    args = args + p.zero_or_more(p.choice(optional_args));
++                    optional = p.zero_or_more(p.choice(optional_args));
++                    for (auto & arg : required_args) {
++                        arg = optional + arg;
++                    }
+                 }
++                auto args = p.permute("tool-" + name + "-args", required_args) + optional;
+ 
+                 auto func = p.tool(p.tool_open("<function=" + p.tool_name(p.literal(name)) + ">\n") +
+                                    p.tool_args(args) +
 diff --git a/common/speculative.cpp b/common/speculative.cpp
 index 851a47b9a..33d6f2529 100644
 --- a/common/speculative.cpp
@@ -7673,6 +7699,33 @@ index 1484c9b07..6cb42e5eb 100644
  ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
          llm_graph_input_rs * inp,
          ggml_tensor *        conv_states_all,
+diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
+index 7918f0ffc..531092624 100644
+--- a/tests/test-chat.cpp
++++ b/tests/test-chat.cpp
+@@ -2112,6 +2112,22 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+         // Qwen3.5 (basically same as Nemotron, but keeping separate tests just in case)
+         auto tst = peg_tester("models/templates/Qwen3.5-4B.jinja", detailed_debug);
+ 
++        // An optional argument before the required one, as unconstrained sampling emits.
++        tst.test(
++               "<tool_call>\n"
++               "<function=special_function_with_opt>\n"
++               "<parameter=arg2>\n2\n</parameter>\n"
++               "<parameter=arg1>\n1\n</parameter>\n"
++               "</function>\n"
++               "</tool_call>")
++            .enable_thinking(false)
++            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
++            .tools({ special_function_tool_with_optional_param })
++            .expect_tool_calls({
++                { "special_function_with_opt", R"({"arg2": 2, "arg1": 1})", {} },
++            })
++            .run();
++
+         tst.test("I'm\nthinking\n</think>\n\nHello, world!\nWhat's up?")
+             .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+             .enable_thinking(true)
 diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
 index 0f3d1c79a..8693183d5 100644
 --- a/tests/test-llama-archs.cpp
