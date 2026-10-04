@@ -1194,7 +1194,9 @@ char * fx_chat_parser_push(fx_chat_parser * p, const char * text, int32_t len, b
         }
         return dup(out.dump());
     } catch (const std::exception & ex) {
-        return err_json(ex.what());
+        // the parse lists only what it understood; the raw tail shows what the model wrote instead
+        const size_t from = p->text.size() > 600 ? p->text.size() - 600 : 0;
+        return err_json(std::string(ex.what()) + "Generated text (tail):\n" + p->text.substr(from));
     }
 }
 
