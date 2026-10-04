@@ -62,7 +62,7 @@ The default build compiles only the CPU and CUDA backends. Edits to Metal, Vulka
 - `layers.rs` turns the manifest into per-block byte and compute accounting.
 - `cost.rs` predicts step times from probes. These predictions only rank and prune candidates: the final choice always comes from measured runs.
 - `search.rs` places contiguous blocks across devices by dynamic programming.
-- `experts.rs` sizes per-GPU expert caches and second-GPU tiers from traced routing counts.
+- `experts.rs` sizes per-GPU expert caches and second-GPU tiers from routing counts traced on prose chat and on the coding-agent conversations in `agent_calibration.json`. Validation also times decoding on those conversations, and serving judges requests that carry tools against that rate.
 - The backend's allocation dry run (`fx_measure`) verifies memory before anything loads.
 - `store.rs` saves plans keyed by `ProfileKey`: model hashes, topology, backend revision and build, driver, context bucket and concurrency.
 
@@ -70,17 +70,4 @@ The default build compiles only the CPU and CUDA backends. Edits to Metal, Vulka
 
 ## Configuration and diagnostics
 
-`flux.toml` is read from `$FLUX_CONFIG`, then `~/.config/flux/flux.toml`. Defaults live in `crates/flux-core/src/config.rs`. State (plans, probes, logs, bench results) goes to `$XDG_DATA_HOME/flux`, which defaults to `~/.local/share/flux`. `flux serve` writes worker output to `logs/serve-worker.log`.
-
-| Variable | Effect |
-|---|---|
-| `FLUX_LOG` | Tracing filter for `flux` (default `info`) |
-| `FLUX_NATIVE_LOG` | Minimum ggml log level printed by the bridge: debug, info, warn (default) or error |
-| `FLUX_WORKER` | Path of the worker binary; by default, `flux-worker` next to `flux` |
-| `FLUX_MOE_HOST_PROFILE=1` | Per-step timing of host (CPU) expert work |
-| `FLUX_CUDA_OP_PROFILE=1` | Per-op CUDA timing |
-| `FLUX_MOE_HOST_SYNC=1` | Turns off the overlap of CPU experts with the GPU |
-| `FLUX_MOE_CACHE_FREEZE=1` | Stops the GPU expert cache from adapting |
-| `GGML_OP_OFFLOAD_MIN_BATCH` | Batch size at which ops on host weights move to a GPU (default 32) |
-
-Throughput measurements are sensitive to other load. A busy desktop browser can halve decode rates, and a cold page cache slows the first prompts. Compare runs only on an idle machine.
+The [Configuration](README.md#configuration) section of `README.md` covers `flux.toml`, the state and log directories, the environment variables, and why throughput is compared only on an idle machine. Defaults live in `crates/flux-core/src/config.rs`.
