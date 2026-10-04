@@ -228,26 +228,83 @@ pub fn save(cfg: &FluxConfig, plan: &Plan) -> Result<std::path::PathBuf> {
     store(cfg).save(plan)
 }
 
-/// Refuses a plan whose GPUs no longer have the memory it was measured to need, naming the shortfall,
-/// instead of letting the backend fail to create its context.
-pub async fn check_fits(plan: &Plan) -> Result<()> {
+/// Fits a plan to the memory its GPUs have free now. The planner fills each GPU up to its reserve, so other programs
+/// growing by a few MiB would otherwise refuse the plan: a GPU short by less than its cached experts take serves
+/// with the least-routed of them dropped, in proportion per layer (the cache adapts while decoding anyway). A larger
+/// shortfall refuses the plan, naming it, instead of letting the backend fail to create its context.
+pub async fn fit(cfg: &FluxConfig, mut plan: Plan) -> Result<Plan> {
     let devices = native::backend().await?.devices;
-    for b in plan.budgets.iter().filter(|b| b.required() > 0) {
+    let budgets = plan.budgets.clone();
+    for b in budgets.iter().filter(|b| b.required() > 0) {
         let Some(free) = devices.iter().find(|d| d.name == b.device).map(|d| d.mem_free) else { continue };
         let usable = free.saturating_sub(b.reserve);
-        anyhow::ensure!(
-            usable >= b.required(),
-            "{}: plan {} needs {} but only {} is free beyond the {} reserve ({} was free when it was planned); free memory on {} or run `flux plan <model> --replan`",
+        let short = b.required().saturating_sub(usable);
+        if short == 0 {
+            continue;
+        }
+        let dropped = match trim_cache(cfg, &mut plan, &b.device, short) {
+            Ok(n) => n,
+            Err(e) => anyhow::bail!(
+                "{}: plan {} needs {} but only {} is free beyond the {} reserve ({} was free when it was planned), and {e:#}; free memory on {} or run `flux plan <model> --replan`",
+                b.device,
+                plan.id,
+                fmt_bytes(b.required()),
+                fmt_bytes(usable),
+                fmt_bytes(b.reserve),
+                fmt_bytes(b.free_at_plan),
+                b.device
+            ),
+        };
+        tracing::warn!(
+            "{}: {} less free than plan {} was measured to need; serving with {dropped} fewer cached experts ({} left). `flux plan <model> --replan` sizes the cache to this memory",
             b.device,
+            fmt_bytes(short),
             plan.id,
-            fmt_bytes(b.required()),
-            fmt_bytes(usable),
-            fmt_bytes(b.reserve),
-            fmt_bytes(b.free_at_plan),
-            b.device
+            plan.expert_cache.as_ref().map_or(0, |c| c.hot_experts)
         );
     }
-    Ok(())
+    Ok(plan)
+}
+
+/// Drops at least `bytes` of the experts cached on `device`, for the layers placed there and as a tier for others,
+/// the same share of each layer's, least routed first; the number dropped.
+fn trim_cache(cfg: &FluxConfig, plan: &mut Plan, device: &str, bytes: u64) -> Result<u32> {
+    let cache = plan.expert_cache.as_mut().context("the plan caches no experts to drop")?;
+    let m = flux_ingest::inspect(&plan.model_files[0], &flux_ingest::InspectOptions { hash: false, config: cfg })?;
+    let n_expert = m.facts.as_ref().and_then(|f| f.moe.as_ref()).map_or(0, |moe| moe.n_expert as u64);
+    anyhow::ensure!(n_expert > 0, "the model has no routed experts");
+    let mut per_expert: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+    for t in m.tensors.iter().filter(|t| t.role() == flux_core::model::TensorRole::FfnRoutedExpert) {
+        if let Some(l) = t.layer() {
+            *per_expert.entry(l).or_default() += t.bytes / n_expert;
+        }
+    }
+    let on_device = |l: u32| plan.placement.layer_device.get(l as usize).is_some_and(|d| d == device);
+    let bytes_of = |l: u32, n: usize| n as u64 * per_expert.get(&l).copied().unwrap_or(0);
+    let tiers = || cache.spec.tiers.iter().filter(|t| t.device == device).flat_map(|t| &t.layers);
+    let held: u64 = cache.spec.layers.iter().filter(|(l, _)| on_device(**l)).map(|(l, (_, hot))| bytes_of(*l, *hot as usize)).sum::<u64>()
+        + tiers().map(|(l, es)| bytes_of(*l, es.len())).sum::<u64>();
+    anyhow::ensure!(held > bytes, "its {} of cached experts there cannot cover it", fmt_bytes(held));
+    let share = bytes as f64 / held as f64;
+    let cut = |n: usize| ((n as f64 * share).ceil() as usize).min(n);
+    let mut dropped = 0;
+    for (_, (_, hot)) in cache.spec.layers.iter_mut().filter(|(l, _)| on_device(**l)) {
+        let n = cut(*hot as usize);
+        *hot -= n as u32;
+        dropped += n as u32;
+    }
+    // a tier lists its experts most routed first
+    for (_, es) in cache.spec.tiers.iter_mut().filter(|t| t.device == device).flat_map(|t| t.layers.iter_mut()) {
+        let n = cut(es.len());
+        es.truncate(es.len() - n);
+        dropped += n as u32;
+    }
+    for t in &mut cache.spec.tiers {
+        t.layers.retain(|(_, es)| !es.is_empty());
+    }
+    cache.spec.tiers.retain(|t| !t.layers.is_empty());
+    cache.hot_experts = cache.hot_experts.saturating_sub(dropped);
+    Ok(dropped)
 }
 
 pub fn find_plan(cfg: &FluxConfig, id: &str) -> Result<Plan> {

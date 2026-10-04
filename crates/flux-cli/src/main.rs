@@ -289,8 +289,7 @@ async fn main() -> Result<()> {
         Cmd::Bench { cmd } => bench::run(cfg, cmd).await?,
         Cmd::Trace { plan, steps, prompt_tokens, per_op, routes } => planning::trace(&cfg, &plan, steps, prompt_tokens, per_op, routes).await?,
         Cmd::Serve { plan, host, port } => {
-            let plan = planning::find_plan(&cfg, &plan)?;
-            planning::check_fits(&plan).await?;
+            let plan = planning::fit(&cfg, planning::find_plan(&cfg, &plan)?).await?;
             let host = host.unwrap_or_else(|| cfg.serve.host.clone());
             let port = port.unwrap_or(cfg.serve.port);
             let st = flux_serve::build(cfg.clone(), plan, Some(planning::replanner(cfg))).await?;
