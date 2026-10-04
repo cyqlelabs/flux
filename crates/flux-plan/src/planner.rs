@@ -1057,6 +1057,13 @@ async fn expert_cache(
         let Some(r) = crate::experts::choose(lay, n_trunk, &base.assignment, cost, shape, routes, &spare) else { return Ok(None) };
         let mut p = base.placement.clone();
         p.overrides = crate::experts::overrides(lay, &r);
+        // A GPU that only holds a tier still needs its backend: list it without blocks.
+        for t in &r.spec.tiers {
+            if !p.devices.contains(&t.device) {
+                p.devices.push(t.device.clone());
+                p.tensor_split.push(0.0);
+            }
+        }
         let mut measured = ctx.measure_model(&ctx.manifest.files[0].path, &p, base.n_ubatch).await.context("dry run with the experts in host memory")?;
         add_cache(&mut measured, crate::experts::cache_bytes(lay, &base.assignment, &r.spec));
         let over: Vec<(String, u64)> = gpus
@@ -1554,7 +1561,12 @@ fn explain(
         let resource = format!("{} ({})", d.name, d.description);
         if chosen.placement.uses_device(&d.name) {
             let span = match (blocks.first(), blocks.last(), chosen.placement.split_mode) {
-                (_, _, SplitMode::Layer) if blocks.is_empty() => "no blocks".into(),
+                (_, _, SplitMode::Layer) if blocks.is_empty() => {
+                    match plan.expert_cache.as_ref().is_some_and(|c| c.spec.tiers.iter().any(|t| t.device == d.name)) {
+                        true => "cached experts for the other GPUs' blocks".into(),
+                        false => "no blocks".into(),
+                    }
+                }
                 (Some(f), Some(l), SplitMode::Layer) => format!("blocks {f}-{l}"),
                 (_, _, mode) => {
                     let k = chosen.placement.devices.iter().position(|x| x == &d.name).unwrap_or(0);

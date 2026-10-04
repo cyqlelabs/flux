@@ -48,9 +48,10 @@ pub fn choose(l: &Layout, n_trunk: usize, a: &Assignment, cost: &CostModel, s: &
     let unit = |i: usize| l.blocks[i].expert_bytes() / n as u64;
     // Expert tensors the base keeps on the block's GPU; a missing flag means resident, as in the cost model.
     let resident = |i: usize| -> u64 { l.blocks[i].experts.iter().enumerate().filter(|(k, _)| a.on_cpu[i].get(*k) != Some(&true)).map(|(_, e)| e.bytes).sum() };
-    let mut budget: HashMap<&str, i64> = HashMap::new();
+    // Every GPU with room holds experts: a GPU without blocks serves the others' blocks as a tier.
+    let mut budget: HashMap<&str, i64> = spare.iter().map(|(d, &s)| (d.as_str(), s)).collect();
     for &i in &gpu_blocks {
-        *budget.entry(a.layer_device[i].as_str()).or_insert_with(|| spare.get(&a.layer_device[i]).copied().unwrap_or(0)) += resident(i) as i64;
+        *budget.entry(a.layer_device[i].as_str()).or_insert(0) += resident(i) as i64;
     }
     // Greedy by selections per byte across all GPU blocks; a pool's first expert also pays its zero expert.
     let mut items: Vec<(usize, u32, f64)> = vec![];
