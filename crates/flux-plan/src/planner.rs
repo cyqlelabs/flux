@@ -4,7 +4,7 @@ use crate::cost::{cpu_beats_transfer, storage_bound_tps, CostModel, Shape, CPU};
 use crate::experts::Routes;
 use crate::layers::{layout, Layout};
 use crate::params::{backend_mapping, placement};
-use crate::run::{bench_sampling, chat_prompt, run_all, summarize, RunSummary};
+use crate::run::{agent_prompt, bench_sampling, chat_prompt, run_all, summarize, RunSummary};
 use crate::search::{prefill_s, search, units, Assignment, SearchInput};
 use anyhow::{bail, ensure, Context, Result};
 use flux_core::backend::BackendParams;
@@ -1079,7 +1079,9 @@ fn draft_vocab(outputs: &[i32], n_vocab: u32) -> Option<u32> {
 /// Generated tokens traced per calibration prompt for routing counts.
 const ROUTE_TOKENS: u32 = 256;
 
-/// Routing counts per layer and expert over tokens generated for the calibration prompts.
+/// Routing counts per layer and expert over tokens generated for the calibration prompts: as many coding-agent
+/// conversations as prose chat prompts. A cache traced on prose alone served 31% of agent decoding against 74%
+/// of prose; the even mix serves about 55% of each, and the cache adapts to the real traffic from there.
 async fn trace_routes(ctx: &Ctx<'_>, plan: &Plan, corpus: &Corpus) -> Result<Routes> {
     let logs = ctx.cfg.data_dir.join("logs");
     std::fs::create_dir_all(&logs)?;
@@ -1087,9 +1089,13 @@ async fn trace_routes(ctx: &Ctx<'_>, plan: &Plan, corpus: &Corpus) -> Result<Rou
     let out = async {
         w.load_with(plan, true).await?;
         let mut acc = Routes::new();
+        let n = ctx.cfg.plan.calibration_prompts;
         // Residency serves decoding: prompts reach the GPU's experts in bulk, so only generated tokens count.
-        for i in 0..ctx.cfg.plan.calibration_prompts {
-            let p = chat_prompt(&w, corpus, Role::Calibration, i * 7, ctx.req.prompt_tokens as usize).await?;
+        for i in 0..2 * n {
+            let p = match i % 2 {
+                0 => chat_prompt(&w, corpus, Role::Calibration, i / 2 * 7, ctx.req.prompt_tokens as usize).await?,
+                _ => agent_prompt(&w, i / 2, n).await?,
+            };
             let r = w.trace(p, ROUTE_TOKENS, false, true).await?;
             // The backend lists experts up to the highest id it saw, so lengths vary.
             for (layer, c) in serde_json::from_value::<Vec<(u32, Vec<u64>)>>(r["decode"].clone())? {

@@ -57,6 +57,26 @@ pub async fn chat_prompt(worker: &Worker, corpus: &Corpus, role: Role, index: us
     worker.tokenize(&templated.prompt, true).await
 }
 
+/// Coding-agent conversations (system prompt, tools, a task and usually one tool round-trip) whose replies
+/// reason about code, call tools and write code: agent clients route experts unlike prose chat.
+const AGENT_CALIBRATION: &str = include_str!("agent_calibration.json");
+
+/// Agent conversation `index` of `of` to spread over, in the model's own template with its tools.
+pub async fn agent_prompt(worker: &Worker, index: usize, of: usize) -> Result<Vec<i32>> {
+    let set: serde_json::Value = serde_json::from_str(AGENT_CALIBRATION)?;
+    let convs = set["conversations"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let c = &convs[index * convs.len() / of.max(1) % convs.len()];
+    let mut messages = vec![serde_json::json!({"role": "system", "content": set["system"]}), serde_json::json!({"role": "user", "content": c["task"]})];
+    if !c["call"].is_null() {
+        let call =
+            serde_json::json!({"id": "call_0", "type": "function", "function": {"name": c["call"]["name"], "arguments": c["call"]["arguments"].to_string()}});
+        messages.push(serde_json::json!({"role": "assistant", "content": "", "tool_calls": [call]}));
+        messages.push(serde_json::json!({"role": "tool", "tool_call_id": "call_0", "content": c["result"]}));
+    }
+    let templated = worker.apply_template(serde_json::Value::Array(messages), Some(set["tools"].clone())).await?;
+    worker.tokenize(&templated.prompt, true).await
+}
+
 /// Runs one request to completion, granting all credit up front.
 pub async fn run_stream(worker: &Worker, req: &str, prompt: Vec<i32>, max_tokens: u32, sampling: Sampling) -> Result<StreamResult> {
     let n_prompt = prompt.len();

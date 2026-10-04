@@ -1,0 +1,205 @@
+{
+  "system": "You are a coding agent working in the user's repository. Investigate with the tools before changing anything, keep changes minimal, and explain briefly what you changed and why.",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "description": "Read a file from the repository.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Path relative to the repository root."
+            },
+            "offset": {
+              "type": "integer",
+              "description": "First line to read."
+            },
+            "limit": {
+              "type": "integer",
+              "description": "Number of lines to read."
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "edit_file",
+        "description": "Replace an exact string in a file.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "old_string": {
+              "type": "string",
+              "description": "Text to replace; must match exactly once."
+            },
+            "new_string": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "old_string",
+            "new_string"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "write_file",
+        "description": "Create or overwrite a file.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "content"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "run_shell_command",
+        "description": "Run a shell command in the repository and return its output.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "timeout_s": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "command"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "grep_search",
+        "description": "Search file contents with a regular expression.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string"
+            },
+            "glob": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "limit": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "pattern"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "list_directory",
+        "description": "List the entries of a directory.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    }
+  ],
+  "conversations": [
+    {
+      "task": "`top_k` in src/ranking.py returns items in the wrong order when two scores tie. Fix it and add a regression test.",
+      "call": {
+        "name": "read_file",
+        "arguments": {
+          "path": "src/ranking.py"
+        }
+      },
+      "result": "from dataclasses import dataclass\nfrom typing import Iterable\n\n\n@dataclass(frozen=True)\nclass Item:\n    id: str\n    score: float\n    created: int\n\n\ndef top_k(items: Iterable[Item], k: int) -> list[Item]:\n    \"\"\"Highest scores first; ties keep the newest item first.\"\"\"\n    ranked = sorted(items, key=lambda it: it.score, reverse=True)\n    return ranked[:k]\n\n\ndef normalize(items: list[Item]) -> list[Item]:\n    if not items:\n        return []\n    hi = max(it.score for it in items)\n    lo = min(it.score for it in items)\n    span = hi - lo or 1.0\n    return [Item(it.id, (it.score - lo) / span, it.created) for it in items]\n"
+    },
+    {
+      "task": "Requests to the billing API sometimes fail with 503. Add retries with exponential backoff to `fetchJson` in src/api/client.ts, at most 4 attempts, and only for 5xx responses and network errors.",
+      "call": {
+        "name": "read_file",
+        "arguments": {
+          "path": "src/api/client.ts"
+        }
+      },
+      "result": "import { ApiError } from './errors';\n\nexport interface RequestOptions {\n  method?: 'GET' | 'POST' | 'PUT' | 'DELETE';\n  body?: unknown;\n  headers?: Record<string, string>;\n  signal?: AbortSignal;\n}\n\nconst BASE_URL = process.env.API_BASE_URL ?? 'https://api.example.com';\n\nexport async function fetchJson<T>(path: string, opts: RequestOptions = {}): Promise<T> {\n  const res = await fetch(`${BASE_URL}${path}`, {\n    method: opts.method ?? 'GET',\n    headers: { 'Content-Type': 'application/json', ...opts.headers },\n    body: opts.body === undefined ? undefined : JSON.stringify(opts.body),\n    signal: opts.signal,\n  });\n  if (!res.ok) {\n    throw new ApiError(res.status, await res.text());\n  }\n  return (await res.json()) as T;\n}\n"
+    },
+    {
+      "task": "`cargo test` fails after my last change. Find out why and fix it.",
+      "call": {
+        "name": "run_shell_command",
+        "arguments": {
+          "command": "cargo test 2>&1 | tail -n 30"
+        }
+      },
+      "result": "   Compiling inventory v0.3.1 (/work/inventory)\nerror[E0502]: cannot borrow `self.items` as mutable because it is also borrowed as immutable\n  --> src/store.rs:42:13\n   |\n38 |         let item = self.items.get(&id).ok_or(StoreError::Missing(id))?;\n   |                    ---------- immutable borrow occurs here\n...\n42 |             self.items.insert(id, Item { qty: item.qty - qty, ..item.clone() });\n   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n   |             |\n   |             mutable borrow occurs here\n   |             immutable borrow later used here\n\nerror: could not compile `inventory` (lib) due to 1 previous error\n"
+    },
+    {
+      "task": "The nightly backup skips the database when the disk is almost full, and nobody notices. Make scripts/backup.sh fail loudly instead, and log how much space was free.",
+      "call": {
+        "name": "read_file",
+        "arguments": {
+          "path": "scripts/backup.sh"
+        }
+      },
+      "result": "#!/usr/bin/env bash\nset -u\n\nDEST=/var/backups/app\nSTAMP=$(date +%Y%m%d-%H%M)\nmkdir -p \"$DEST\"\n\nfree_kb=$(df --output=avail \"$DEST\" | tail -n 1)\nif [ \"$free_kb\" -lt 5000000 ]; then\n  echo \"low disk, skipping database\"\nelse\n  pg_dump -Fc app > \"$DEST/db-$STAMP.dump\"\nfi\n\ntar -czf \"$DEST/uploads-$STAMP.tar.gz\" /srv/app/uploads\nfind \"$DEST\" -type f -mtime +14 -delete\n"
+    },
+    {
+      "task": "Users report that search returns duplicate products. Find where results are assembled and fix it.",
+      "call": {
+        "name": "grep_search",
+        "arguments": {
+          "pattern": "func .*Search",
+          "glob": "**/*.go"
+        }
+      },
+      "result": "internal/catalog/search.go:27:func (s *Service) Search(ctx context.Context, q Query) ([]Product, error) {\ninternal/catalog/search.go:58:func mergeResults(byName, byTag []Product) []Product {\ninternal/catalog/search_test.go:14:func TestSearchByName(t *testing.T) {\n\ninternal/catalog/search.go (lines 50-70):\n58 func mergeResults(byName, byTag []Product) []Product {\n59 \tout := make([]Product, 0, len(byName)+len(byTag))\n60 \tout = append(out, byName...)\n61 \tout = append(out, byTag...)\n62 \tsort.Slice(out, func(i, j int) bool { return out[i].Rank > out[j].Rank })\n63 \treturn out\n64 }\n"
+    },
+    {
+      "task": "Write a small CLI in Python that reads a CSV of transactions (date, account, amount), and prints the monthly balance per account. Keep it in one file with a main function, then explain how to run it.",
+      "call": null,
+      "result": null
+    }
+  ]
+}
