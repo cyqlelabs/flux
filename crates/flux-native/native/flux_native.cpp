@@ -232,12 +232,20 @@ struct load_params {
             spec_n_max = sp.value("n_max", 3);
             spec_draft_vocab = sp.value("draft_vocab", 0);
             mp.load_mtp = true;
-            cp.n_rs_seq = (uint32_t) spec_n_max;
+            cp.n_rs_seq = (uint32_t) spec_window();
         }
         // A batch requests logits only for each decoding sequence's verification rows and a prompt's last
         // token; reserving vocabulary-wide rows for every token of a prompt chunk would cost a GPU-sized slab.
-        cp.n_outputs_max = n_seq * (uint32_t) (spec_n_max + 1) + 1;
+        cp.n_outputs_max = n_seq * (uint32_t) (spec_window() + 1) + 1;
     }
+
+    // Drafts a round may verify: the heads' n_max, or a longer copy of earlier context (ngram_draft).
+    int32_t spec_window() const { return spec_n_max > 0 ? std::max(spec_n_max, ngram_draft) : 0; }
+
+    // Copying drafts: when the last ngram_match tokens occurred earlier in the context, the tokens that followed
+    // them there. Agent replies copy code and tool output, where such drafts are mostly accepted; a long match
+    // keeps them from replacing the heads' drafts elsewhere.
+    static constexpr int32_t ngram_match = 8, ngram_draft = 5;
 
     int32_t spec_n_max = 0, spec_draft_vocab = 0;
     bool host_overrides = false;
@@ -612,10 +620,15 @@ struct fx_engine {
     // Speculation: the next-token heads run in their own context against the target's hidden states.
     llama_context * ctx_dft = nullptr;
     common_speculative * spec = nullptr;
-    int32_t spec_n_max = 0;
+    // Drafts a round may verify, and those the heads draft: a longer draft copies earlier context.
+    int32_t spec_n_max = 0, spec_heads_max = 0;
     // Verification rounds, drafted and accepted tokens, and time spent drafting, verifying, sampling the
     // verified rows and following the target (microseconds), logged periodically.
     int64_t spec_rounds = 0, spec_drafted = 0, spec_accepted = 0, spec_draft_us = 0, spec_verify_us = 0, spec_sample_us = 0, spec_follow_us = 0;
+    // The rounds that verified copied context, their drafted and accepted tokens, and whether each sequence's
+    // last draft was one.
+    int64_t spec_copy_rounds = 0, spec_copy_drafted = 0, spec_copy_accepted = 0;
+    std::vector<bool> spec_copied;
     int32_t n_threads = 0, n_threads_batch = 0;
     // Recurrent state cannot be trimmed back to an arbitrary position, only restored from a checkpoint.
     bool recurrent = false;
@@ -959,7 +972,10 @@ fx_engine * fx_engine_load(const char * params_json, char ** error) {
                 return nullptr;
             }
             common_params_speculative sp;
-            sp.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
+            // A copying draft comes first; the heads draft whenever the context offers none.
+            sp.types = {COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE, COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
+            sp.ngram_simple.size_n = load_params::ngram_match;
+            sp.ngram_simple.size_m = load_params::ngram_match;
             sp.draft.n_max = p.spec_n_max;
             // Always draft n_max tokens: a fixed verification batch keeps the target graph reused.
             sp.draft.p_min = 0.0f;
@@ -971,7 +987,9 @@ fx_engine * fx_engine_load(const char * params_json, char ** error) {
                 *error = dup("backend failed to initialize drafting with the next-token heads");
                 return nullptr;
             }
-            e->spec_n_max = p.spec_n_max;
+            e->spec_n_max = p.spec_window();
+            e->spec_heads_max = p.spec_n_max;
+            e->spec_copied.assign(llama_n_seq_max(e->ctx), false);
         }
         return e;
     } catch (const std::exception & ex) {
@@ -1468,12 +1486,13 @@ int32_t fx_seq_keep(fx_engine * e, int32_t seq, int32_t keep) {
     return 0;
 }
 
-int32_t fx_spec_draft(fx_engine * e, int32_t seq, int32_t pos, int32_t last, int32_t n_max, int32_t * out) {
-    static const llama_tokens no_prompt;
+int32_t fx_spec_draft(fx_engine * e, int32_t seq, int32_t pos, int32_t last, const int32_t * hist, int32_t n_hist, int32_t n_max, int32_t * out) {
     llama_tokens draft;
     try {
         const int64_t t0 = ggml_time_us();
-        common_speculative_get_draft_params(e->spec, seq) = {true, n_max, pos, last, &no_prompt, &draft};
+        // the copying drafter searches the context for the tokens before `last`
+        const llama_tokens prompt(hist, hist + std::max(n_hist, 0));
+        common_speculative_get_draft_params(e->spec, seq) = {true, n_max, pos, last, &prompt, &draft};
         common_speculative_draft(e->spec);
         e->spec_draft_us += ggml_time_us() - t0;
     } catch (const std::exception & ex) {
@@ -1485,6 +1504,8 @@ int32_t fx_spec_draft(fx_engine * e, int32_t seq, int32_t pos, int32_t last, int
     llama_memory_seq_rm(llama_get_memory(e->ctx_dft), seq, pos, -1);
     draft.resize(std::min<size_t>(draft.size(), (size_t) std::max(n_max, 0)));
     e->spec_drafted += (int64_t) draft.size();
+    e->spec_copied[seq] = (int32_t) draft.size() > e->spec_heads_max;
+    e->spec_copy_drafted += e->spec_copied[seq] ? (int64_t) draft.size() : 0;
     std::copy(draft.begin(), draft.end(), out);
     return (int32_t) draft.size();
 }
@@ -1495,11 +1516,15 @@ bool fx_spec_accept(fx_engine * e, int32_t seq, int32_t pos, int32_t n_accepted)
         llama_memory_seq_rm(llama_get_memory(e->ctx_dft), seq, pos, -1);
         common_speculative_accept(e->spec, seq, (uint16_t) n_accepted);
         e->spec_accepted += n_accepted;
+        if (e->spec_copied[seq]) {
+            e->spec_copy_rounds++;
+            e->spec_copy_accepted += n_accepted;
+        }
         if (++e->spec_rounds % 64 == 0) {
-            fprintf(stderr, "speculation: %lld rounds, %lld of %lld drafts accepted (%.1f tokens per round), %.1f ms drafting, %.1f ms verifying, %.1f ms sampling and %.1f ms following per round\n",
+            fprintf(stderr, "speculation: %lld rounds, %lld of %lld drafts accepted (%.1f tokens per round), %.1f ms drafting, %.1f ms verifying, %.1f ms sampling and %.1f ms following per round; %lld rounds copied context, %lld of %lld accepted\n",
                     (long long) e->spec_rounds, (long long) e->spec_accepted, (long long) e->spec_drafted, 1.0 + (double) e->spec_accepted / (double) e->spec_rounds,
                     e->spec_draft_us / 1e3 / e->spec_rounds, e->spec_verify_us / 1e3 / e->spec_rounds, e->spec_sample_us / 1e3 / e->spec_rounds,
-                    e->spec_follow_us / 1e3 / e->spec_rounds);
+                    e->spec_follow_us / 1e3 / e->spec_rounds, (long long) e->spec_copy_rounds, (long long) e->spec_copy_accepted, (long long) e->spec_copy_drafted);
         }
         return ok;
     } catch (const std::exception & ex) {

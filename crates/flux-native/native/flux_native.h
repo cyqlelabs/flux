@@ -70,8 +70,8 @@ bool fx_seq_checkpoint(fx_engine * e, int32_t seq);
 int32_t fx_seq_keep(fx_engine * e, int32_t seq, int32_t keep);
 
 // Speculation (engines loaded with a draft-mtp plan). Drafts up to n_max tokens after `last`, which sits at
-// `pos`; returns how many were written to out.
-int32_t fx_spec_draft(fx_engine * e, int32_t seq, int32_t pos, int32_t last, int32_t n_max, int32_t * out);
+// `pos`, given the n_hist tokens before it; returns how many were written to out.
+int32_t fx_spec_draft(fx_engine * e, int32_t seq, int32_t pos, int32_t last, const int32_t * hist, int32_t n_hist, int32_t n_max, int32_t * out);
 // After verification: drops the sequence from `pos` on (target and drafter) and tells the drafter how many
 // draft tokens the target accepted. False when the target could not roll back.
 bool fx_spec_accept(fx_engine * e, int32_t seq, int32_t pos, int32_t n_accepted);

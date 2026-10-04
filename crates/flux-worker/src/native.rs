@@ -346,7 +346,7 @@ impl NativeWorker {
             // Every drafted token must be emittable: within credit, max_tokens and the planned context.
             let room = (s.credit as usize).min((s.max_tokens - s.emitted) as usize).min((self.n_ctx_seq as i32 - s.pos) as usize);
             let n_draft = self.spec_n_max.min(room.saturating_sub(1));
-            let draft = if n_draft > 0 { self.engine.as_mut().unwrap().spec_draft(s.slot, s.pos, s.next.unwrap(), n_draft) } else { vec![] };
+            let draft = if n_draft > 0 { self.engine.as_mut().unwrap().spec_draft(s.slot, s.pos, s.next.unwrap(), &s.kv, n_draft) } else { vec![] };
             sample_rows.push((i, tokens.len() as i32, draft.clone()));
             decode_rows.push(i);
             for (k, &t) in std::iter::once(&s.next.unwrap()).chain(&draft).enumerate() {

@@ -52,7 +52,7 @@ mod ffi {
         pub fn fx_seq_clear(e: *mut Engine, seq: i32);
         pub fn fx_seq_checkpoint(e: *mut Engine, seq: i32) -> bool;
         pub fn fx_seq_keep(e: *mut Engine, seq: i32, keep: i32) -> i32;
-        pub fn fx_spec_draft(e: *mut Engine, seq: i32, pos: i32, last: i32, n_max: i32, out: *mut i32) -> i32;
+        pub fn fx_spec_draft(e: *mut Engine, seq: i32, pos: i32, last: i32, hist: *const i32, n_hist: i32, n_max: i32, out: *mut i32) -> i32;
         pub fn fx_spec_accept(e: *mut Engine, seq: i32, pos: i32, n_accepted: i32) -> bool;
 
         pub fn fx_sampler_new(e: *mut Engine, sampling: *const c_char) -> *mut Sampler;
@@ -221,10 +221,11 @@ impl Engine {
         (t >= 0).then_some(t)
     }
 
-    /// Up to `n_max` draft tokens following `last`, which sits at `pos` (engines planned with speculation).
-    pub fn spec_draft(&mut self, seq: i32, pos: i32, last: i32, n_max: usize) -> Vec<i32> {
+    /// Up to `n_max` draft tokens following `last`, which sits at `pos` after the tokens `hist` (engines planned
+    /// with speculation).
+    pub fn spec_draft(&mut self, seq: i32, pos: i32, last: i32, hist: &[i32], n_max: usize) -> Vec<i32> {
         let mut out = vec![0i32; n_max];
-        let n = unsafe { ffi::fx_spec_draft(self.ptr.as_ptr(), seq, pos, last, n_max as i32, out.as_mut_ptr()) };
+        let n = unsafe { ffi::fx_spec_draft(self.ptr.as_ptr(), seq, pos, last, hist.as_ptr(), hist.len() as i32, n_max as i32, out.as_mut_ptr()) };
         out.truncate(n.max(0) as usize);
         out
     }
