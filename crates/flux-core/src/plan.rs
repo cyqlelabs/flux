@@ -248,6 +248,10 @@ pub struct Measurement {
     pub token_ms: Summary,
     pub peak_device_bytes: Vec<(String, u64)>,
     pub peak_host_rss: u64,
+    /// Decode rate on the built-in coding-agent conversations (validation runs): agent clients route experts
+    /// unlike the prose prompts above, so serving judges requests that carry tools against this rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_decode_tps: Option<Summary>,
 }
 
 /// One long request on a candidate: a prompt a quarter of the planned context, then decoding at that depth.

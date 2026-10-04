@@ -136,6 +136,7 @@ async fn token_request(
     stop.extend(extra_stops);
     st.live.begin(&id, prompt.len() as u32);
     let parsed = chat.parser.is_some();
+    let agent = body.get("tools").and_then(Value::as_array).is_some_and(|t| !t.is_empty());
     let job = TokenJob { id: id.clone(), prompt, sampling: sampling(&body), stop, max_tokens: max_tokens as u32, render_special, chat };
     let (tx, rx) = mpsc::channel(32);
     let (done_tx, done_rx) = oneshot::channel();
@@ -145,7 +146,7 @@ async fn token_request(
         drop(permit);
         st2.live.finish(&id2, &o);
         if let Some(tps) = o.decode_tps {
-            crate::monitor::observe_rate(&st2, tps, o.n_prompt);
+            crate::monitor::observe_rate(&st2, tps, o.n_prompt, agent);
         }
         let _ = done_tx.send(o);
     });

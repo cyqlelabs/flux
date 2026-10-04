@@ -1407,12 +1407,24 @@ async fn measured_run(ctx: &Ctx<'_>, plan: &Plan, corpus: &Corpus, role: Role, n
         let wall = t0.elapsed().as_secs_f64();
         let errors: Vec<String> = results.iter().filter_map(|r| r.error.clone()).collect();
         ensure!(errors.is_empty(), "{}", errors.join("; "));
-        summarize(&results, wall).context("no completed streams")
+        let s = summarize(&results, wall).context("no completed streams")?;
+        let agent = if role == Role::Validation {
+            let mut prompts = vec![];
+            for i in 0..n {
+                prompts.push(agent_prompt(&w, i, n).await?);
+            }
+            let t0 = Instant::now();
+            let results = run_all(&w, "agent", prompts, ctx.req.decode_tokens, concurrency, bench_sampling()).await?;
+            summarize(&results, t0.elapsed().as_secs_f64()).map(|a| a.decode_tps)
+        } else {
+            None
+        };
+        anyhow::Ok((s, agent))
     }
     .await;
     let peaks = sampler.finish();
     w.shutdown().await;
-    let s = result?;
+    let (s, agent_decode_tps) = result?;
     (ctx.log)(&format!(
         "  peak host RSS {}, devices {:?}",
         fmt_bytes(peaks.tree_rss),
@@ -1426,6 +1438,7 @@ async fn measured_run(ctx: &Ctx<'_>, plan: &Plan, corpus: &Corpus, role: Role, n
             token_ms: s.token_ms,
             peak_device_bytes: peaks.device_added().into_iter().collect(),
             peak_host_rss: peaks.tree_rss,
+            agent_decode_tps,
         },
         s,
     ))

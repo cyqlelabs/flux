@@ -52,9 +52,10 @@ fn retune_cost_s(p: &Plan, load_ms: f64) -> f64 {
 }
 
 /// The chosen candidate's short-prompt decode rate and, where measured, its long-prompt measurement.
-fn validated_rates(p: &Plan) -> (Option<f64>, Option<flux_core::plan::DepthMeasurement>) {
-    let Some(c) = p.validation.as_ref().and_then(|v| v.candidates.iter().find(|c| c.label == v.chosen)) else { return (None, None) };
-    (c.validation.as_ref().or(c.calibration.as_ref()).map(|m| m.decode_tps.p50), c.depth.clone())
+fn validated_rates(p: &Plan) -> monitor::Rates {
+    let Some(c) = p.validation.as_ref().and_then(|v| v.candidates.iter().find(|c| c.label == v.chosen)) else { return monitor::Rates::default() };
+    let m = c.validation.as_ref().or(c.calibration.as_ref());
+    monitor::Rates { prose_tps: m.map(|m| m.decode_tps.p50), agent_tps: m.and_then(|m| m.agent_decode_tps.as_ref()).map(|a| a.p50), depth: c.depth.clone() }
 }
 
 pub async fn build(cfg: FluxConfig, plan: Plan, replanner: Option<Replanner>) -> Result<Arc<AppState>> {
@@ -62,10 +63,10 @@ pub async fn build(cfg: FluxConfig, plan: Plan, replanner: Option<Replanner>) ->
     std::fs::create_dir_all(&logs)?;
     let model_name = plan.model_files[0].file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     let concurrency = plan.workload.concurrency as usize;
-    let (rate, depth) = validated_rates(&plan);
+    let rates = validated_rates(&plan);
     let tuning = plan.clone();
     let supervisor = Supervisor::start(plan, logs.join("serve-worker.log")).await?;
-    let drift = monitor::Drift::new(rate, depth, retune_cost_s(&tuning, supervisor.loaded().await.load_ms));
+    let drift = monitor::Drift::new(rates, retune_cost_s(&tuning, supervisor.loaded().await.load_ms));
     let level = supervisor.current().await.1.level.clone();
     Ok(Arc::new(AppState {
         admission: Admission::new(concurrency, cfg.serve.queue_depth),
@@ -161,7 +162,7 @@ async fn stats(State(st): State<Arc<AppState>>) -> Response {
             "rejected": st.admission.rejected.load(std::sync::atomic::Ordering::Relaxed),
         },
         "journal_running": st.journal.running(),
-        "drift": {"baseline_tps": d.baseline_tps, "recent_tps": d.recent_tps, "recent_vs_expected": d.recent_ratio, "drifted": d.drifted},
+        "drift": {"baseline_tps": d.baseline_tps, "agent_baseline_tps": d.agent_tps, "recent_tps": d.recent_tps, "recent_vs_expected": d.recent_ratio, "drifted": d.drifted},
         "requests": st.live.snapshot(),
         "worker": worker,
     }))
@@ -192,8 +193,7 @@ pub async fn replan_now(st: &Arc<AppState>) -> Result<Plan> {
     match &result {
         Ok(p) => {
             let load_ms = st.supervisor.loaded().await.load_ms;
-            let (rate, depth) = validated_rates(p);
-            *st.drift.lock().unwrap() = monitor::Drift::new(rate, depth, retune_cost_s(p, load_ms));
+            *st.drift.lock().unwrap() = monitor::Drift::new(validated_rates(p), retune_cost_s(p, load_ms));
         }
         // A planning failure leaves the devices free: bring the previous plan back.
         Err(_) => {

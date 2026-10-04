@@ -206,7 +206,11 @@ pub fn print_plan(p: &Plan) {
                         " · {}-token prompt at {:.0} tok/s, decode {:.2} tok/s",
                         d.prompt_tokens, d.prefill_tps, d.decode_tps
                     )),
-                    if c.validation.is_some() { " · validated" } else { "" }
+                    match c.validation.as_ref().map(|v| v.agent_decode_tps.as_ref()) {
+                        Some(Some(a)) => format!(" · validated · agent conversations {:.2} tok/s", a.p50),
+                        Some(None) => " · validated".to_string(),
+                        None => String::new(),
+                    }
                 ),
                 (None, Some(f)) => println!("  {:<60} {f}", c.label),
                 _ => {}

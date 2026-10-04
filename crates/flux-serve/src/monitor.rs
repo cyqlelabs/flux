@@ -74,12 +74,14 @@ pub fn spawn(st: Arc<AppState>) {
 }
 
 /// Feeds a finished request's decode rate at `depth` prompt tokens. The rate is compared with what the plan
-/// measured at that depth, so long-context requests do not read as drift. Once drift is established, replans
-/// automatically when the configured horizon makes it pay (`should_retune`), otherwise logs once.
-pub fn observe_rate(st: &Arc<AppState>, tps: f64, depth: u32) {
+/// measured at that depth, so long-context requests do not read as drift, and an `agent` request (one carrying
+/// tools) with the plan's agent-conversation rate, as agent clients route experts unlike prose. Once drift is
+/// established, replans automatically when the configured horizon makes it pay (`should_retune`), otherwise logs once.
+pub fn observe_rate(st: &Arc<AppState>, tps: f64, depth: u32, agent: bool) {
     let mut d = st.drift.lock().unwrap();
     d.recent_tps = if d.recent_tps == 0.0 { tps } else { 0.8 * d.recent_tps + 0.2 * tps };
-    let expected = d.depth.as_ref().map_or(d.baseline_tps, |m| m.decode_tps_at(d.baseline_tps, depth));
+    let at_depth = d.depth.as_ref().map_or(d.baseline_tps, |m| m.decode_tps_at(d.baseline_tps, depth));
+    let expected = if agent && d.agent_tps > 0.0 && d.baseline_tps > 0.0 { at_depth * d.agent_tps / d.baseline_tps } else { at_depth };
     let ratio = if expected > 0.0 { tps / expected } else { 1.0 };
     d.recent_ratio = if d.recent_ratio == 0.0 { ratio } else { 0.8 * d.recent_ratio + 0.2 * ratio };
     let baseline = d.baseline_tps;
@@ -109,9 +111,19 @@ pub fn observe_rate(st: &Arc<AppState>, tps: f64, depth: u32) {
     }
 }
 
+/// What the plan measured: decode on prose and on agent conversations, and on one long prompt.
+#[derive(Default)]
+pub struct Rates {
+    pub prose_tps: Option<f64>,
+    pub agent_tps: Option<f64>,
+    pub depth: Option<DepthMeasurement>,
+}
+
 pub struct Drift {
     pub monitor: Option<DriftMonitor>,
     pub baseline_tps: f64,
+    /// Decode rate on the plan's agent conversations, 0 when the plan predates that measurement.
+    pub agent_tps: f64,
     /// The plan's long-prompt measurement, which sets the expected rate at depth.
     pub depth: Option<DepthMeasurement>,
     pub recent_tps: f64,
@@ -123,11 +135,12 @@ pub struct Drift {
 }
 
 impl Drift {
-    pub fn new(baseline_tps: Option<f64>, depth: Option<DepthMeasurement>, retune_cost_s: f64) -> Drift {
+    pub fn new(rates: Rates, retune_cost_s: f64) -> Drift {
         Drift {
-            monitor: baseline_tps.map(|b| DriftMonitor::new(b, 0.15, 5)),
-            baseline_tps: baseline_tps.unwrap_or(0.0),
-            depth,
+            monitor: rates.prose_tps.map(|b| DriftMonitor::new(b, 0.15, 5)),
+            baseline_tps: rates.prose_tps.unwrap_or(0.0),
+            agent_tps: rates.agent_tps.unwrap_or(0.0),
+            depth: rates.depth,
             recent_tps: 0.0,
             recent_ratio: 0.0,
             retune_cost_s,
