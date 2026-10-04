@@ -115,15 +115,18 @@ async fn token_request(
 ) -> Response {
     let n_ctx = st.supervisor.loaded().await.n_ctx_seq as usize;
     let requested = body.get("max_completion_tokens").or_else(|| body.get("max_tokens")).and_then(Value::as_u64).map(|v| v as usize);
-    let max_tokens = requested.unwrap_or(n_ctx.saturating_sub(prompt.len()));
-    if prompt.is_empty() || max_tokens == 0 || prompt.len() + max_tokens > n_ctx {
+    // max_tokens is a ceiling, as in llama-server: agents ask for 32K or more on every turn, so a reply stops
+    // ("length") where the context ends instead of the request failing once the conversation grows.
+    let room = n_ctx.saturating_sub(prompt.len());
+    let max_tokens = requested.unwrap_or(room).min(room);
+    if prompt.is_empty() || requested == Some(0) {
+        return error(StatusCode::BAD_REQUEST, "invalid_request_error", "the prompt is empty or max_tokens is 0");
+    }
+    if room == 0 {
         return error(
             StatusCode::BAD_REQUEST,
             "context_length_exceeded",
-            format!(
-                "prompt ({} tokens) + max_tokens ({max_tokens}) exceeds the plan's {n_ctx} tokens per sequence; Flux never truncates a request",
-                prompt.len()
-            ),
+            format!("prompt ({} tokens) leaves no room in the plan's {n_ctx} tokens per sequence; Flux never truncates a prompt", prompt.len()),
         );
     }
     if st.journal.begin(&id, prompt.clone()).is_none() {
