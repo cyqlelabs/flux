@@ -78,7 +78,7 @@ cargo build --release -p flux-cli -p flux-worker
 ```sh
 export PATH="$PWD/target/release:$PATH"
 
-flux plan path/to/model.gguf --ctx 16384
+flux plan path/to/model.gguf
 flux serve <plan-id>
 ```
 
@@ -114,7 +114,7 @@ Run `flux <command> --help` for every flag.
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--ctx` | 8192 | Tokens per sequence the plan must hold, prompt plus output |
+| `--ctx` | 65536, or the model's trained context if shorter | Tokens per sequence the plan must hold, prompt plus output |
 | `--concurrency` | 1 | Concurrent sequences the plan must hold |
 | `--serving-p95-ms` | off | Optimize aggregate tokens per second under this p95 per-token latency |
 | `--engines` | `native,llama-server` | Engines to compare, including any named in `flux.toml` |

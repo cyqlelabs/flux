@@ -7,6 +7,9 @@ use clap::{Parser, Subcommand};
 use flux_core::config::FluxConfig;
 use std::path::PathBuf;
 
+/// Tokens per sequence a plan holds when `--ctx` is not given.
+const DEFAULT_CTX: u32 = 65536;
+
 #[derive(Parser)]
 #[command(name = "flux", version, about = "Measured LLM execution planning over llama.cpp and other engines")]
 struct Cli {
@@ -60,9 +63,10 @@ enum Cmd {
     /// Find, measure and save the fastest validated plan for a model and workload.
     Plan {
         model: PathBuf,
-        /// Tokens per sequence the plan must hold (prompt + output).
-        #[arg(long, default_value_t = 8192)]
-        ctx: u32,
+        /// Tokens per sequence the plan must hold (prompt + output). Default: 65536, or the model's trained context
+        /// when that is shorter; agent clients send prompts of 20K tokens and more.
+        #[arg(long)]
+        ctx: Option<u32>,
         /// Concurrent sequences the plan must hold.
         #[arg(long, default_value_t = 1)]
         concurrency: u32,
@@ -216,6 +220,7 @@ async fn main() -> Result<()> {
                 None => model,
             };
             let m = planning::inspect_hashed(&cfg, &model)?;
+            let ctx = ctx.unwrap_or_else(|| m.facts.as_ref().map(|f| f.n_ctx_train).filter(|&n| n > 0).map_or(DEFAULT_CTX, |n| n.min(DEFAULT_CTX)));
             // Drafting is measured whenever the model carries next-token heads, and kept only where it wins.
             let speculation = speculation || m.facts.as_ref().is_some_and(|f| f.n_layer_nextn > 0);
             let report = planning::probe_report(&cfg, Some(&m), false, reprobe).await?;
