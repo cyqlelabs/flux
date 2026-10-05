@@ -1,0 +1,17 @@
+model has unused tensor blk.64.attn_norm.weight (size = 20480 bytes) -- ignoring
+model has unused tensor blk.64.post_attention_norm.weight (size = 20480 bytes) -- ignoring
+model has unused tensor blk.64.attn_q.weight (size = 35389440 bytes) -- ignoring
+model has unused tensor blk.64.attn_k.weight (size = 2949120 bytes) -- ignoring
+model has unused tensor blk.64.attn_v.weight (size = 3604480 bytes) -- ignoring
+model has unused tensor blk.64.attn_output.weight (size = 17694720 bytes) -- ignoring
+model has unused tensor blk.64.attn_q_norm.weight (size = 1024 bytes) -- ignoring
+model has unused tensor blk.64.attn_k_norm.weight (size = 1024 bytes) -- ignoring
+model has unused tensor blk.64.ffn_gate.weight (size = 50135040 bytes) -- ignoring
+model has unused tensor blk.64.ffn_down.weight (size = 50135040 bytes) -- ignoring
+model has unused tensor blk.64.ffn_up.weight (size = 50135040 bytes) -- ignoring
+model has unused tensor blk.64.nextn.eh_proj.weight (size = 55705600 bytes) -- ignoring
+model has unused tensor blk.64.nextn.enorm.weight (size = 20480 bytes) -- ignoring
+model has unused tensor blk.64.nextn.hnorm.weight (size = 20480 bytes) -- ignoring
+model has unused tensor blk.64.nextn.shared_head_norm.weight (size = 20480 bytes) -- ignoring
+...........................................................................................
+prompt reuse: a checkpoint holds 149.6 MiB of recurrent state (up to 4 per sequence)

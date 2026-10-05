@@ -1,0 +1,3 @@
+...........................................................................................
+prompt reuse: a checkpoint holds 149.6 MiB of recurrent state (up to 4 per sequence)
+speculation: 64 rounds, 105 of 128 drafts accepted (2.6 tokens per round), 10.7 ms drafting, 71.7 ms verifying, 0.5 ms sampling and 0.5 ms following per round; 0 rounds copied context, 0 of 0 accepted

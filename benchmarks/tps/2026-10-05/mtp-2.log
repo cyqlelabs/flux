@@ -1,0 +1,9 @@
+...........................................................................................
+ggml_backend_cuda_buffer_type_alloc_buffer: allocating 58.52 MiB on device 1: cudaMalloc failed: out of memory
+ggml_gallocr_reserve_n_impl: failed to allocate CUDA1 buffer of size 61358592
+graph_reserve: failed to allocate compute buffers
+sched_reserve: compute buffer allocation failed, retrying without pipeline parallelism
+ggml_backend_cuda_buffer_type_alloc_buffer: allocating 32.50 MiB on device 1: cudaMalloc failed: out of memory
+ggml_gallocr_reserve_n_impl: failed to allocate CUDA1 buffer of size 34082944
+graph_reserve: failed to allocate compute buffers
+llama_init_from_model: failed to initialize the context: failed to allocate compute pp buffers

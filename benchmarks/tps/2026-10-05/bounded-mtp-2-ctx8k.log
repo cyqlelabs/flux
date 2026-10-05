@@ -1,0 +1,13 @@
+...........................................................................................
+prompt reuse: a checkpoint holds 149.6 MiB of recurrent state (up to 4 per sequence)
+speculation: 64 rounds, 81 of 128 drafts accepted (2.3 tokens per round), 10.4 ms drafting, 68.7 ms verifying, 0.5 ms sampling and 0.5 ms following per round; 0 rounds copied context, 0 of 0 accepted
+speculation: 128 rounds, 156 of 256 drafts accepted (2.2 tokens per round), 10.3 ms drafting, 66.0 ms verifying, 0.4 ms sampling and 0.5 ms following per round; 0 rounds copied context, 0 of 0 accepted
+speculation: 192 rounds, 241 of 384 drafts accepted (2.3 tokens per round), 9.9 ms drafting, 66.1 ms verifying, 0.4 ms sampling and 0.5 ms following per round; 0 rounds copied context, 0 of 0 accepted
+speculation: 256 rounds, 329 of 512 drafts accepted (2.3 tokens per round), 9.3 ms drafting, 65.8 ms verifying, 0.4 ms sampling and 0.5 ms following per round; 0 rounds copied context, 0 of 0 accepted
+speculation: 320 rounds, 422 of 639 drafts accepted (2.3 tokens per round), 9.6 ms drafting, 65.7 ms verifying, 0.6 ms sampling and 0.5 ms following per round; 0 rounds copied context, 0 of 0 accepted
+speculation: 384 rounds, 520 of 766 drafts accepted (2.4 tokens per round), 9.7 ms drafting, 65.8 ms verifying, 0.6 ms sampling and 0.6 ms following per round; 0 rounds copied context, 0 of 0 accepted
+speculation: 448 rounds, 625 of 893 drafts accepted (2.4 tokens per round), 9.7 ms drafting, 65.7 ms verifying, 0.6 ms sampling and 0.6 ms following per round; 0 rounds copied context, 0 of 0 accepted
+speculation: 512 rounds, 708 of 1020 drafts accepted (2.4 tokens per round), 9.8 ms drafting, 65.6 ms verifying, 0.6 ms sampling and 0.6 ms following per round; 0 rounds copied context, 0 of 0 accepted
+speculation: 576 rounds, 781 of 1148 drafts accepted (2.4 tokens per round), 9.8 ms drafting, 65.6 ms verifying, 0.6 ms sampling and 0.6 ms following per round; 0 rounds copied context, 0 of 0 accepted
+speculation: 640 rounds, 864 of 1275 drafts accepted (2.4 tokens per round), 9.9 ms drafting, 65.5 ms verifying, 0.5 ms sampling and 0.6 ms following per round; 0 rounds copied context, 0 of 0 accepted
+speculation: 704 rounds, 955 of 1401 drafts accepted (2.4 tokens per round), 10.0 ms drafting, 65.5 ms verifying, 0.5 ms sampling and 0.6 ms following per round; 0 rounds copied context, 0 of 0 accepted

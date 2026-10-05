@@ -1,0 +1,93 @@
+{
+  "baseline": "benchmarks/tps/2026-10-05/plain-ctx8k-control.json",
+  "candidate": "benchmarks/tps/2026-10-05/bounded-mtp-2-ctx8k.json",
+  "exact_token_trials": 10,
+  "exact_text_trials": 10,
+  "total_trials": 18,
+  "cells": [
+    {
+      "prompt_tokens": 512,
+      "trials": 3,
+      "prefill_tps": {
+        "baseline": 525.5601185191445,
+        "candidate": 467.30356881706945,
+        "ratio": 0.889153404816517
+      },
+      "decode_tps": {
+        "baseline": 17.853051555213916,
+        "candidate": 32.089569465578506,
+        "ratio": 1.7974277039606077
+      },
+      "ttft_s": {
+        "baseline": 1.0353990889998386,
+        "candidate": 1.1064864069994655,
+        "ratio": 1.0686569253873837
+      },
+      "total_s": {
+        "baseline": 6.356408183994063,
+        "candidate": 4.063332300000184,
+        "ratio": 0.6392497433113209
+      },
+      "warm_ttft_s": {
+        "baseline": 0.09068401799595449,
+        "candidate": 0.0904173430026276
+      }
+    },
+    {
+      "prompt_tokens": 2048,
+      "trials": 3,
+      "prefill_tps": {
+        "baseline": 466.5341996415695,
+        "candidate": 436.79303860343987,
+        "ratio": 0.9362508449305983
+      },
+      "decode_tps": {
+        "baseline": 17.7401738909472,
+        "candidate": 34.56409510022143,
+        "ratio": 1.9483515388684811
+      },
+      "ttft_s": {
+        "baseline": 4.453283186005137,
+        "candidate": 4.704044348996831,
+        "ratio": 1.0563092784621768
+      },
+      "total_s": {
+        "baseline": 9.808374135005579,
+        "candidate": 7.411532712998451,
+        "ratio": 0.755633157033343
+      },
+      "warm_ttft_s": {
+        "baseline": 0.09111849499458913,
+        "candidate": 0.09187073099747067
+      }
+    },
+    {
+      "prompt_tokens": 4096,
+      "trials": 3,
+      "prefill_tps": {
+        "baseline": 456.48711910235556,
+        "candidate": 431.09284672879545,
+        "ratio": 0.944370232344133
+      },
+      "decode_tps": {
+        "baseline": 17.77676786775306,
+        "candidate": 30.102784306129546,
+        "ratio": 1.693377813676456
+      },
+      "ttft_s": {
+        "baseline": 9.038472605003335,
+        "candidate": 9.51845442999911,
+        "ratio": 1.0531043071071629
+      },
+      "total_s": {
+        "baseline": 14.380358162001357,
+        "candidate": 12.674317867000354,
+        "ratio": 0.8813631568990373
+      },
+      "warm_ttft_s": {
+        "baseline": 0.09156986000016332,
+        "candidate": 0.093663330997515
+      }
+    }
+  ]
+}

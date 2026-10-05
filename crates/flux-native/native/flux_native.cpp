@@ -239,13 +239,14 @@ struct load_params {
         cp.n_outputs_max = n_seq * (uint32_t) (spec_window() + 1) + 1;
     }
 
-    // Drafts a round may verify: the heads' n_max, or a longer copy of earlier context (ngram_draft).
-    int32_t spec_window() const { return spec_n_max > 0 ? std::max(spec_n_max, ngram_draft) : 0; }
+    // Both head and copying drafts obey the plan's limit. Each additional slot keeps a full recurrent
+    // state per sequence; reserving five for a two-token plan can prevent otherwise viable loads.
+    int32_t spec_window() const { return spec_n_max; }
 
     // Copying drafts: when the last ngram_match tokens occurred earlier in the context, the tokens that followed
     // them there. Agent replies copy code and tool output, where such drafts are mostly accepted; a long match
     // keeps them from replacing the heads' drafts elsewhere.
-    static constexpr int32_t ngram_match = 8, ngram_draft = 5;
+    static constexpr int32_t ngram_match = 8;
 
     int32_t spec_n_max = 0, spec_draft_vocab = 0;
     bool host_overrides = false;
@@ -306,6 +307,24 @@ json memory_json(const llama_context * ctx) {
         out.push_back({{"device", name}, {"model", t.model}, {"context", t.context}, {"compute", t.compute}, {"staging", t.staging}});
     }
     return out;
+}
+
+json engine_memory_json(const llama_context * target, const llama_context * draft) {
+    json memory = memory_json(target);
+    if (draft) {
+        // Weights are shared; the drafter owns additional state and scratch buffers.
+        for (const auto & d : memory_json(draft)) {
+            auto it = std::find_if(memory.begin(), memory.end(), [&](const json & m) { return m["device"] == d["device"]; });
+            if (it == memory.end()) {
+                memory.push_back({{"device", d["device"]}, {"model", 0}, {"context", d["context"]}, {"compute", d["compute"]}, {"staging", d["staging"]}});
+                continue;
+            }
+            for (const char * k : {"context", "compute", "staging"}) {
+                (*it)[k] = (*it)[k].get<uint64_t>() + d[k].get<uint64_t>();
+            }
+        }
+    }
+    return memory;
 }
 
 void set_threads(ggml_backend_t backend, ggml_backend_dev_t dev, int n) {
@@ -715,19 +734,8 @@ char * fx_measure(const char * params_json) {
                 return err_json("backend could not create the draft context with these parameters");
             }
         }
-        json memory = memory_json(ctx);
+        json memory = engine_memory_json(ctx, ctx_dft);
         if (ctx_dft) {
-            // The draft context shares the model's weights: add only its own cache and compute buffers.
-            for (const auto & d : memory_json(ctx_dft)) {
-                auto it = std::find_if(memory.begin(), memory.end(), [&](const json & m) { return m["device"] == d["device"]; });
-                if (it == memory.end()) {
-                    memory.push_back({{"device", d["device"]}, {"model", 0}, {"context", d["context"]}, {"compute", d["compute"]}});
-                    continue;
-                }
-                for (const char * k : {"context", "compute"}) {
-                    (*it)[k] = (*it)[k].get<uint64_t>() + d[k].get<uint64_t>();
-                }
-            }
             llama_free(ctx_dft);
         }
         json out = {
@@ -1016,7 +1024,7 @@ char * fx_engine_info(fx_engine * e) {
             {"add_bos", llama_vocab_get_add_bos(e->vocab)},
             {"spec_n_max", e->spec_n_max},
             {"recurrent", e->recurrent},
-            {"memory", memory_json(e->ctx)},
+            {"memory", engine_memory_json(e->ctx, e->ctx_dft)},
         }.dump());
     } catch (const std::exception & ex) {
         return err_json(ex.what());

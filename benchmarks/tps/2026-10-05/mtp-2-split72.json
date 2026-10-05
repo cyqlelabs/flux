@@ -1,0 +1,26 @@
+{
+  "config": {
+    "worker": "/tmp/flux-tps-baseline-worker",
+    "model": "/media/nico/nvme/ai/models/Qwen3.8-27B-Uncensored-HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf",
+    "output": "benchmarks/tps/2026-10-05/mtp-2-split72.json",
+    "corpus": "benchmarks/tps/2026-10-05/corpus.json",
+    "ubatch": 128,
+    "drafts": 2,
+    "split": 0.72,
+    "context": 8192,
+    "concurrency": 1,
+    "prompts": "512,2048,4096",
+    "generated": 96,
+    "repeats": 2
+  },
+  "runs": [],
+  "hello": {
+    "ev": "hello",
+    "protocol": 1,
+    "worker": "0.1.0",
+    "engine": "native",
+    "backend_revision": "427291b5b34cd914a31b3fd3b61a68f6184f4b9f",
+    "backend_build": "427291b5b34c+5292b81c5bf2dac1fa7d2589",
+    "level": "tokens"
+  }
+}

@@ -153,6 +153,7 @@ pub struct Speculation {
     /// `draft-mtp` (model's own next-token heads) or `draft` (separate model).
     pub kind: String,
     pub draft_model: Option<PathBuf>,
+    /// Maximum draft tokens per round, including native copies of earlier context.
     pub n_max: u32,
     /// The next-token heads draft only from token ids below this, which cuts the cost of their output head.
     /// None drafts from the whole vocabulary.
