@@ -5,10 +5,16 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$ROOT/third_party/llama.cpp"
 PIN="$(cat "$ROOT/backend.pin")"
-HEAD="$(git -C "$SRC" rev-parse HEAD)"
+HEAD="$(git -C "$SRC" rev-parse HEAD 2>/dev/null || echo "")"
 if [[ "$HEAD" != "$PIN" ]]; then
-  echo "third_party/llama.cpp is at $HEAD, backend.pin requires $PIN" >&2
-  exit 1
+  echo "third_party/llama.cpp is at ${HEAD:-empty}, backend.pin requires $PIN. Updating submodule..." >&2
+  git -C "$ROOT" submodule update --init "$SRC"
+  
+  HEAD="$(git -C "$SRC" rev-parse HEAD 2>/dev/null || echo "")"
+  if [[ "$HEAD" != "$PIN" ]]; then
+    echo "Failed to check out pinned backend revision $PIN" >&2
+    exit 1
+  fi
 fi
 # Flux extensions to the pinned revision (GPU expert cache, MTP heads, Q2_0 AVX2 kernel).
 for patch in "$ROOT"/patches/llama.cpp/*.patch; do

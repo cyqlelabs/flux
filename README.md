@@ -67,11 +67,14 @@ While serving, the CPU computes its experts at the same time as the GPU computes
 ```sh
 git clone --recurse-submodules https://github.com/cyqlelabs/flux.git
 cd flux
+# Optional: install Python dependencies if you intend to run `flux convert`
+pip install -r requirements.txt
+
 scripts/build-backend.sh
 cargo build --release -p flux-cli -p flux-worker
 ```
 
-`build-backend.sh` checks that `third_party/llama.cpp` is at the commit in `backend.pin`, applies the patches in `patches/llama.cpp/`, and builds llama.cpp for CUDA compute capabilities 7.5 and 8.6 (RTX 20 and RTX 30 series). Set `CUDA_ARCHS` to target other GPUs. The `flux` and `flux-worker` binaries land in `target/release/`.
+`build-backend.sh` ensures `third_party/llama.cpp` matches `backend.pin`, applies the patches in `patches/llama.cpp/`, and builds llama.cpp for CUDA compute capabilities 7.5 and 8.6 (RTX 20 and RTX 30 series). If you have a different GPU (e.g. RTX 40-series/8.9, A100/8.0), set `CUDA_ARCHS` appropriately: `CUDA_ARCHS=89 scripts/build-backend.sh`. The `flux` and `flux-worker` binaries land in `target/release/`.
 
 `scripts/package.sh` builds a relocatable tarball in `dist/` that bundles both binaries, the llama.cpp libraries, and a starter `flux.toml`.
 
