@@ -88,7 +88,10 @@ fn delta_chunk(id: &str, model: &str, created: i64, delta: Value) -> Value {
 }
 
 /// "tool_calls" when a parsed reply ends by calling tools, as OpenAI reports it.
-fn finish_reason(o: &Outcome) -> String {
+pub(crate) fn finish_reason(o: &Outcome) -> String {
+    if let Some(reason) = &o.finish_reason {
+        return reason.clone();
+    }
     let calls = o.message.as_ref().and_then(|m| m["tool_calls"].as_array()).is_some_and(|c| !c.is_empty());
     match finish_name(o.reason) {
         f if calls && f == "stop" => "tool_calls".into(),
@@ -129,8 +132,12 @@ async fn token_request(
             format!("prompt ({} tokens) leaves no room in the plan's {n_ctx} tokens per sequence; Flux never truncates a prompt", prompt.len()),
         );
     }
-    if st.journal.begin(&id, prompt.clone()).is_none() {
-        return error(StatusCode::CONFLICT, "duplicate_request", format!("request {id} exists; resume it at /flux/requests/{id}/stream"));
+    if let Err(kind) = st.journal.try_begin(&id, prompt.clone()) {
+        return error(
+            if kind == "duplicate_request" { StatusCode::CONFLICT } else { StatusCode::SERVICE_UNAVAILABLE },
+            kind,
+            format!("cannot journal request {id}: {kind}"),
+        );
     }
     let mut stop = stops(&body);
     stop.extend(extra_stops);
@@ -163,19 +170,15 @@ async fn respond(st: Arc<AppState>, api: Api, id: String, stream: bool, parsed: 
     }
     let mut rx = rx;
     let mut text = String::new();
-    let mut chunks = vec![];
     while let Some(p) = rx.recv().await {
         match p {
             Piece::Text { text: t, .. } => text.push_str(&t),
-            Piece::Chunk(c) => chunks.push(c),
+            Piece::Chunk(_) => {}
         }
     }
     let o = done.await.unwrap_or(Outcome { error: Some("generation task failed".into()), ..failed() });
     if let Some(e) = &o.error {
         return error(StatusCode::INTERNAL_SERVER_ERROR, "engine_error", e.clone());
-    }
-    if !chunks.is_empty() {
-        text = chunks.iter().filter_map(|c| c["choices"][0]["delta"]["content"].as_str()).collect();
     }
     let finish = finish_reason(&o);
     let message = match &o.message {
@@ -195,7 +198,7 @@ async fn respond(st: Arc<AppState>, api: Api, id: String, stream: bool, parsed: 
 }
 
 fn failed() -> Outcome {
-    Outcome { reason: None, n_prompt: 0, n_completion: 0, error: None, decode_tps: None, message: None }
+    Outcome::default()
 }
 
 fn sse(
@@ -211,7 +214,11 @@ fn sse(
     let pieces = stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|p| (p, rx)) }).flat_map(move |p| {
         let values = match p {
             Piece::Text { deltas, .. } if parsed => deltas.into_iter().map(|d| delta_chunk(&id, &model, created, d)).collect(),
-            Piece::Text { text, .. } => vec![chunk(api, &id, &model, created, Some(&text), None, None)],
+            Piece::Text { token, text, .. } => {
+                let mut c = chunk(api, &id, &model, created, Some(&text), None, None);
+                c["flux_token"] = if token >= 0 { json!(token) } else { Value::Null };
+                vec![c]
+            }
             Piece::Chunk(c) => vec![c],
         };
         stream::iter(values.into_iter().map(|v| Ok(Sse::default().data(v.to_string()))))
@@ -234,9 +241,13 @@ pub async fn chat(State(st): State<Arc<AppState>>, headers: HeaderMap, Json(body
         Ok(p) => p,
         Err(r) => return rejection(r),
     };
+    let w = match st.supervisor.ready().await {
+        Ok(w) => w,
+        Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, "worker_unavailable", e.to_string()),
+    };
     if st.level == "chat" {
-        if st.journal.begin(&id, vec![]).is_none() {
-            return error(StatusCode::CONFLICT, "duplicate_request", format!("request {id} exists"));
+        if let Err(kind) = st.journal.try_begin(&id, vec![]) {
+            return error(if kind == "duplicate_request" { StatusCode::CONFLICT } else { StatusCode::SERVICE_UNAVAILABLE }, kind, kind);
         }
         let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
         let (tx, rx) = mpsc::channel(32);
@@ -251,11 +262,16 @@ pub async fn chat(State(st): State<Arc<AppState>>, headers: HeaderMap, Json(body
         });
         return respond(st, Api::Chat, id, stream, false, rx, done_rx).await;
     }
-    let (_, w) = st.supervisor.current().await;
     let messages = body.get("messages").cloned().unwrap_or(Value::Null);
     let templated = match w.apply_template(messages, body.get("tools").cloned()).await {
         Ok(t) => t,
-        Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", format!("chat template: {e}")),
+        Err(e) => {
+            return error(
+                if w.is_alive().await { StatusCode::BAD_REQUEST } else { StatusCode::SERVICE_UNAVAILABLE },
+                "template_failed",
+                format!("chat template: {e}"),
+            )
+        }
     };
     let prompt = match w.tokenize(&templated.prompt, true).await {
         Ok(p) => p,
@@ -274,14 +290,15 @@ pub async fn completions(State(st): State<Arc<AppState>>, headers: HeaderMap, Js
         Ok(p) => p,
         Err(r) => return rejection(r),
     };
+    let w = match st.supervisor.ready().await {
+        Ok(w) => w,
+        Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, "worker_unavailable", e.to_string()),
+    };
     let prompt = match body.get("prompt") {
-        Some(Value::String(s)) => {
-            let (_, w) = st.supervisor.current().await;
-            match w.tokenize(s, true).await {
-                Ok(p) => p,
-                Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "engine_error", e.to_string()),
-            }
-        }
+        Some(Value::String(s)) => match w.tokenize(s, true).await {
+            Ok(p) => p,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "engine_error", e.to_string()),
+        },
         Some(Value::Array(a)) if a.iter().all(Value::is_i64) => a.iter().map(|v| v.as_i64().unwrap() as i32).collect(),
         _ => return error(StatusCode::BAD_REQUEST, "invalid_request_error", "prompt must be a string or an array of token ids"),
     };
@@ -319,22 +336,22 @@ pub async fn resume(State(st): State<Arc<AppState>>, Path(id): Path<String>, Que
         return error(StatusCode::NOT_FOUND, "not_found", format!("no request {id} in the journal"));
     };
     let st2 = st.clone();
-    let s = stream::unfold((q.after, false), move |(next, done)| {
+    let s = stream::unfold((q.after, false, watch), move |(next, done, mut w)| {
         let st = st2.clone();
         let id = id.clone();
-        let mut w = watch.clone();
         async move {
             if done {
                 return None;
             }
             loop {
-                let e = st.journal.get(&id)?;
-                if next < e.texts.len() {
-                    let v = json!({"index": next, "token": e.tokens[next], "text": e.texts[next]});
-                    return Some((Ok::<_, Infallible>(Sse::default().data(v.to_string())), (next + 1, false)));
+                let Some((event, status)) = st.journal.event(&id, next) else {
+                    return Some((Ok::<_, Infallible>(Sse::default().data(json!({"error":"request expired"}).to_string())), (next, true, w)));
+                };
+                if let Some(event) = event {
+                    return Some((Ok::<_, Infallible>(Sse::default().id(next.to_string()).data(&event)), (next + 1, false, w)));
                 }
-                if e.status != crate::journal::Status::Running {
-                    return Some((Ok(Sse::default().data(json!({"status": e.status.to_json()}).to_string())), (next, true)));
+                if status != crate::journal::Status::Running {
+                    return Some((Ok(Sse::default().data(json!({"status": status.to_json()}).to_string())), (next, true, w)));
                 }
                 if w.changed().await.is_err() {
                     return None;

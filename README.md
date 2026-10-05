@@ -150,16 +150,23 @@ Run `flux <command> --help` for every flag.
 | `GET /v1/models` | List the served model |
 | `POST /v1/chat/completions` | Create chat completions, streamed or not; replies are split into `reasoning_content`, `content`, and `tool_calls` as llama-server does |
 | `POST /v1/completions` | Create text completions, streamed or not |
-| `GET /health` | Return 200 while admitting requests, 503 once admission closes |
+| `GET /health` | Return 200 when the worker is ready and admission is open, otherwise 503 |
+| `GET /live` | Return 200 while the HTTP server is alive |
 | `GET /flux/plan` | Return the plan being served |
 | `GET /flux/stats` | Report admission, decode drift, and worker counters |
 | `POST /flux/replan` | Drain, plan again, and switch; restore the old plan if the new one fails to load |
 | `POST /flux/tokenize` | Tokenize text with the model's vocabulary |
 | `POST /flux/admission` | Set the free host memory below which new requests are refused |
 | `GET /flux/requests/{id}` | Return a journaled request's status and text |
-| `GET /flux/requests/{id}/stream?after=N` | Resume a lost stream after token `N`, without duplicates |
+| `GET /flux/requests/{id}/stream?after=N` | Read retained output starting at event index `N` (default 0) |
 
 A request's id is its `x-request-id` header or, when that is absent, the `id` in the response.
+
+The resume endpoint emits versioned events with an `index` and SSE `id`. Each event retains a token and text, structured chat deltas, an external chat chunk, or terminal message and usage metadata. To continue after event `N`, request `after=N+1`. Tails and terminal events also occupy indexes. The journal is held in memory, defaults to a 256 MiB accounting budget and 600 seconds of completed-request retention, and may evict completed requests earlier under pressure. An expired request returns 404; expiration during replay is explicit.
+
+Idle worker failures recover automatically. If a worker fails after emitting any token, that request ends with an explicit error and its retained output remains available until expiry. Start a new request to generate again. Live replanning completes or restores the previous plan even if its HTTP caller disconnects; independent memory-pressure closures remain in force.
+
+Saved plans identify the complete workload policy and backend build. Rebuild Flux and replan after backend libraries change; plans created before these identity checks must be regenerated. Certification requires held-out execution, complete fixed-length output, and the requested latency and minimum throughput constraints. Chat engines must supply per-token logprobs and completion usage for token timing and certification.
 
 ## Configuration
 
@@ -174,6 +181,17 @@ tuning_budget_s = 600
 
 [serve]
 port = 8090
+prefill_timeout_s = 300
+decode_timeout_s = 120
+client_write_timeout_s = 30
+replan_timeout_s = 3600
+journal_max_bytes = 268435456
+
+[serve.worker_timeouts]
+hello_s = 30
+load_s = 1800
+rpc_s = 120
+write_s = 30
 
 # Any OpenAI-compatible engine; {port}, {model} and {ctx} are substituted.
 [engines.my-engine]

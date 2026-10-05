@@ -6,8 +6,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot};
@@ -38,14 +39,55 @@ struct Routes {
     by_id: HashMap<u64, oneshot::Sender<Event>>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Timeouts {
+    pub hello_s: u64,
+    pub load_s: u64,
+    pub rpc_s: u64,
+    pub write_s: u64,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self { hello_s: 30, load_s: 1800, rpc_s: 120, write_s: 30 }
+    }
+}
+
+struct CallRoute<'a> {
+    routes: &'a Mutex<Routes>,
+    id: u64,
+}
+impl Drop for CallRoute<'_> {
+    fn drop(&mut self) {
+        self.routes.lock().unwrap().by_id.remove(&self.id);
+    }
+}
+
+// Cancelling a partial JSON-line write must retire that protocol connection.
+struct WriteGuard<'a> {
+    alive: &'a AtomicBool,
+    complete: bool,
+}
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.alive.store(false, Ordering::Release);
+        }
+    }
+}
+
 pub struct Worker {
     stdin: tokio::sync::Mutex<ChildStdin>,
     routes: Arc<Mutex<Routes>>,
     control: tokio::sync::Mutex<mpsc::UnboundedReceiver<Event>>,
     child: tokio::sync::Mutex<Child>,
     next_id: AtomicU64,
+    alive: Arc<AtomicBool>,
+    timeouts: Timeouts,
     pub engine: String,
     pub backend_revision: String,
+    pub backend_build: String,
     /// `tokens` or `chat`.
     pub level: String,
 }
@@ -81,6 +123,10 @@ pub struct ChatOptions {
 impl Worker {
     /// Starts a worker for `engine`; its stderr goes to `log` (or is inherited).
     pub async fn spawn(engine: &EngineKind, log: Option<&Path>) -> Result<Worker> {
+        Self::spawn_with(engine, log, Timeouts::default()).await
+    }
+
+    pub async fn spawn_with(engine: &EngineKind, log: Option<&Path>, timeouts: Timeouts) -> Result<Worker> {
         let bin = worker_binary();
         let stderr = match log {
             Some(p) => Stdio::from(std::fs::File::options().create(true).append(true).open(p).with_context(|| format!("opening {}", p.display()))?),
@@ -98,9 +144,12 @@ impl Worker {
         let stdout = child.stdout.take().unwrap();
         let routes = Arc::new(Mutex::new(Routes::default()));
         let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel();
-        tokio::spawn(read_events(stdout, routes.clone(), ctl_tx));
+        let alive = Arc::new(AtomicBool::new(true));
+        tokio::spawn(read_events(stdout, routes.clone(), ctl_tx, alive.clone()));
 
-        let Some(Event::Hello { protocol, engine, backend_revision, level, .. }) = ctl_rx.recv().await else {
+        let Some(Event::Hello { protocol, engine, backend_revision, backend_build, level, .. }) =
+            tokio::time::timeout(Duration::from_secs(timeouts.hello_s), ctl_rx.recv()).await.context("worker hello timed out")?
+        else {
             bail!("worker exited before its hello");
         };
         if protocol != PROTOCOL_VERSION {
@@ -112,8 +161,11 @@ impl Worker {
             control: tokio::sync::Mutex::new(ctl_rx),
             child: tokio::sync::Mutex::new(child),
             next_id: AtomicU64::new(1),
+            alive,
+            timeouts,
             engine,
             backend_revision,
+            backend_build,
             level,
         };
         w.send(&Request::Hello { protocol: PROTOCOL_VERSION }).await?;
@@ -121,11 +173,19 @@ impl Worker {
     }
 
     pub async fn send(&self, r: &Request) -> Result<()> {
+        anyhow::ensure!(self.alive.load(Ordering::Acquire), "worker unavailable");
         let mut line = serde_json::to_vec(r)?;
         line.push(b'\n');
-        let mut s = self.stdin.lock().await;
-        s.write_all(&line).await.context("worker stdin closed")?;
-        s.flush().await?;
+        let mut guard = WriteGuard { alive: &self.alive, complete: false };
+        tokio::time::timeout(Duration::from_secs(self.timeouts.write_s), async {
+            let mut s = self.stdin.lock().await;
+            s.write_all(&line).await.context("worker stdin closed")?;
+            s.flush().await?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("worker write timed out")??;
+        guard.complete = true;
         Ok(())
     }
 
@@ -139,6 +199,18 @@ impl Worker {
 
     /// Loads with per-node time attribution installed (for `trace`).
     pub async fn load_with(&self, plan: &Plan, trace: bool) -> Result<Loaded> {
+        let result = tokio::time::timeout(Duration::from_secs(self.timeouts.load_s), self.load_inner(plan, trace)).await;
+        if result.is_err() {
+            self.kill().await;
+        }
+        result.context("worker load timed out")?
+    }
+
+    async fn load_inner(&self, plan: &Plan, trace: bool) -> Result<Loaded> {
+        anyhow::ensure!(
+            plan.key.backend_build == self.backend_build && plan.key.backend_revision == self.backend_revision,
+            "plan backend identity differs from the running worker; replan with this build"
+        );
         self.send(&Request::Load { plan: Box::new(plan.clone()), trace }).await?;
         loop {
             match self.control_event().await? {
@@ -153,8 +225,13 @@ impl Worker {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.routes.lock().unwrap().by_id.insert(id, tx);
+        let _route = CallRoute { routes: &self.routes, id };
         self.send(&make(id)).await?;
-        match rx.await.map_err(|_| anyhow!("worker exited"))? {
+        let result = tokio::time::timeout(Duration::from_secs(self.timeouts.rpc_s), rx).await;
+        if result.is_err() {
+            self.kill().await;
+        }
+        match result.context("worker RPC timed out")?.map_err(|_| anyhow!("worker exited"))? {
             Event::Error { message, .. } => bail!("{message}"),
             ev => Ok(ev),
         }
@@ -204,14 +281,22 @@ impl Worker {
     ) -> Result<mpsc::UnboundedReceiver<Event>> {
         let rx = self.route(req);
         let ChatOptions { parser, prefix, checkpoints } = chat;
-        self.send(&Request::Prefill { req: req.into(), prompt, sampling, stop, max_tokens, render_special, chat: parser, chat_prefix: prefix, checkpoints })
-            .await?;
+        if let Err(e) = self
+            .send(&Request::Prefill { req: req.into(), prompt, sampling, stop, max_tokens, render_special, chat: parser, chat_prefix: prefix, checkpoints })
+            .await
+        {
+            self.routes.lock().unwrap().by_req.remove(req);
+            return Err(e);
+        }
         Ok(rx)
     }
 
     pub async fn chat(&self, req: &str, body: serde_json::Value) -> Result<mpsc::UnboundedReceiver<Event>> {
         let rx = self.route(req);
-        self.send(&Request::Chat { req: req.into(), body }).await?;
+        if let Err(e) = self.send(&Request::Chat { req: req.into(), body }).await {
+            self.routes.lock().unwrap().by_req.remove(req);
+            return Err(e);
+        }
         Ok(rx)
     }
 
@@ -226,11 +311,16 @@ impl Worker {
     }
 
     pub async fn cancel(&self, req: &str) -> Result<()> {
-        self.send(&Request::Cancel { req: req.into() }).await
+        let result = self.send(&Request::Cancel { req: req.into() }).await;
+        self.routes.lock().unwrap().by_req.remove(req);
+        result
     }
 
     pub async fn shutdown(&self) {
-        let _ = self.send(&Request::Shutdown).await;
+        if self.send(&Request::Shutdown).await.is_err() {
+            self.kill().await;
+            return;
+        }
         let mut child = self.child.lock().await;
         if tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await.is_err() {
             let _ = child.kill().await;
@@ -239,7 +329,12 @@ impl Worker {
 
     /// Kills the process, e.g. for fault injection or after a hang.
     pub async fn kill(&self) {
+        self.alive.store(false, Ordering::Release);
         let _ = self.child.lock().await.kill().await;
+    }
+
+    pub async fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire) && matches!(self.child.lock().await.try_wait(), Ok(None))
     }
 
     pub async fn pid(&self) -> Option<u32> {
@@ -247,10 +342,10 @@ impl Worker {
     }
 }
 
-async fn read_events(stdout: tokio::process::ChildStdout, routes: Arc<Mutex<Routes>>, control: mpsc::UnboundedSender<Event>) {
+async fn read_events(stdout: tokio::process::ChildStdout, routes: Arc<Mutex<Routes>>, control: mpsc::UnboundedSender<Event>, alive: Arc<AtomicBool>) {
     let mut lines = BufReader::new(stdout).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        let Ok(ev) = serde_json::from_str::<Event>(&line) else { continue };
+        let Ok(ev) = serde_json::from_str::<Event>(&line) else { break };
         let mut r = routes.lock().unwrap();
         let (req, id) = match &ev {
             Event::Prefilled { req, .. } | Event::Prefilling { req, .. } | Event::Token { req, .. } | Event::ChatChunk { req, .. } | Event::Paused { req } => {
@@ -278,6 +373,7 @@ async fn read_events(stdout: tokio::process::ChildStdout, routes: Arc<Mutex<Rout
         }
     }
     // The worker is gone: every open stream ends with an explicit error.
+    alive.store(false, Ordering::Release);
     let mut r = routes.lock().unwrap();
     for (req, tx) in r.by_req.drain() {
         let _ = tx.send(Event::Error { req: Some(req.clone()), id: None, code: ErrorCode::Backend, message: "worker process exited".into() });
@@ -288,6 +384,10 @@ async fn read_events(stdout: tokio::process::ChildStdout, routes: Arc<Mutex<Rout
 
 /// Runs a one-shot native job (`measure`, `probe <kind>`) in a fresh worker process.
 pub async fn oneshot_job(args: &[&str], input: &serde_json::Value) -> Result<serde_json::Value> {
+    tokio::time::timeout(Duration::from_secs(1800), oneshot_inner(args, input)).await.context("worker job timed out after 1800 seconds")?
+}
+
+async fn oneshot_inner(args: &[&str], input: &serde_json::Value) -> Result<serde_json::Value> {
     let mut child = Command::new(worker_binary())
         .args(args)
         .stdin(Stdio::piped())

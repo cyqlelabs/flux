@@ -225,15 +225,6 @@ async fn main() -> Result<()> {
             // Drafting is measured whenever the model carries next-token heads, and kept only where it wins.
             let speculation = speculation || m.facts.as_ref().is_some_and(|f| f.n_layer_nextn > 0);
             let report = planning::probe_report(&cfg, Some(&m), false, reprobe).await?;
-            if !replan {
-                if let Some(p) = planning::lookup(&cfg, &m, &report, ctx, concurrency).await {
-                    planning::log("a plan for this profile key exists (use --replan to measure again)");
-                    planning::print_plan(&p);
-                    planning::print_next(&cfg, &p);
-                    return Ok(());
-                }
-            }
-            let corpus = planning::corpus(&cfg).await?;
             let engines = engines
                 .iter()
                 .map(|e| match e.as_str() {
@@ -265,6 +256,15 @@ async fn main() -> Result<()> {
                 mlock,
                 draft_model,
             };
+            if !replan {
+                if let Some(p) = planning::lookup(&cfg, &m, &report, &req).await {
+                    planning::log("a plan satisfying this workload and policy exists (use --replan to measure again)");
+                    planning::print_plan(&p);
+                    planning::print_next(&cfg, &p);
+                    return Ok(());
+                }
+            }
+            let corpus = planning::corpus(&cfg).await?;
             let plan = flux_plan::planner::plan(&cfg, &m, &report, &corpus, &req, &planning::log).await?;
             let path = planning::save(&cfg, &plan)?;
             planning::print_plan(&plan);

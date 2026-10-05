@@ -171,6 +171,8 @@ pub enum Event {
         worker: String,
         engine: String,
         backend_revision: String,
+        #[serde(default)]
+        backend_build: String,
         /// `tokens` (Tokenize/ApplyTemplate/Prefill) or `chat` (Chat only).
         level: String,
     },

@@ -126,7 +126,7 @@ pub fn print_probe(r: &ProbeReport) {
     }
 }
 
-pub async fn lookup(cfg: &FluxConfig, m: &ModelManifest, r: &ProbeReport, n_ctx: u32, concurrency: u32) -> Option<Plan> {
+pub async fn lookup(cfg: &FluxConfig, m: &ModelManifest, r: &ProbeReport, req: &flux_plan::planner::PlanRequest) -> Option<Plan> {
     let build = native::backend().await.ok()?.build;
     let key = ProfileKey {
         model_identity: m.identity.clone()?,
@@ -134,10 +134,13 @@ pub async fn lookup(cfg: &FluxConfig, m: &ModelManifest, r: &ProbeReport, n_ctx:
         backend_revision: r.backend_revision.clone(),
         backend_build: build,
         driver: r.inventory.driver_version.clone().unwrap_or_default(),
-        ctx_bucket: ctx_bucket(n_ctx.div_ceil(256) * 256),
-        concurrency,
+        ctx_bucket: ctx_bucket(req.workload.n_ctx_seq.div_ceil(256) * 256),
+        concurrency: req.workload.concurrency,
+        policy: req.policy_key(cfg),
     };
-    PlanStore::new(&cfg.plans_dir()).lookup(&key)
+    PlanStore::new(&cfg.plans_dir())
+        .lookup(&key)
+        .filter(|p| p.workload.n_ctx_seq >= req.workload.n_ctx_seq && p.workload.objective == req.workload.objective && req.engines.contains(&p.engine))
 }
 
 /// The command that serves a plan, printed once `flux plan` has one.

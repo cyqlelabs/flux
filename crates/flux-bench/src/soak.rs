@@ -33,6 +33,9 @@ pub struct SoakReport {
     pub requests: u64,
     pub completed: u64,
     pub cancelled: u64,
+    /// Explicit partial-reply failures verified against the journal during an injected kill.
+    #[serde(default)]
+    pub interrupted_by_fault: u64,
     pub rejected_queue_full: u64,
     pub rejected_closed: u64,
     /// Refusals for memory pressure while no ballast was held: the gate closing on its own.
@@ -70,10 +73,17 @@ fn mem_available_mib() -> u64 {
 
 enum Outcome {
     Completed {
-        streamed: usize,
+        tokens: Vec<i32>,
+        text: String,
+        finish: String,
         id: String,
     },
     Cancelled,
+    Interrupted {
+        tokens: Vec<i32>,
+        text: String,
+        id: String,
+    },
     /// A refusal, with the server's Retry-After in seconds.
     Status(u16, Option<u64>),
     Error(String),
@@ -92,6 +102,9 @@ async fn one_request(http: &reqwest::Client, base: &str, id: &str, prompt: &[i32
     let mut bytes = resp.bytes_stream();
     let mut buf = vec![];
     let mut streamed = 0usize;
+    let mut tokens = vec![];
+    let mut text = String::new();
+    let mut finish = None;
     while let Some(c) = bytes.next().await {
         let Ok(c) = c else { return Outcome::Error("stream interrupted".into()) };
         buf.extend_from_slice(&c);
@@ -107,7 +120,19 @@ async fn one_request(http: &reqwest::Client, base: &str, id: &str, prompt: &[i32
                 return Outcome::Error("bad chunk".into());
             };
             if let Some(e) = v.get("error") {
+                if e.to_string().contains("worker interrupted a partial reply") {
+                    return Outcome::Interrupted { tokens, text, id: id.into() };
+                }
                 return Outcome::Error(e.to_string());
+            }
+            if let Some(reason) = v["choices"][0]["finish_reason"].as_str() {
+                finish = Some(reason.to_string());
+            }
+            if let Some(t) = v["flux_token"].as_i64() {
+                tokens.push(t as i32);
+            }
+            if let Some(t) = v["choices"][0]["text"].as_str() {
+                text.push_str(t);
             }
             if v["choices"][0]["finish_reason"].is_null() {
                 streamed += 1;
@@ -117,7 +142,11 @@ async fn one_request(http: &reqwest::Client, base: &str, id: &str, prompt: &[i32
             }
         }
     }
-    Outcome::Completed { streamed, id: id.into() }
+    let Some(finish) = finish else { return Outcome::Error("stream ended without finish marker".into()) };
+    if finish != "length" && finish != "stop" {
+        return Outcome::Error(format!("unexpected finish: {finish}"));
+    }
+    Outcome::Completed { tokens, text, finish, id: id.into() }
 }
 
 pub async fn soak(
@@ -137,11 +166,14 @@ pub async fn soak(
     let deadline = t0 + opts.duration;
     let prompts = Arc::new(prompts);
     let in_episode = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fault_epoch = Arc::new(AtomicU64::new(0));
+    let recovering = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let mut tasks = vec![];
     for c in 0..opts.clients {
         let (http, base, report, seq, prompts, opts, in_episode) =
             (http.clone(), server.base.clone(), report.clone(), seq.clone(), prompts.clone(), opts.clone(), in_episode.clone());
+        let (fault_epoch, recovering) = (fault_epoch.clone(), recovering.clone());
         tasks.push(tokio::spawn(async move {
             let mut rng = rand::rngs::StdRng::seed_from_u64(opts.seed + c as u64);
             while Instant::now() < deadline {
@@ -151,12 +183,26 @@ pub async fn soak(
                 let max_tokens = rng.random_range(16..=256);
                 let cancel = (rng.random::<f64>() < opts.cancel_fraction).then(|| rng.random_range(1..=max_tokens as usize));
                 let started = Instant::now();
+                let epoch = fault_epoch.load(Ordering::Acquire);
+                let began_recovering = recovering.load(Ordering::Acquire);
                 let out = tokio::time::timeout(opts.request_timeout, one_request(&http, &base, &id, prompt, max_tokens, cancel)).await;
+                let during_fault = began_recovering || recovering.load(Ordering::Acquire) || epoch != fault_epoch.load(Ordering::Acquire);
                 let latency = started.elapsed().as_secs_f64();
                 let verify = match &out {
-                    Ok(Outcome::Completed { streamed, id }) => {
-                        let j: Option<serde_json::Value> = async { http.get(format!("{base}/flux/requests/{id}")).send().await.ok()?.json().await.ok() }.await;
-                        j.map(|j| j["tokens"].as_array().map_or(0, |a| a.len()) != *streamed)
+                    Ok(Outcome::Completed { tokens, text, finish, id }) => {
+                        let j: Option<serde_json::Value> =
+                            async { http.get(format!("{base}/flux/requests/{id}")).timeout(opts.request_timeout).send().await.ok()?.json().await.ok() }.await;
+                        Some(j.is_none_or(|j| {
+                            j["tokens"] != json!(tokens) || j["text"] != *text || j["status"]["state"] != "done" || j["status"]["finish_reason"] != *finish
+                        }))
+                    }
+                    Ok(Outcome::Interrupted { tokens, text, id }) => {
+                        let j: Option<serde_json::Value> =
+                            async { http.get(format!("{base}/flux/requests/{id}")).timeout(opts.request_timeout).send().await.ok()?.json().await.ok() }.await;
+                        Some(j.is_none_or(|j| {
+                            let recorded: Vec<i32> = serde_json::from_value(j["tokens"].clone()).unwrap_or_default();
+                            !recorded.starts_with(tokens) || !j["text"].as_str().unwrap_or_default().starts_with(text) || j["status"]["state"] != "failed"
+                        }))
                     }
                     _ => None,
                 };
@@ -168,8 +214,10 @@ pub async fn soak(
                         Err(_) => r.hung += 1,
                         Ok(Outcome::Completed { .. }) => r.completed += 1,
                         Ok(Outcome::Cancelled) => r.cancelled += 1,
+                        Ok(Outcome::Interrupted { .. }) if during_fault => r.interrupted_by_fault += 1,
+                        Ok(Outcome::Interrupted { .. }) => *r.errors.entry("worker interrupted outside injected fault".into()).or_default() += 1,
                         Ok(Outcome::Status(429, _)) => r.rejected_queue_full += 1,
-                        Ok(Outcome::Status(503, _)) if in_episode.load(Ordering::Relaxed) => r.rejected_closed += 1,
+                        Ok(Outcome::Status(503, _)) if in_episode.load(Ordering::Relaxed) || during_fault => r.rejected_closed += 1,
                         Ok(Outcome::Status(503, _)) => r.rejected_closed_outside_episodes += 1,
                         Ok(Outcome::Status(s, _)) => *r.errors.entry(format!("HTTP {s}")).or_default() += 1,
                         Ok(Outcome::Error(e)) => *r.errors.entry(e.chars().take(80).collect()).or_default() += 1,
@@ -194,12 +242,21 @@ pub async fn soak(
         if next_kill.is_some_and(|t| Instant::now() >= t) {
             if let Some(w) = child_named(server.pid, "flux-worker") {
                 log(&format!("fault: killing worker {w}"));
+                recovering.store(true, Ordering::Release);
+                fault_epoch.fetch_add(1, Ordering::AcqRel);
                 unsafe {
                     libc::kill(w as i32, libc::SIGKILL);
                 }
                 report.lock().unwrap().worker_kills += 1;
             }
             next_kill = opts.kill_every.map(|d| Instant::now() + d);
+        }
+        if recovering.load(Ordering::Acquire) {
+            if let Ok(r) = http.get(format!("{}/health", server.base)).timeout(Duration::from_secs(2)).send().await {
+                if r.status().is_success() {
+                    recovering.store(false, Ordering::Release);
+                }
+            }
         }
         if next_pressure.is_some_and(|t| Instant::now() >= t) {
             // Threshold 1 GiB below what is free now, then a 2 GiB allocation crosses it.
@@ -230,7 +287,8 @@ pub async fn soak(
     for t in tasks {
         let _ = tokio::time::timeout(opts.request_timeout, t).await;
     }
-    let alive = http.get(format!("{}/health", server.base)).send().await.is_ok();
+    let alive = http.get(format!("{}/live", server.base)).timeout(opts.request_timeout).send().await.is_ok_and(|r| r.status().is_success());
+    let ready = http.get(format!("{}/health", server.base)).timeout(opts.request_timeout).send().await.is_ok_and(|r| r.status().is_success());
     server.stop().await;
 
     let mut r = report.lock().unwrap().clone();
@@ -238,6 +296,9 @@ pub async fn soak(
     r.server_alive = alive;
     if !alive {
         r.reasons.push("server died".into());
+    }
+    if !ready {
+        r.reasons.push("server did not recover readiness".into());
     }
     if r.hung > 0 {
         r.reasons.push(format!("{} request(s) exceeded {:?}", r.hung, opts.request_timeout));

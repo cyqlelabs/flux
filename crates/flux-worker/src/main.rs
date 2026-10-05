@@ -73,11 +73,13 @@ fn hello(out: &out::Out, engine: &str, level: &str) {
         worker: env!("CARGO_PKG_VERSION").into(),
         engine: engine.into(),
         backend_revision: flux_native::BACKEND_PIN.into(),
+        backend_build: flux_native::BACKEND_BUILD.into(),
         level: level.into(),
     });
 }
 
 fn main() -> Result<()> {
+    flux_native::verify_libraries()?;
     match Cli::parse().cmd {
         Cmd::Info => print_result(flux_native::backend_info().map(|mut v| {
             v["pin"] = flux_native::BACKEND_PIN.into();
@@ -97,7 +99,7 @@ fn main() -> Result<()> {
         Cmd::Serve => {
             let out = out::Out::stdout();
             hello(&out, "native", "tokens");
-            let (tx, rx) = std::sync::mpsc::channel();
+            let (tx, rx) = std::sync::mpsc::sync_channel(64);
             let reader_out = out.clone();
             std::thread::spawn(move || {
                 for line in std::io::stdin().lock().lines() {

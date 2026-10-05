@@ -136,6 +136,7 @@ impl State {
             }
             Request::Chat { req, mut body } if self.api == Api::OpenAiChat => {
                 body["stream"] = serde_json::Value::Bool(true);
+                body["stream_options"] = serde_json::json!({"include_usage":true});
                 self.spawn_stream(req, "/v1/chat/completions", body, 0);
             }
             Request::Decode { req, n } => match self.active.lock().unwrap().get(&req) {
@@ -181,6 +182,7 @@ impl State {
         let port = free_port()?;
         let (program, args, env, cwd, health, timeout) = match &plan.engine {
             EngineKind::LlamaServer => {
+                flux_native::verify_llama_server(&cfg.llama_bin("llama-server"))?;
                 let mut args = plan.backend_params().llama_server_args();
                 args.extend(["--host", "127.0.0.1", "--port", &port.to_string(), "--jinja", "--no-webui"].map(String::from));
                 (cfg.llama_bin("llama-server").display().to_string(), args, Default::default(), None, "/health".to_string(), 600)
@@ -201,6 +203,19 @@ impl State {
         let stderr = std::io::stderr().as_fd().try_clone_to_owned()?;
         let mut cmd = tokio::process::Command::new(&program);
         cmd.args(&args).envs(&env).stdin(Stdio::null()).stdout(Stdio::from(stderr)).stderr(Stdio::inherit()).kill_on_drop(true);
+        // A supervisor SIGKILL cannot run Rust destructors. Kill the engine with its worker.
+        let parent = std::process::id() as libc::pid_t;
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    libc::_exit(1);
+                }
+                Ok(())
+            });
+        }
         if let Some(d) = cwd {
             cmd.current_dir(d);
         }
@@ -228,7 +243,8 @@ impl State {
     }
 
     fn spawn_stream(&self, req: String, path: &str, body: serde_json::Value, n_prompt: u32) {
-        if self.active.lock().unwrap().contains_key(&req) {
+        let mut registry = self.active.lock().unwrap();
+        if registry.contains_key(&req) {
             return self.error(Some(&req), None, ErrorCode::BadRequest, "request id already active");
         }
         let credit = Arc::new(Semaphore::new(0));
@@ -252,7 +268,7 @@ impl State {
             }
             active.lock().unwrap().remove(&r);
         });
-        self.active.lock().unwrap().insert(req, Active { credit, task });
+        registry.insert(req, Active { credit, task });
     }
 }
 
@@ -273,6 +289,7 @@ async fn stream(
     let mut bytes = resp.bytes_stream();
     let mut buf: Vec<u8> = vec![];
     let (mut first, mut emitted, mut finish) = (true, 0u32, None::<(FinishReason, u32)>);
+    let mut usage = None;
     while let Some(chunk) = bytes.next().await {
         buf.extend_from_slice(&chunk?);
         while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
@@ -282,6 +299,12 @@ async fn stream(
                 continue;
             }
             let v: serde_json::Value = serde_json::from_str(data)?;
+            if let Some(e) = v.get("error") {
+                anyhow::bail!("external engine: {e}");
+            }
+            if let (Some(p), Some(c)) = (v["usage"]["prompt_tokens"].as_u64(), v["usage"]["completion_tokens"].as_u64()) {
+                usage = Some((p as u32, c as u32));
+            }
             if first {
                 first = false;
                 out.send(&Event::Prefilled { req: req.into(), n_prompt, ms: t0.elapsed().as_secs_f64() * 1e3, reused: 0 });
@@ -315,12 +338,16 @@ async fn stream(
                         finish = Some((reason, v["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32));
                     }
                     out.send(&Event::ChatChunk { req: req.into(), chunk: v, t_us });
-                    emitted += 1;
                 }
             }
         }
     }
-    let (reason, n_prompt) = finish.context("engine stream ended without a finish marker")?;
+    let (reason, mut n_prompt) = finish.context("engine stream ended without a finish marker")?;
+    if api == Api::OpenAiChat {
+        let (p, c) = usage.context("external engine omitted requested completion usage")?;
+        n_prompt = p;
+        emitted = c;
+    }
     out.send(&Event::Finished { req: req.into(), reason, n_prompt, n_decoded: emitted, tail: String::new(), deltas: vec![], message: None });
     Ok(())
 }

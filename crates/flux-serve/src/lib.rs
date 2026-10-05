@@ -45,6 +45,8 @@ pub struct AppState {
     pub concurrency: usize,
     pub started: Instant,
     pub replanner: Option<Replanner>,
+    pub replan_lock: tokio::sync::Mutex<()>,
+    pub control_slots: tokio::sync::Semaphore,
 }
 
 fn retune_cost_s(p: &Plan, load_ms: f64) -> f64 {
@@ -59,18 +61,19 @@ fn validated_rates(p: &Plan) -> monitor::Rates {
 }
 
 pub async fn build(cfg: FluxConfig, plan: Plan, replanner: Option<Replanner>) -> Result<Arc<AppState>> {
+    anyhow::ensure!(!plan.model_files.is_empty() && plan.workload.concurrency > 0, "plan needs a model and positive concurrency");
     let logs = cfg.data_dir.join("logs");
     std::fs::create_dir_all(&logs)?;
     let model_name = plan.model_files[0].file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     let concurrency = plan.workload.concurrency as usize;
     let rates = validated_rates(&plan);
     let tuning = plan.clone();
-    let supervisor = Supervisor::start(plan, logs.join("serve-worker.log")).await?;
+    let supervisor = Supervisor::start_with(plan, logs.join("serve-worker.log"), cfg.serve.worker_timeouts.clone()).await?;
     let drift = monitor::Drift::new(rates, retune_cost_s(&tuning, supervisor.loaded().await.load_ms));
     let level = supervisor.current().await.1.level.clone();
     Ok(Arc::new(AppState {
         admission: Admission::new(concurrency, cfg.serve.queue_depth),
-        journal: Journal::new(Duration::from_secs(cfg.serve.journal_ttl_s)),
+        journal: Journal::with_limit(Duration::from_secs(cfg.serve.journal_ttl_s), cfg.serve.journal_max_bytes),
         pressure_closed: AtomicBool::new(false),
         min_available_mib: std::sync::atomic::AtomicU64::new(cfg.serve.min_available_mib),
         drift: Mutex::new(drift),
@@ -80,6 +83,8 @@ pub async fn build(cfg: FluxConfig, plan: Plan, replanner: Option<Replanner>) ->
         concurrency,
         started: Instant::now(),
         replanner,
+        replan_lock: tokio::sync::Mutex::new(()),
+        control_slots: tokio::sync::Semaphore::new(4),
         cfg,
         supervisor,
     }))
@@ -89,6 +94,7 @@ pub fn router(st: Arc<AppState>) -> Router {
     let limit = st.cfg.serve.max_body_bytes;
     Router::new()
         .route("/health", get(health))
+        .route("/live", get(|| async { StatusCode::OK }))
         .route("/v1/models", get(openai::models))
         .route("/v1/chat/completions", post(openai::chat))
         .route("/v1/completions", post(openai::completions))
@@ -105,19 +111,23 @@ pub fn router(st: Arc<AppState>) -> Router {
 
 /// Serves until interrupted; binds the configured local address by default.
 pub async fn run(st: Arc<AppState>, host: &str, port: u16) -> Result<()> {
-    monitor::spawn(st.clone());
     let listener = tokio::net::TcpListener::bind((host, port)).await?;
+    let mut monitors = monitor::spawn(st.clone());
     tracing::info!("serving plan {} on http://{}", st.supervisor.plan().await.id, listener.local_addr()?);
     let shutdown = async {
         let _ = tokio::signal::ctrl_c().await;
     };
-    axum::serve(listener, router(st.clone())).with_graceful_shutdown(shutdown).await?;
+    let result = axum::serve(listener, router(st.clone())).with_graceful_shutdown(shutdown).await;
+    monitors.abort_all();
+    while monitors.join_next().await.is_some() {}
+    let _exclusive = st.replan_lock.lock().await;
     st.supervisor.shutdown().await;
+    result?;
     Ok(())
 }
 
 async fn health(State(st): State<Arc<AppState>>) -> Response {
-    let closed = st.admission.closed_reason();
+    let closed = st.admission.closed_reason().or(if st.supervisor.current().await.1.is_alive().await { None } else { Some("worker unavailable".into()) });
     let status = if closed.is_some() { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK };
     (status, Json(json!({"status": if closed.is_some() { "closed" } else { "ok" }, "reason": closed, "plan": st.supervisor.plan().await.id}))).into_response()
 }
@@ -134,6 +144,10 @@ async fn admission(State(st): State<Arc<AppState>>, Json(body): Json<serde_json:
 }
 
 async fn tokenize(State(st): State<Arc<AppState>>, Json(body): Json<serde_json::Value>) -> Response {
+    let Ok(_slot) = st.control_slots.try_acquire() else { return openai::error(StatusCode::TOO_MANY_REQUESTS, "control_busy", "control queue full") };
+    if let Some(reason) = st.admission.closed_reason() {
+        return openai::error(StatusCode::SERVICE_UNAVAILABLE, "admission_closed", reason);
+    }
     let text = body.get("content").and_then(|v| v.as_str()).unwrap_or_default();
     let add_special = body.get("add_special").and_then(|v| v.as_bool()).unwrap_or(true);
     match st.supervisor.current().await.1.tokenize(text, add_special).await {
@@ -147,6 +161,7 @@ async fn plan(State(st): State<Arc<AppState>>) -> Json<Plan> {
 }
 
 async fn stats(State(st): State<Arc<AppState>>) -> Response {
+    let Ok(_slot) = st.control_slots.try_acquire() else { return openai::error(StatusCode::TOO_MANY_REQUESTS, "control_busy", "control queue full") };
     let (gen, w) = st.supervisor.current().await;
     let worker = if st.level == "tokens" || w.engine != "native" { w.stats().await.ok() } else { None };
     let d = st.drift.lock().unwrap();
@@ -179,17 +194,39 @@ async fn replan(State(st): State<Arc<AppState>>) -> Response {
 }
 
 pub async fn replan_now(st: &Arc<AppState>) -> Result<Plan> {
+    let st = st.clone();
+    tokio::spawn(async move { replan_inner(&st).await }).await?
+}
+
+async fn replan_inner(st: &Arc<AppState>) -> Result<Plan> {
+    use futures::FutureExt;
+    let _exclusive = st.replan_lock.lock().await;
     let replanner = st.replanner.clone().ok_or_else(|| anyhow::anyhow!("this server was started without a replanner"))?;
-    st.admission.close("replanning");
-    let permits = st.admission.drain(st.concurrency).await;
+    st.admission.block("replan", "replanning");
+    let deadline = Duration::from_secs(st.cfg.serve.replan_timeout_s);
+    let permits = match tokio::time::timeout(deadline, st.admission.drain(st.concurrency)).await {
+        Ok(p) => p,
+        Err(_) => {
+            st.admission.unblock("replan");
+            anyhow::bail!("draining requests timed out")
+        }
+    };
     let current = st.supervisor.plan().await;
     st.supervisor.shutdown().await;
     let result = async {
-        let p = replanner(current.clone()).await?;
+        let p = tokio::time::timeout(deadline, std::panic::AssertUnwindSafe(async { replanner(current.clone()).await }).catch_unwind())
+            .await
+            .map_err(|_| anyhow::anyhow!("replanner timed out"))?
+            .map_err(|_| anyhow::anyhow!("replanner panicked"))??;
+        anyhow::ensure!(
+            p.workload.concurrency == current.workload.concurrency && p.engine == current.engine,
+            "live replanning cannot change concurrency or engine"
+        );
         st.supervisor.switch(p.clone()).await?;
         Ok::<Plan, anyhow::Error>(p)
     }
     .await;
+    let mut result = result;
     match &result {
         Ok(p) => {
             let load_ms = st.supervisor.loaded().await.load_ms;
@@ -197,12 +234,19 @@ pub async fn replan_now(st: &Arc<AppState>) -> Result<Plan> {
         }
         // A planning failure leaves the devices free: bring the previous plan back.
         Err(_) => {
-            if st.supervisor.current().await.1.stats().await.is_err() {
-                let _ = st.supervisor.switch(current).await;
+            if !st.supervisor.current().await.1.is_alive().await {
+                if let Err(e) = st.supervisor.switch(current).await {
+                    result = Err(anyhow::anyhow!("replanning failed; restoring previous plan failed: {e:#}"));
+                }
             }
         }
     }
     drop(permits);
-    st.admission.open();
+    if st.supervisor.current().await.1.is_alive().await {
+        st.admission.unblock("worker");
+    } else {
+        st.admission.block("worker", "worker unavailable after replanning");
+    }
+    st.admission.unblock("replan");
     result
 }

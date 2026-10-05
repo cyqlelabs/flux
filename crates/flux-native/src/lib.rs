@@ -8,8 +8,50 @@ use std::ptr::NonNull;
 
 /// Revision of the backend this crate was compiled against.
 pub const BACKEND_PIN: &str = env!("FLUX_BACKEND_PIN");
-/// The pin plus a digest of the Flux patches applied to it.
+/// Identity of backend sources, bridge, worker, build configuration and library artifacts.
 pub const BACKEND_BUILD: &str = env!("FLUX_BACKEND_BUILD");
+
+/// The server executable is a separate scheduler and must match the profiled backend artifacts.
+pub fn verify_llama_server(path: &std::path::Path) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let wanted = include_str!(env!("FLUX_BACKEND_LIBRARIES"))
+        .lines()
+        .find_map(|line| line.strip_prefix("llama-server "))
+        .ok_or_else(|| anyhow::anyhow!("llama-server was absent when Flux was built; build the backend and rebuild Flux"))?;
+    let mut file = std::fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    std::io::copy(&mut file, &mut digest)?;
+    ensure!(format!("{:x}", digest.finalize()) == wanted, "llama-server changed: {}; rebuild Flux and replan", path.display());
+    Ok(())
+}
+
+/// Checks the actual loaded library files once per process, including backends loaded by ggml.
+pub fn verify_libraries() -> Result<()> {
+    static VERIFIED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    let result = VERIFIED.get_or_init(|| {
+        use sha2::{Digest, Sha256};
+        let check = || -> Result<()> {
+            backend_info()?;
+            let expected: std::collections::HashMap<_, _> = include_str!(env!("FLUX_BACKEND_LIBRARIES")).lines().filter_map(|l| l.split_once(' ')).collect();
+            let maps = std::fs::read_to_string("/proc/self/maps")?;
+            let paths: std::collections::BTreeSet<_> =
+                maps.lines().filter_map(|l| l.split_whitespace().nth(5)).filter(|p| p.contains("/libggml") || p.contains("/libllama")).collect();
+            ensure!(!paths.is_empty(), "cannot identify loaded backend libraries");
+            for p in paths {
+                let name = std::path::Path::new(p).file_name().unwrap().to_string_lossy();
+                let base = name.split(".so").next().unwrap().to_owned() + ".so";
+                let wanted = expected.get(base.as_str()).ok_or_else(|| anyhow::anyhow!("unidentified backend library {p}; rebuild Flux"))?;
+                let mut file = std::fs::File::open(p)?;
+                let mut digest = Sha256::new();
+                std::io::copy(&mut file, &mut digest)?;
+                ensure!(format!("{:x}", digest.finalize()) == *wanted, "backend library changed: {p}; rebuild Flux and replan");
+            }
+            Ok(())
+        };
+        check().map_err(|e| format!("{e:#}"))
+    });
+    result.clone().map_err(anyhow::Error::msg)
+}
 
 mod ffi {
     use std::ffi::c_char;
@@ -331,6 +373,11 @@ mod tests {
 
     #[test]
     fn backend_reports_pinned_build_and_cpu() {
+        verify_libraries().unwrap();
+        let server = std::path::Path::new(env!("FLUX_BACKEND_SERVER"));
+        if server.exists() {
+            verify_llama_server(server).unwrap();
+        }
         let info = backend_info().unwrap();
         let devices = info["devices"].as_array().unwrap();
         assert!(devices.iter().any(|d| d["kind"] == "cpu"));

@@ -41,6 +41,12 @@ pub struct PlanConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServeConfig {
+    pub worker_timeouts: crate::worker::Timeouts,
+    pub prefill_timeout_s: u64,
+    pub decode_timeout_s: u64,
+    pub client_write_timeout_s: u64,
+    pub replan_timeout_s: u64,
+    pub journal_max_bytes: usize,
     pub host: String,
     pub port: u16,
     pub queue_depth: usize,
@@ -117,6 +123,12 @@ impl Default for PlanConfig {
 impl Default for ServeConfig {
     fn default() -> Self {
         ServeConfig {
+            worker_timeouts: crate::worker::Timeouts::default(),
+            prefill_timeout_s: 300,
+            decode_timeout_s: 120,
+            client_write_timeout_s: 30,
+            replan_timeout_s: 3600,
+            journal_max_bytes: 256 << 20,
             host: "127.0.0.1".into(),
             port: 8090,
             queue_depth: 64,

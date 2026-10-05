@@ -1,6 +1,6 @@
 //! Executes prompts against a loaded worker and measures what the client observes.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use flux_core::corpus::{Corpus, Role};
 use flux_core::protocol::{Event, FinishReason, Sampling};
 use flux_core::stats::{interactive_rate, Summary};
@@ -84,7 +84,7 @@ pub async fn run_stream(worker: &Worker, req: &str, prompt: Vec<i32>, max_tokens
     let mut rx = worker.start(req, prompt, sampling, vec![], max_tokens, vec![], Default::default()).await?;
     worker.credit(req, max_tokens).await?;
     let mut r = StreamResult { n_prompt, ttft_s: 0.0, token_times_s: vec![], tokens: vec![], alts: vec![], finish: None, error: None, total_s: 0.0 };
-    while let Some(ev) = rx.recv().await {
+    while let Some(ev) = tokio::time::timeout(std::time::Duration::from_secs(300), rx.recv()).await.context("measurement made no progress for 300 seconds")? {
         match ev {
             Event::Token { .. } | Event::ChatChunk { .. } => {
                 if let Event::Token { token, alt, .. } = ev {
@@ -98,12 +98,18 @@ pub async fn run_stream(worker: &Worker, req: &str, prompt: Vec<i32>, max_tokens
                 r.token_times_s.push(t);
             }
             Event::Error { message, .. } => r.error = Some(message),
-            Event::Finished { reason, .. } => {
+            Event::Finished { reason, n_decoded, .. } => {
+                if n_decoded as usize != r.tokens.len() {
+                    r.error = Some(format!("completion usage {n_decoded} differs from {} emitted tokens", r.tokens.len()));
+                }
                 r.finish = Some(reason);
                 break;
             }
             _ => {}
         }
+    }
+    if r.error.is_none() && (r.finish != Some(FinishReason::Length) || r.tokens.len() != max_tokens as usize) {
+        r.error = Some(format!("incomplete measurement: {:?}, {} of {max_tokens} tokens", r.finish, r.tokens.len()));
     }
     r.total_s = t0.elapsed().as_secs_f64();
     Ok(r)
@@ -131,6 +137,53 @@ pub async fn run_all(worker: &Worker, tag: &str, prompts: Vec<Vec<i32>>, max_tok
     Ok(out.into_iter().map(|r| r.expect("every prompt ran")).collect())
 }
 
+/// Chat engines must expose per-token logprobs and completion usage to participate in token timing.
+pub async fn run_chats(worker: &Worker, prompts: Vec<String>, max_tokens: u32, concurrency: usize) -> Result<Vec<StreamResult>> {
+    use futures::{stream, StreamExt};
+    stream::iter(prompts.into_iter().enumerate().map(|(i, text)| async move {
+        let req = format!("chat-cal-{i}");
+        let t0 = Instant::now();
+        let body = serde_json::json!({"messages":[{"role":"user","content":text}],"stream":true,
+            "stream_options":{"include_usage":true},"logprobs":true,"max_tokens":max_tokens,"temperature":0,"ignore_eos":true});
+        let mut rx = worker.chat(&req, body).await?;
+        worker.credit(&req, 16).await?;
+        let mut r = StreamResult { n_prompt: 0, ttft_s: 0.0, token_times_s: vec![], tokens: vec![], alts: vec![], finish: None, error: None, total_s: 0.0 };
+        while let Some(ev) = tokio::time::timeout(std::time::Duration::from_secs(300), rx.recv()).await.context("chat measurement stalled")? {
+            match ev {
+                Event::ChatChunk { chunk, .. } => {
+                    let count = chunk["choices"][0]["logprobs"]["content"].as_array().map_or(0, Vec::len);
+                    let t = t0.elapsed().as_secs_f64();
+                    if count > 0 && r.token_times_s.is_empty() {
+                        r.ttft_s = t;
+                    }
+                    r.token_times_s.extend(std::iter::repeat_n(t, count));
+                    worker.credit(&req, 1).await?;
+                }
+                Event::Finished { reason, n_prompt, n_decoded, .. } => {
+                    r.finish = Some(reason);
+                    r.n_prompt = n_prompt as usize;
+                    if reason != FinishReason::Length || n_decoded != max_tokens || r.token_times_s.len() != max_tokens as usize {
+                        r.error = Some("chat measurement needs complete fixed-length output, per-token logprobs, and matching usage".into());
+                    }
+                    break;
+                }
+                Event::Error { message, .. } => r.error = Some(message),
+                _ => {}
+            }
+        }
+        if r.finish.is_none() {
+            r.error = Some("chat measurement ended without finish".into());
+        }
+        r.total_s = t0.elapsed().as_secs_f64();
+        Ok(r)
+    }))
+    .buffered(concurrency.max(1))
+    .collect::<Vec<Result<StreamResult>>>()
+    .await
+    .into_iter()
+    .collect()
+}
+
 type Inflight<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<StreamResult>)> + Send + 'a>>;
 
 /// Aggregates of a set of streams.
@@ -147,7 +200,7 @@ pub struct RunSummary {
 }
 
 pub fn summarize(results: &[StreamResult], wall_s: f64) -> Option<RunSummary> {
-    let ok: Vec<&StreamResult> = results.iter().filter(|r| r.error.is_none() && r.token_times_s.len() > 1).collect();
+    let ok: Vec<&StreamResult> = results.iter().filter(|r| r.error.is_none() && r.finish == Some(FinishReason::Length) && r.token_times_s.len() > 1).collect();
     let gaps: Vec<f64> = ok.iter().flat_map(|r| r.token_times_s.windows(2).map(|w| (w[1] - w[0]) * 1e3)).collect();
     Some(RunSummary {
         ttft_ms: Summary::of(&ok.iter().map(|r| r.ttft_s * 1e3).collect::<Vec<_>>())?,

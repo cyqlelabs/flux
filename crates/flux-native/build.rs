@@ -46,17 +46,57 @@ fn main() {
     println!("cargo:lib_dir={}", lib_dir.display());
     println!("cargo:rustc-env=FLUX_BACKEND_PIN={pin}");
 
-    // Build identity: the pin plus the Flux patches applied on top of it.
+    // Identify both the inputs and the linked artifacts, including uncommitted backend edits.
     let patches = root.join("patches/llama.cpp");
     println!("cargo:rerun-if-changed={}", patches.display());
     let mut files: Vec<PathBuf> = std::fs::read_dir(&patches).map(|rd| rd.flatten().map(|e| e.path()).collect()).unwrap_or_default();
     files.sort();
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
+    h.update(std::fs::read(PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("libflux_native.a")).expect("compiled bridge"));
+    h.update(pin.as_bytes());
+    let diff = Command::new("git").arg("-C").arg(&llama).args(["diff", "HEAD", "--binary"]).output().expect("backend diff");
+    assert!(diff.status.success(), "cannot identify backend working tree");
+    h.update(&diff.stdout);
+    for dir in [root.join("crates/flux-native/native"), root.join("crates/flux-native/src"), root.join("crates/flux-worker/src")] {
+        println!("cargo:rerun-if-changed={}", dir.display());
+        let mut inputs: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.is_file()).collect();
+        inputs.sort();
+        for p in inputs {
+            h.update(p.file_name().unwrap().as_encoded_bytes());
+            h.update(std::fs::read(p).unwrap());
+        }
+    }
+    for p in [llama.join("build/CMakeCache.txt"), root.join("scripts/build-backend.sh")] {
+        println!("cargo:rerun-if-changed={}", p.display());
+        h.update(std::fs::read(p).expect("backend build input"));
+    }
+    for dir in ["src", "ggml/src", "common", "include", "ggml/include"] {
+        println!("cargo:rerun-if-changed={}", llama.join(dir).display());
+    }
+    let mut libs: Vec<_> = std::fs::read_dir(&lib_dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|e| e == "so")).collect();
+    let server = lib_dir.join("llama-server");
+    println!("cargo:rustc-env=FLUX_BACKEND_SERVER={}", server.display());
+    println!("cargo:rerun-if-changed={}", server.display());
+    if server.is_file() {
+        libs.push(server);
+    }
+    libs.sort();
+    let mut manifest = String::new();
+    for p in libs {
+        println!("cargo:rerun-if-changed={}", p.display());
+        let bytes = std::fs::read(&p).expect("backend library");
+        let digest = format!("{:x}", sha2::Sha256::digest(bytes));
+        manifest.push_str(&format!("{} {digest}\n", p.file_name().unwrap().to_string_lossy()));
+    }
+    h.update(manifest.as_bytes());
+    let manifest_path = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("backend-libraries.txt");
+    std::fs::write(&manifest_path, manifest).unwrap();
+    println!("cargo:rustc-env=FLUX_BACKEND_LIBRARIES={}", manifest_path.display());
     for f in &files {
         h.update(std::fs::read(f).unwrap_or_default());
     }
     let digest: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    let build = if files.is_empty() { pin[..12].to_string() } else { format!("{}+{}", &pin[..12], &digest[..12]) };
+    let build = format!("{}+{}", &pin[..12], &digest[..24]);
     println!("cargo:rustc-env=FLUX_BACKEND_BUILD={build}");
 }

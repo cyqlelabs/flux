@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PlanRequest {
     pub workload: Workload,
     /// Engines allowed to run the plan, in preference order for ties.
@@ -45,6 +45,31 @@ pub struct PlanRequest {
     pub mlock: bool,
     /// Separate draft model for speculative decoding, measured like the model's own heads.
     pub draft_model: Option<std::path::PathBuf>,
+}
+
+impl PlanRequest {
+    pub fn policy_key(&self, cfg: &FluxConfig) -> String {
+        flux_core::fsutil::sha256_hex(
+            serde_json::to_string(&json!({
+                "revision": 2, "request": self, "planning": cfg.plan, "engines": cfg.engines
+            }))
+            .expect("planning policy serializes")
+            .as_bytes(),
+        )
+    }
+}
+
+fn eligible(s: &RunSummary, objective: Objective, min_decode_tps: Option<f64>) -> bool {
+    s.failures == 0
+        && s.decode_tps.p50.is_finite()
+        && s.decode_tps.p50 > 0.0
+        && s.aggregate_tps.is_finite()
+        && s.aggregate_tps > 0.0
+        && min_decode_tps.is_none_or(|min| s.decode_tps.p50 >= min)
+        && match objective {
+            Objective::Interactive => true,
+            Objective::Serving { max_p95_token_ms } => s.token_ms.p95.is_finite() && s.token_ms.p95 <= max_p95_token_ms as f64,
+        }
 }
 
 #[derive(Clone)]
@@ -261,6 +286,16 @@ pub async fn plan(
     req: &PlanRequest,
     log: &(dyn Fn(&str) + Sync),
 ) -> Result<Plan> {
+    ensure!(
+        req.workload.concurrency > 0 && req.workload.n_ctx_seq > 0 && req.decode_tokens > 1 && req.n_ubatch > 0,
+        "context, concurrency, and batch must be positive; measurement needs at least two output tokens"
+    );
+    ensure!(cfg.plan.calibration_prompts > 0 && cfg.plan.validation_prompts > 0, "calibration and validation need prompts");
+    ensure!(
+        cfg.plan.tuning_budget_s.is_finite() && cfg.plan.tuning_budget_s > 0.0 && cfg.plan.finalists > 0,
+        "tuning budget and finalist count must be positive"
+    );
+    ensure!(req.min_decode_tps.is_none_or(|v| v.is_finite() && v > 0.0), "minimum decode rate must be finite and positive");
     let t_start = Instant::now();
     let facts = manifest.facts.clone().context("the artifact has no architecture facts")?;
     let identity = manifest.identity.clone().context("model identity missing: inspect with hashing enabled")?;
@@ -822,11 +857,12 @@ pub async fn plan(
             }
         }
     }
-    let mut ranked: Vec<usize> = (0..results.len()).filter(|&k| results[k].2.is_some()).collect();
+    let mut ranked: Vec<usize> =
+        (0..results.len()).filter(|&k| results[k].2.as_ref().is_some_and(|s| eligible(s, req.workload.objective, req.min_decode_tps))).collect();
     order(&mut ranked, &|k| results[k].2.clone().unwrap());
     ensure!(
         !ranked.is_empty(),
-        "every candidate failed to run:\n  {}",
+        "no candidate passed execution and the requested throughput/latency constraints:\n  {}",
         results.iter().map(|r| format!("{}: {}", r.1.label, r.1.failure.clone().unwrap_or_default())).collect::<Vec<_>>().join("\n  ")
     );
     // Long prompts: one request a quarter of the planned context deep, so the choice also holds for clients that
@@ -866,6 +902,7 @@ pub async fn plan(
             }
         }
         let measured: Vec<usize> = ranked.iter().copied().filter(|&k| results[k].1.depth.is_some()).collect();
+        ensure!(!measured.is_empty(), "all long-context validation candidates failed");
         if !measured.is_empty() {
             ranked = measured;
             robust(&mut ranked, &|k| results[k].2.clone().unwrap(), &|k| results[k].1.depth.clone().unwrap());
@@ -876,10 +913,11 @@ pub async fn plan(
     for &k in ranked.iter().take(2) {
         log(&format!("validating {}", results[k].1.label));
         match measured_run(&ctx, &base_plan(&runs[results[k].0]), corpus, Role::Validation, cfg.plan.validation_prompts, &devices).await {
-            Ok((m, s)) => {
+            Ok((m, s)) if eligible(&s, req.workload.objective, req.min_decode_tps) => {
                 results[k].1.validation = Some(m);
                 validated.push((k, s));
             }
+            Ok(_) => results[k].1.failure = Some("validation violates requested latency or throughput constraints".into()),
             Err(e) => results[k].1.failure = Some(format!("validation: {e:#}")),
         }
     }
@@ -889,7 +927,8 @@ pub async fn plan(
     } else {
         order(&mut finals, &|i| validated[i].1.clone());
     }
-    let best = finals.first().map_or(ranked[0], |&i| validated[i].0);
+    ensure!(!finals.is_empty(), "no candidate passed held-out validation and workload constraints");
+    let best = validated[finals[0]].0;
     let chosen = &runs[results[best].0];
     let validation = ValidationRecord {
         tuning_seconds: t_start.elapsed().as_secs_f64(),
@@ -992,6 +1031,7 @@ fn assemble(
             driver: report.inventory.driver_version.clone().unwrap_or_default(),
             ctx_bucket: ctx_bucket(ctx.n_ctx_seq),
             concurrency: ctx.req.workload.concurrency,
+            policy: ctx.req.policy_key(ctx.cfg),
         },
         model_files: ctx.manifest.paths(),
         architecture: arch.into(),
@@ -1458,13 +1498,20 @@ async fn depth_run(ctx: &Ctx<'_>, plan: &Plan, corpus: &Corpus, n_tokens: u32) -
     let w = Worker::spawn(&plan.engine, Some(&logs.join(format!("plan-{}.log", plan.id)))).await?;
     let result = async {
         tokio::time::timeout(Duration::from_secs(1800), w.load(plan)).await.context("load timed out")??;
-        let warm = chat_prompt(&w, corpus, Role::Calibration, 999, 32).await?;
-        crate::run::run_stream(&w, "warmup", warm, 8, bench_sampling()).await?;
-        let p = chat_prompt(&w, corpus, Role::Calibration, 500, n_tokens as usize).await?;
-        let r = crate::run::run_stream(&w, "depth", p, ctx.req.decode_tokens, bench_sampling()).await?;
-        if let Some(e) = r.error {
+        let r = if w.level == "chat" {
+            let p = corpus.text(Role::Calibration, 500, n_tokens as usize * 4);
+            crate::run::run_chats(&w, vec![p], ctx.req.decode_tokens, 1).await?.remove(0)
+        } else {
+            let warm = chat_prompt(&w, corpus, Role::Calibration, 999, 32).await?;
+            crate::run::run_stream(&w, "warmup", warm, 8, bench_sampling()).await?;
+            let p = chat_prompt(&w, corpus, Role::Calibration, 500, n_tokens as usize).await?;
+            crate::run::run_stream(&w, "depth", p, ctx.req.decode_tokens, bench_sampling()).await?
+        };
+        if let Some(e) = &r.error {
             bail!("{e}");
         }
+        let summary = summarize(std::slice::from_ref(&r), r.total_s).context("no completed long-context measurement")?;
+        ensure!(eligible(&summary, ctx.req.workload.objective, ctx.req.min_decode_tps), "long-context validation violates workload constraints");
         Ok(DepthMeasurement {
             prompt_tokens: r.n_prompt as u32,
             ttft_ms: r.ttft_s * 1e3,
@@ -1486,6 +1533,22 @@ async fn measured_run(ctx: &Ctx<'_>, plan: &Plan, corpus: &Corpus, role: Role, n
     let result = async {
         tokio::time::timeout(Duration::from_secs(1800), w.load(plan)).await.context("load timed out")??;
         let offset = if role == Role::Validation { 100 } else { 0 };
+        if w.level == "chat" {
+            let prompts = (0..n).map(|i| corpus.text(role, offset + i * 7, ctx.req.prompt_tokens as usize * 4)).collect();
+            let t0 = Instant::now();
+            let concurrency = match ctx.req.workload.objective {
+                Objective::Interactive => 1,
+                _ => ctx.req.workload.concurrency as usize,
+            };
+            let results = crate::run::run_chats(&w, prompts, ctx.req.decode_tokens, concurrency).await?;
+            ensure!(
+                results.iter().all(|r| r.error.is_none()),
+                "chat engine lacks complete token timing/usage or failed validation: {:?}",
+                results.iter().filter_map(|r| r.error.as_ref()).collect::<Vec<_>>()
+            );
+            let s = summarize(&results, t0.elapsed().as_secs_f64()).context("no completed chat streams")?;
+            return Ok((s, None));
+        }
         let mut prompts = vec![];
         for i in 0..n {
             prompts.push(chat_prompt(&w, corpus, role, offset + i * 7, ctx.req.prompt_tokens as usize).await?);
@@ -1509,7 +1572,10 @@ async fn measured_run(ctx: &Ctx<'_>, plan: &Plan, corpus: &Corpus, role: Role, n
             }
             let t0 = Instant::now();
             let results = run_all(&w, "agent", prompts, ctx.req.decode_tokens, concurrency, bench_sampling()).await?;
-            summarize(&results, t0.elapsed().as_secs_f64()).map(|a| a.decode_tps)
+            ensure!(results.iter().all(|r| r.error.is_none()), "agent validation failed");
+            let a = summarize(&results, t0.elapsed().as_secs_f64()).context("no completed agent validation streams")?;
+            ensure!(eligible(&a, ctx.req.workload.objective, ctx.req.min_decode_tps), "agent validation violates workload constraints");
+            Some(a.decode_tps)
         } else {
             None
         };
@@ -1683,6 +1749,53 @@ fn explain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn certification_requires_complete_runs_and_latency_slo() {
+        let summary = |v| flux_core::stats::Summary::of(&[v]).unwrap();
+        let mut s =
+            RunSummary { ttft_ms: summary(1.0), decode_tps: summary(100.0), token_ms: summary(10.0), aggregate_tps: 200.0, failures: 0, tokens: vec![] };
+        assert!(eligible(&s, Objective::Serving { max_p95_token_ms: 10 }, None));
+        assert!(!eligible(&s, Objective::Serving { max_p95_token_ms: 9 }, None));
+        assert!(!eligible(&s, Objective::Interactive, Some(101.0)));
+        s.failures = 1;
+        assert!(!eligible(&s, Objective::Interactive, None));
+        s.failures = 0;
+        s.decode_tps.p50 = f64::NAN;
+        assert!(!eligible(&s, Objective::Interactive, None));
+    }
+
+    #[test]
+    fn policy_identity_covers_context_objective_and_constraints() {
+        let mut cfg = FluxConfig::default();
+        let mut req = PlanRequest {
+            workload: Workload { n_ctx_seq: 2048, concurrency: 1, objective: Objective::Interactive },
+            engines: vec![EngineKind::Native],
+            type_k: "f16".into(),
+            type_v: "f16".into(),
+            n_ubatch: 512,
+            allow_storage_streaming: false,
+            prompt_tokens: 256,
+            decode_tokens: 128,
+            speculation: false,
+            expert_residency: true,
+            min_decode_tps: None,
+            mlock: false,
+            draft_model: None,
+        };
+        let mut previous = req.policy_key(&cfg);
+        req.workload.n_ctx_seq += 1;
+        assert_ne!(previous, req.policy_key(&cfg));
+        previous = req.policy_key(&cfg);
+        req.workload.objective = Objective::Serving { max_p95_token_ms: 10 };
+        assert_ne!(previous, req.policy_key(&cfg));
+        previous = req.policy_key(&cfg);
+        req.allow_storage_streaming = true;
+        assert_ne!(previous, req.policy_key(&cfg));
+        previous = req.policy_key(&cfg);
+        cfg.plan.validation_prompts += 1;
+        assert_ne!(previous, req.policy_key(&cfg));
+    }
 
     #[test]
     fn meta_memory_is_apportioned_by_split() {

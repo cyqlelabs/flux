@@ -107,8 +107,14 @@ impl NativeWorker {
     }
 
     pub fn run(&mut self, rx: Receiver<Request>) -> Result<()> {
+        let mut commands = 0;
         loop {
             let busy = self.seqs.iter().any(|s| !s.prefill_done() || s.wants_decode());
+            if busy && commands >= 8 {
+                self.step();
+                commands = 0;
+                continue;
+            }
             let req = if busy {
                 match rx.try_recv() {
                     Ok(r) => Some(r),
@@ -126,8 +132,14 @@ impl NativeWorker {
                     self.out.send(&Event::Bye);
                     return Ok(());
                 }
-                Some(r) => self.handle(r),
-                None => self.step(),
+                Some(r) => {
+                    self.handle(r);
+                    commands += 1;
+                }
+                None => {
+                    self.step();
+                    commands = 0;
+                }
             }
         }
     }
@@ -334,18 +346,25 @@ impl NativeWorker {
     }
 
     fn step(&mut self) {
+        // Rotate batch priority so a batch smaller than the active set cannot starve later slots.
+        if self.seqs.len() > 1 {
+            self.seqs.rotate_left(1);
+        }
         let (mut tokens, mut pos, mut seqid, mut logits) = (vec![], vec![], vec![], vec![]);
         // (sequence index, batch row, draft) for the rows sampled after the step; the draft follows the row.
         let mut sample_rows: Vec<(usize, i32, Vec<i32>)> = vec![];
         let mut decode_rows: Vec<usize> = vec![];
         for i in 0..self.seqs.len() {
+            if tokens.len() == self.n_batch {
+                break;
+            }
             if !self.seqs[i].wants_decode() {
                 continue;
             }
             let s = &self.seqs[i];
             // Every drafted token must be emittable: within credit, max_tokens and the planned context.
             let room = (s.credit as usize).min((s.max_tokens - s.emitted) as usize).min((self.n_ctx_seq as i32 - s.pos) as usize);
-            let n_draft = self.spec_n_max.min(room.saturating_sub(1));
+            let n_draft = self.spec_n_max.min(room.saturating_sub(1)).min(self.n_batch.saturating_sub(tokens.len() + 1));
             let draft = if n_draft > 0 { self.engine.as_mut().unwrap().spec_draft(s.slot, s.pos, s.next.unwrap(), &s.kv, n_draft) } else { vec![] };
             sample_rows.push((i, tokens.len() as i32, draft.clone()));
             decode_rows.push(i);

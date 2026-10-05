@@ -44,11 +44,25 @@ pub fn pressure(s: MemSample, min: u64, currently_closed: bool) -> Option<String
     }
 }
 
-pub fn spawn(st: Arc<AppState>) {
-    tokio::spawn(async move {
+pub fn spawn(st: Arc<AppState>) -> tokio::task::JoinSet<()> {
+    let mut tasks = tokio::task::JoinSet::new();
+    let health = st.clone();
+    tasks.spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if let Ok(_guard) = health.replan_lock.try_lock() {
+                match health.supervisor.ready().await {
+                    Ok(_) => health.admission.unblock("worker"),
+                    Err(e) => health.admission.block("worker", &format!("worker unavailable: {e}")),
+                }
+            }
+        }
+    });
+    tasks.spawn(async move {
         let mut last_swap = pswpin();
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
+            st.journal.expire();
             let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
             let swap = pswpin();
             let s = MemSample { available: read_kib(&meminfo, "MemAvailable:").unwrap_or(0) * 1024, swapped_in: swap.saturating_sub(last_swap) };
@@ -59,18 +73,19 @@ pub fn spawn(st: Arc<AppState>) {
                     if !closed_by_us {
                         tracing::warn!("{reason}: admission closed");
                     }
-                    st.admission.close(&reason);
+                    st.admission.block("pressure", &reason);
                     st.pressure_closed.store(true, Ordering::Relaxed);
                 }
                 None if closed_by_us => {
                     tracing::info!("memory pressure cleared: admission open");
-                    st.admission.open();
+                    st.admission.unblock("pressure");
                     st.pressure_closed.store(false, Ordering::Relaxed);
                 }
                 None => {}
             }
         }
     });
+    tasks
 }
 
 /// Feeds a finished request's decode rate at `depth` prompt tokens. The rate is compared with what the plan

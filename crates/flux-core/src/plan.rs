@@ -18,6 +18,9 @@ pub struct ProfileKey {
     /// Context per sequence rounded up to a power of two.
     pub ctx_bucket: u32,
     pub concurrency: u32,
+    /// Complete workload, runtime policy, and planner revision fingerprint.
+    #[serde(default)]
+    pub policy: String,
 }
 
 impl ProfileKey {
