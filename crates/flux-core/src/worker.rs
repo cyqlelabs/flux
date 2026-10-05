@@ -392,7 +392,7 @@ async fn oneshot_inner(args: &[&str], input: &serde_json::Value) -> Result<serde
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .context("starting flux-worker")?;
@@ -400,7 +400,11 @@ async fn oneshot_inner(args: &[&str], input: &serde_json::Value) -> Result<serde
     stdin.write_all(input.to_string().as_bytes()).await?;
     drop(stdin);
     let out = child.wait_with_output().await?;
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).with_context(|| format!("worker {args:?} exited with {} and no result", out.status))?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).with_context(|| {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+        format!("worker {args:?} exited with {} and no result:\n{}", out.status, lines[lines.len().saturating_sub(10)..].join("\n"))
+    })?;
     if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
         bail!("{e}");
     }
