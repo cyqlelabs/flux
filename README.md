@@ -10,6 +10,8 @@ Flux is a measured execution planner and runtime for LLM inference. It measures 
 
 Cost models only rank and prune candidates; Flux always saves the plan that measured fastest. It runs on a pinned, patched build of [llama.cpp](https://github.com/ggml-org/llama.cpp) and can also plan for `llama-server` or any OpenAI-compatible engine you configure.
 
+Planning is model compilation. A compiler fits a program to the processor that will run it; `flux plan` fits a model to the machine that will serve it. It leaves the weights untouched and decides where each layer and expert runs. Like a binary, the plan is built once and run many times, and a new GPU, driver, or backend build calls for a new one.
+
 <p align="center">
   <img src="assets/pipeline.png" width="348" alt="A GGUF or Hugging Face model goes through inspect, probe, and plan; the saved plan feeds serve and bench">
 </p>
