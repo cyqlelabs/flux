@@ -22,7 +22,7 @@ class Worker:
         try:
             self.hello = self.receive()
             assert self.hello["ev"] == "hello", self.hello
-            self.send(op="hello", protocol=1)
+            self.send(op="hello", protocol=2)
         except Exception:
             self.close()
             raise

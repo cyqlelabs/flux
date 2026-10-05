@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use flux_core::config::FluxConfig;
 use std::path::PathBuf;
 
-/// Tokens per sequence a plan holds when `--ctx` is not given.
+/// Tokens per sequence a plan holds when `--ctx` is not given and the model does not state its trained context.
 const DEFAULT_CTX: u32 = 65536;
 
 #[derive(Parser)]
@@ -63,8 +63,8 @@ enum Cmd {
     /// Find, measure and save the fastest validated plan for a model and workload.
     Plan {
         model: PathBuf,
-        /// Tokens per sequence the plan must hold (prompt + output). Default: 65536, or the model's trained context
-        /// when that is shorter; agent clients send prompts of 20K tokens and more.
+        /// Tokens per sequence the plan must hold (prompt + output). Default: the model's trained context, capped only
+        /// when VRAM and the RAM left after the weights cannot hold its KV cache.
         #[arg(long)]
         ctx: Option<u32>,
         /// Concurrent sequences the plan must hold.
@@ -221,10 +221,14 @@ async fn main() -> Result<()> {
                 None => model,
             };
             let m = planning::inspect_hashed(&cfg, &model)?;
-            let ctx = ctx.unwrap_or_else(|| m.facts.as_ref().map(|f| f.n_ctx_train).filter(|&n| n > 0).map_or(DEFAULT_CTX, |n| n.min(DEFAULT_CTX)));
             // Drafting is measured whenever the model carries next-token heads, and kept only where it wins.
             let speculation = speculation || m.facts.as_ref().is_some_and(|f| f.n_layer_nextn > 0);
             let report = planning::probe_report(&cfg, Some(&m), false, reprobe).await?;
+            // The planner rounds the context up to whole 256-token pages, so the default rounds the trained context
+            // down. Without a GPU that reads host pages, KV past the floor would take VRAM from the weights, so the
+            // default stops at the floor.
+            let floor = if report.host_pages.iter().any(|p| p.supported()) { u32::MAX } else { flux_core::plan::KV_FLOOR_TOKENS };
+            let ctx = ctx.unwrap_or_else(|| m.facts.as_ref().map(|f| (f.n_ctx_train / 256 * 256).min(floor)).filter(|&n| n > 0).unwrap_or(DEFAULT_CTX));
             let engines = engines
                 .iter()
                 .map(|e| match e.as_str() {

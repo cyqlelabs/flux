@@ -174,6 +174,49 @@ pub struct RuntimeParams {
     pub mlock: bool,
     pub op_offload: bool,
     pub speculation: Option<Speculation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_paging: Option<KvPaging>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub qsa_pooled: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub qsa_blocks: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub qsa_indexed: bool,
+}
+
+/// Attention KV kept in VRAM before the expert cache gets the rest: the context Flux served before paging, so short
+/// and medium conversations keep their speed. A measured trade between the two caches will replace it.
+pub const KV_FLOOR_TOKENS: u32 = 65536;
+
+/// A KV cache that reserves address space for the whole context and commits pages as conversations grow: VRAM
+/// first, then pinned RAM on GPUs whose kernels read host pages.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KvPaging {
+    /// Tokens of attention KV per sequence that stay in VRAM.
+    pub floor_tokens: u32,
+    /// Prompt chunks copy a layer's RAM pages to VRAM once instead of reading them per tile of queries.
+    #[serde(default = "default_stage_prompts")]
+    pub stage_prompts: bool,
+    /// RAM for KV pages; `flux serve` recomputes it from the memory available when it starts.
+    pub host_budget: u64,
+    /// RAM left free for the OS and other programs.
+    pub host_reserve: u64,
+    pub devices: Vec<KvDeviceBudget>,
+}
+
+fn default_stage_prompts() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KvDeviceBudget {
+    pub device: String,
+    /// VRAM for KV pages on this GPU.
+    pub bytes: u64,
+    /// The part of `bytes` held for caches every step reads in full (indexer keys, the draft layer).
+    pub full_read_reserve: u64,
+    /// Attention pages past the VRAM budget may live in RAM: the GPU's kernels read host pages.
+    pub host_reads: bool,
 }
 
 /// Bytes on one device split by purpose.
@@ -232,7 +275,7 @@ impl HostBudget {
     }
 
     pub fn fits(&self) -> bool {
-        self.required() <= self.capacity && self.required() - self.os_reserve <= self.available_at_plan
+        self.required() <= self.capacity && self.required() <= self.available_at_plan
     }
 }
 
@@ -412,6 +455,10 @@ impl Plan {
             type_v: r.type_v.clone(),
             op_offload: r.op_offload,
             kv_unified: false,
+            kv_paging: r.kv_paging.clone(),
+            qsa_pooled: r.qsa_pooled,
+            qsa_blocks: r.qsa_blocks,
+            qsa_indexed: r.qsa_indexed,
             speculation: r.speculation.clone(),
             expert_cache: self.expert_cache.as_ref().map(|c| c.spec.clone()),
             expert_cache_frozen: self.expert_cache.as_ref().is_some_and(|c| c.frozen),
@@ -461,6 +508,9 @@ mod tests {
         };
         assert_eq!(h.required(), 58 * gib);
         assert!(h.fits());
+        h.available_at_plan = 57 * gib;
+        assert!(!h.fits());
+        h.available_at_plan = 60 * gib;
         h.mirrored_weights = 12 * gib;
         assert_eq!(h.required(), 70 * gib);
         assert!(!h.fits());

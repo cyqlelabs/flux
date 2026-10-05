@@ -27,6 +27,7 @@ char * fx_probe_matmul(const char * request_json);
 char * fx_probe_copy(const char * request_json);
 // The same activities alone and concurrently, to expose shared-link and memory-bandwidth contention.
 char * fx_probe_contention(const char * request_json);
+char * fx_probe_host_pages(const char * request_json);
 // Whether a device implements MUL_MAT / MUL_MAT_ID for each encoding.
 char * fx_supports(const char * request_json);
 
@@ -34,6 +35,9 @@ fx_engine * fx_engine_load(const char * params_json, char ** error);
 void fx_engine_free(fx_engine * e);
 // {"n_ctx","n_ctx_seq","n_seq","n_batch","n_vocab","memory":[...]}
 char * fx_engine_info(fx_engine * e);
+bool fx_seq_reserve(fx_engine * e, int32_t seq, uint32_t cells);
+void fx_seq_release(fx_engine * e, int32_t seq);
+void fx_host_reserve(fx_engine * e, uint64_t bytes);
 
 // Returns the token count, or -(required) when cap is too small.
 int32_t fx_tokenize(fx_engine * e, const char * text, int32_t len, bool add_special, int32_t * out, int32_t cap);

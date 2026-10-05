@@ -9,7 +9,7 @@ def emit(ev, **fields):
 
 
 chat = len(sys.argv) > 1 and sys.argv[1] == "external"
-emit("hello", protocol=1, worker="test", engine="fixture" if chat else "native",
+emit("hello", protocol=2, worker="test", engine="fixture" if chat else "native",
      backend_revision="audit", backend_build="audit", level="chat" if chat else "tokens")
 mode = "normal"
 for line in sys.stdin:
@@ -20,7 +20,7 @@ for line in sys.stdin:
         if mode == "load_error":
             emit("error", code="load_failed", message="injected load failure")
         else:
-            emit("loaded", load_ms=0, n_ctx_seq=4096, n_seq=2, memory=[])
+            emit("loaded", load_ms=0, n_ctx_seq=r["plan"]["workload"]["n_ctx_seq"], n_seq=2, memory=[])
     elif kind == "tokenize" and r["text"] != "HANG":
         emit("tokens", id=r["id"], tokens=[1, 2])
     elif kind == "apply_template":

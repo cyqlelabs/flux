@@ -7,6 +7,8 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "llama-ext.h"
+#include "llama-memory.h"
+#include "llama-context.h"
 #include "llama.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -14,6 +16,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -191,6 +194,15 @@ struct load_params {
         cp.offload_kqv = true;
         cp.op_offload = j.value("op_offload", true);
         cp.kv_unified = j.value("kv_unified", false);
+        const auto paging = j.value("kv_paging", json());
+        cp.kv_paging = paging.is_object() || (paging.is_boolean() && paging.get<bool>());
+        cp.qsa_indexed = j.value("qsa_indexed", false);
+        cp.qsa_pooled = j.value("qsa_pooled", false);
+        cp.qsa_blocks = j.value("qsa_blocks", false);
+        if (paging.is_object()) {
+            cp.kv_floor_tokens = paging.value("floor_tokens", 65536u);
+            cp.kv_staging = paging.value("stage_prompts", true);
+        }
         cp.no_perf = false;
 
         // Expert cache: per layer, the initial cached experts (the first `hot` of `order`).
@@ -299,12 +311,37 @@ json memory_json(const llama_context * ctx) {
         auto & t = totals[host ? std::string("CPU") : std::string(ggml_backend_dev_name(dev))];
         t.model += mb.model;
         t.context += mb.context;
+        t.context_capacity += mb.context_capacity;
         t.compute += mb.compute;
         t.staging += mb.staging;
     }
     json out = json::array();
     for (const auto & [name, t] : totals) {
-        out.push_back({{"device", name}, {"model", t.model}, {"context", t.context}, {"compute", t.compute}, {"staging", t.staging}});
+        out.push_back({{"device", name}, {"model", t.model}, {"context", t.context}, {"context_capacity", t.context_capacity},
+                {"compute", t.compute}, {"staging", t.staging}, {"kv_full_read", 0}, {"kv_dense", 0}, {"kv_sparse", 0}, {"kv_floor", 0}});
+    }
+    auto * memory = llama_get_memory(ctx);
+    if (memory) {
+        const auto capacity = memory->page_requirements(UINT32_MAX);
+        const auto floor = memory->page_requirements(ctx->get_cparams().kv_floor_tokens);
+        for (auto & entry : out) {
+            uint64_t full = 0, dense = 0, sparse = 0, floor_bytes = 0;
+            for (const auto & requirement : capacity) {
+                const auto buft = requirement.first.first;
+                const auto cls = requirement.first.second;
+                const auto dev = ggml_backend_buft_get_device(buft);
+                const std::string device = !dev || ggml_backend_buft_is_host(buft) ? "CPU" : ggml_backend_dev_name(dev);
+                if (entry["device"] != device) continue;
+                if (cls == llama_kv_page_class::full_read) full += requirement.second;
+                if (cls == llama_kv_page_class::dense_attention) dense += requirement.second;
+                if (cls == llama_kv_page_class::sparse_attention) sparse += requirement.second;
+                floor_bytes += cls == llama_kv_page_class::full_read ? requirement.second : floor.at(requirement.first);
+            }
+            entry["kv_full_read"] = full;
+            entry["kv_dense"] = dense;
+            entry["kv_sparse"] = sparse;
+            entry["kv_floor"] = floor_bytes;
+        }
     }
     return out;
 }
@@ -316,10 +353,12 @@ json engine_memory_json(const llama_context * target, const llama_context * draf
         for (const auto & d : memory_json(draft)) {
             auto it = std::find_if(memory.begin(), memory.end(), [&](const json & m) { return m["device"] == d["device"]; });
             if (it == memory.end()) {
-                memory.push_back({{"device", d["device"]}, {"model", 0}, {"context", d["context"]}, {"compute", d["compute"]}, {"staging", d["staging"]}});
+                auto state = d;
+                state["model"] = 0;
+                memory.push_back(std::move(state));
                 continue;
             }
-            for (const char * k : {"context", "compute", "staging"}) {
+            for (const char * k : {"context", "context_capacity", "compute", "staging", "kv_full_read", "kv_dense", "kv_sparse", "kv_floor"}) {
                 (*it)[k] = (*it)[k].get<uint64_t>() + d[k].get<uint64_t>();
             }
         }
@@ -629,6 +668,7 @@ static bool trace_cb(ggml_tensor * t, bool ask, void * ud) {
 }
 
 struct fx_engine {
+    std::shared_ptr<llama_kv_page_ledger> page_ledger;
     trace_state trace;
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;
@@ -735,6 +775,12 @@ char * fx_measure(const char * params_json) {
             }
         }
         json memory = engine_memory_json(ctx, ctx_dft);
+        if (p.cp.kv_paging) {
+            for (auto & entry : memory) {
+                const uint64_t paged = entry.value("kv_full_read", 0ull) + entry.value("kv_dense", 0ull) + entry.value("kv_sparse", 0ull);
+                entry["context"] = entry["context"].get<uint64_t>() - paged + entry.value("kv_floor", 0ull);
+            }
+        }
         if (ctx_dft) {
             llama_free(ctx_dft);
         }
@@ -891,6 +937,170 @@ char * fx_probe_contention(const char * request_json) {
     }
 }
 
+char * fx_probe_host_pages(const char * request_json) {
+    try {
+        ensure_init();
+        const json j = json::parse(request_json);
+        auto * dev = dev_by_name(j.at("device").get<std::string>());
+        auto unsupported = [](const char * reason) {
+            return dup(json{{"unsupported", reason}}.dump());
+        };
+        if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            return unsupported("host-page link probing requires a GPU");
+        }
+        auto * buft = ggml_backend_dev_growable_buffer_type(dev);
+        if (!buft) {
+            return unsupported("backend has no growable virtual memory");
+        }
+        const size_t page_size = ggml_backend_buft_get_alignment(buft);
+        const size_t bytes = j.value("bytes", size_t(512) << 20);
+        const double seconds = j.value("seconds", 1.5);
+        const int threads = j.value("threads", 1);
+        if (bytes < 2 * page_size || bytes > (size_t(4) << 30) || bytes % page_size || !std::isfinite(seconds) || seconds <= 0 || seconds > 10 || threads < 1) {
+            return err_json("invalid host-page probe size, duration or threads");
+        }
+        using backend_ptr = std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)>;
+        backend_ptr gpu(ggml_backend_dev_init(dev, nullptr), ggml_backend_free);
+        auto * cpu_dev = dev_by_name("CPU");
+        backend_ptr cpu(ggml_backend_dev_init(cpu_dev, nullptr), ggml_backend_free);
+        if (!gpu || !cpu) {
+            return err_json("could not initialize probe backends");
+        }
+        set_threads(cpu.get(), cpu_dev, threads);
+
+        ctx_guard source;
+        source.ctx = small_ctx();
+        const int64_t rows = bytes / 1024;
+        auto * keys = ggml_new_tensor_2d(source.ctx, GGML_TYPE_F32, 256, rows);
+        source.buf = ggml_backend_alloc_ctx_tensors_from_buft(source.ctx, buft);
+        if (!source.buf || !ggml_backend_buffer_commit(source.buf, 0, 2 * page_size, GGML_BACKEND_PAGE_DEVICE)) {
+            return unsupported("could not commit device pages");
+        }
+        // Exercise page boundaries and both migration directions before timing RAM reads.
+        const float marker[] = { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f };
+        const size_t marker_offset = page_size - sizeof(marker) / 2;
+        ggml_backend_tensor_set(keys, marker, marker_offset, sizeof(marker));
+        for (auto location : {GGML_BACKEND_PAGE_HOST, GGML_BACKEND_PAGE_DEVICE}) {
+            if (!ggml_backend_buffer_move(source.buf, 0, 2 * page_size, location)) {
+                return unsupported("driver cannot migrate host NUMA pages");
+            }
+            float restored[8]{};
+            ggml_backend_tensor_get(keys, restored, marker_offset, sizeof(restored));
+            if (memcmp(marker, restored, sizeof(marker))) {
+                throw std::runtime_error("page migration changed tensor data");
+            }
+        }
+        if (!ggml_backend_buffer_release(source.buf, 0, 2 * page_size)) {
+            throw std::runtime_error("page release failed");
+        }
+        ggml_backend_page_info info{};
+        if (!ggml_backend_buffer_page_info(source.buf, &info) || info.device_bytes || info.host_bytes) {
+            throw std::runtime_error("released pages remain committed");
+        }
+        if (!ggml_backend_buffer_commit(source.buf, 0, info.capacity, GGML_BACKEND_PAGE_HOST)) {
+            return unsupported("driver cannot allocate the probe's host NUMA pages");
+        }
+        // the read check below expects zeros, and new pages carry no promised contents
+        ggml_backend_tensor_memset(keys, 0, 0, ggml_nbytes(keys));
+
+        ctx_guard cpu_graph;
+        cpu_graph.ctx = small_ctx();
+        // Decode-shaped GEMV over weights larger than the host's last-level cache.
+        auto * weights = ggml_new_tensor_2d(cpu_graph.ctx, GGML_TYPE_F32, 4096, bytes / (4096 * sizeof(float)));
+        auto * input = ggml_new_tensor_1d(cpu_graph.ctx, GGML_TYPE_F32, 4096);
+        auto * cpu_gf = ggml_new_graph(cpu_graph.ctx);
+        ggml_build_forward_expand(cpu_gf, ggml_mul_mat(cpu_graph.ctx, weights, input));
+        cpu_graph.buf = ggml_backend_alloc_ctx_tensors(cpu_graph.ctx, cpu.get());
+        if (!cpu_graph.buf) {
+            throw std::runtime_error("could not allocate CPU contention weights");
+        }
+        ggml_backend_tensor_memset(weights, 0, 0, ggml_nbytes(weights));
+        fill_f32(input);
+
+        json result = json::object();
+        std::mt19937 random(0);
+        for (bool scattered : {false, true}) {
+            ctx_guard g;
+            g.ctx = small_ctx();
+            auto * ids = scattered ? ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, 2048) : nullptr;
+            auto * read = scattered ? ggml_get_rows(g.ctx, keys, ids) : keys;
+            auto * sum = ggml_sum_rows(g.ctx, read);
+            if (!ggml_backend_supports_op(gpu.get(), sum) || (scattered && !ggml_backend_supports_op(gpu.get(), read))) {
+                return unsupported("backend does not support the host-page read graphs");
+            }
+            auto * gf = ggml_new_graph(g.ctx);
+            ggml_build_forward_expand(gf, sum);
+            g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, gpu.get());
+            if (!g.buf) {
+                throw std::runtime_error("could not allocate host-page read graph");
+            }
+            std::vector<int32_t> indices(2048);
+            auto once = [&] {
+                if (scattered) {
+                    for (size_t b = 0; b < indices.size() / 4; ++b) {
+                        const int32_t first = (random() % (rows / 4)) * 4;
+                        for (int c = 0; c < 4; ++c) {
+                            indices[b * 4 + c] = first + c;
+                        }
+                    }
+                    ggml_backend_tensor_set(ids, indices.data(), 0, indices.size() * sizeof(int32_t));
+                }
+                const double t0 = now_us();
+                if (ggml_backend_graph_compute(gpu.get(), gf) != GGML_STATUS_SUCCESS) {
+                    throw std::runtime_error("host-page read graph failed");
+                }
+                ggml_backend_synchronize(gpu.get());
+                return now_us() - t0;
+            };
+            once();
+            float value = 1;
+            ggml_backend_tensor_get(sum, &value, 0, sizeof(value));
+            if (value != 0) {
+                throw std::runtime_error("kernel read of zeroed host pages failed");
+            }
+            const size_t read_bytes = scattered ? indices.size() * 1024 : bytes;
+            const std::string prefix = scattered ? "scattered" : "streaming";
+            result[prefix + "_gbps"] = sustained_gbps(once, read_bytes, seconds);
+
+            std::atomic<bool> stop{false}, ready{false}, cpu_failed{false};
+            std::thread load([&] {
+                do {
+                    if (ggml_backend_graph_compute(cpu.get(), cpu_gf) != GGML_STATUS_SUCCESS) {
+                        cpu_failed.store(true);
+                        break;
+                    }
+                    ready.store(true);
+                } while (!stop.load());
+            });
+            try {
+                while (!ready.load() && !cpu_failed.load()) {
+                    std::this_thread::yield();
+                }
+                if (cpu_failed.load()) {
+                    throw std::runtime_error("CPU contention graph failed");
+                }
+                result[prefix + "_contended_gbps"] = sustained_gbps(once, read_bytes, seconds);
+            } catch (...) {
+                stop.store(true);
+                load.join();
+                throw;
+            }
+            stop.store(true);
+            load.join();
+            if (cpu_failed.load()) {
+                throw std::runtime_error("CPU contention graph failed");
+            }
+        }
+        result["unsupported"] = nullptr;
+        result["buffer_bytes"] = bytes;
+        result["block_cells"] = 4;
+        result["cpu_threads"] = threads;
+        return dup(result.dump());
+    } catch (const std::exception & e) {
+        return err_json(e.what());
+    }
+}
+
 char * fx_supports(const char * request_json) {
     try {
         ensure_init();
@@ -917,9 +1127,23 @@ char * fx_supports(const char * request_json) {
 fx_engine * fx_engine_load(const char * params_json, char ** error) {
     try {
         ensure_init();
-        load_params p(json::parse(params_json));
-        auto * e = new fx_engine();
-        if (json::parse(params_json).value("trace", false)) {
+        const json params = json::parse(params_json);
+        load_params p(params);
+        auto owner = std::make_unique<fx_engine>();
+        auto * e = owner.get();
+        const json paging = params.value("kv_paging", json());
+        if (paging.is_object()) {
+            if (p.cp.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED || p.cp.kv_unified) {
+                throw std::runtime_error("paged KV requires flash attention and separate streams");
+            }
+            llama_kv_page_ledger::devices_t budgets;
+            for (const auto & d : paging.at("devices")) {
+                auto * device = dev_by_name(d.at("device").get<std::string>());
+                budgets.emplace(device, llama_kv_device_budget{d.at("bytes"), d.at("full_read_reserve"), d.at("host_reads")});
+            }
+            e->page_ledger = std::make_shared<llama_kv_page_ledger>(paging.at("host_budget"), paging.at("host_reserve"), std::move(budgets));
+        }
+        if (params.value("trace", false)) {
             // Observation splits the graph; re-capturing CUDA graphs for every piece would dominate.
             setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
             p.cp.cb_eval = trace_cb;
@@ -927,13 +1151,11 @@ fx_engine * fx_engine_load(const char * params_json, char ** error) {
         }
         e->model = llama_model_load_from_file(p.model.c_str(), p.mp);
         if (!e->model) {
-            delete e;
             *error = dup("backend failed to load the model (see worker log)");
             return nullptr;
         }
         e->ctx = llama_init_from_model(e->model, p.cp);
         if (!e->ctx) {
-            delete e;
             *error = dup("backend failed to create the context (insufficient memory?)");
             return nullptr;
         }
@@ -948,13 +1170,11 @@ fx_engine * fx_engine_load(const char * params_json, char ** error) {
         if (!p.cache_layers.empty()) {
             if (llama_moe_cache_init(e->ctx, (int32_t) p.cache_layers.size(), p.cache_layers.data(), p.cache_offsets.data(), p.cache_experts.data(),
                                      p.cache_slots.data()) != 0) {
-                delete e;
                 *error = dup("backend failed to set up the expert cache (see worker log)");
                 return nullptr;
             }
             for (const auto & t : p.cache_tiers) {
                 if (llama_moe_cache_tier(e->ctx, t.device.c_str(), (int32_t) t.layers.size(), t.layers.data(), t.offsets.data(), t.experts.data()) != 0) {
-                    delete e;
                     *error = dup(("backend failed to set up the expert tier on " + t.device + " (see worker log)").c_str());
                     return nullptr;
                 }
@@ -969,13 +1189,11 @@ fx_engine * fx_engine_load(const char * params_json, char ** error) {
         }
         if (p.spec_n_max > 0) {
             if (llama_model_n_layer_nextn(e->model) == 0) {
-                delete e;
                 *error = dup("speculation needs next-token heads, and the model has none");
                 return nullptr;
             }
             e->ctx_dft = new_draft_context(e->model, p.cp, e->ctx, p.spec_draft_vocab);
             if (!e->ctx_dft) {
-                delete e;
                 *error = dup("backend failed to create the draft context (insufficient memory?)");
                 return nullptr;
             }
@@ -991,7 +1209,6 @@ fx_engine * fx_engine_load(const char * params_json, char ** error) {
             sp.draft.ctx_dft = e->ctx_dft;
             e->spec = common_speculative_init(sp, llama_n_seq_max(e->ctx));
             if (!e->spec) {
-                delete e;
                 *error = dup("backend failed to initialize drafting with the next-token heads");
                 return nullptr;
             }
@@ -999,7 +1216,15 @@ fx_engine * fx_engine_load(const char * params_json, char ** error) {
             e->spec_heads_max = p.spec_n_max;
             e->spec_copied.assign(llama_n_seq_max(e->ctx), false);
         }
-        return e;
+        if (e->page_ledger) {
+            llama_get_memory(e->ctx)->set_page_floor(p.cp.kv_floor_tokens);
+            llama_get_memory(e->ctx)->set_page_ledger(e->page_ledger);
+            if (e->ctx_dft) {
+                llama_get_memory(e->ctx_dft)->set_page_floor(p.cp.kv_floor_tokens);
+                llama_get_memory(e->ctx_dft)->set_page_ledger(e->page_ledger);
+            }
+        }
+        return owner.release();
     } catch (const std::exception & ex) {
         *error = dup(ex.what());
         return nullptr;
@@ -1015,6 +1240,16 @@ void fx_engine_free(fx_engine * e) {
 
 char * fx_engine_info(fx_engine * e) {
     try {
+        json pages = json::object();
+        if (e->page_ledger) {
+            for (const auto & cls : std::vector<std::pair<const char *, llama_kv_page_class>>{
+                    {"full_read", llama_kv_page_class::full_read},
+                    {"dense_attention", llama_kv_page_class::dense_attention},
+                    {"sparse_attention", llama_kv_page_class::sparse_attention}}) {
+                const auto used = e->page_ledger->usage(cls.second);
+                pages[cls.first] = {{"vram_bytes", used.device_bytes}, {"ram_bytes", used.host_bytes}};
+            }
+        }
         return dup(json{
             {"n_ctx", llama_n_ctx(e->ctx)},
             {"n_ctx_seq", llama_n_ctx_seq(e->ctx)},
@@ -1025,6 +1260,7 @@ char * fx_engine_info(fx_engine * e) {
             {"spec_n_max", e->spec_n_max},
             {"recurrent", e->recurrent},
             {"memory", engine_memory_json(e->ctx, e->ctx_dft)},
+            {"kv_pages", pages},
         }.dump());
     } catch (const std::exception & ex) {
         return err_json(ex.what());
@@ -1416,6 +1652,29 @@ char * fx_route_stats(fx_engine * e, const char * request_json) {
         e->trace.routes = false;
         return err_json(ex.what());
     }
+}
+
+bool fx_seq_reserve(fx_engine * e, int32_t seq, uint32_t cells) {
+    if (!e->page_ledger) return true;
+    try {
+        std::vector<llama_kv_page_request> requests;
+        if (!llama_get_memory(e->ctx)->collect_reservation(seq, cells, requests) ||
+                (e->ctx_dft && !llama_get_memory(e->ctx_dft)->collect_reservation(seq, cells, requests))) return false;
+        return e->page_ledger->commit(requests);
+    } catch (const std::exception & ex) {
+        fprintf(stderr, "KV admission: %s\n", ex.what());
+        return false;
+    }
+}
+
+void fx_seq_release(fx_engine * e, int32_t seq) {
+    if (!e->page_ledger) return;
+    llama_get_memory(e->ctx)->release_reservation(seq);
+    if (e->ctx_dft) llama_get_memory(e->ctx_dft)->release_reservation(seq);
+}
+
+void fx_host_reserve(fx_engine * e, uint64_t bytes) {
+    if (e->page_ledger) e->page_ledger->set_host_reserve(bytes);
 }
 
 void fx_seq_clear(fx_engine * e, int32_t seq) {

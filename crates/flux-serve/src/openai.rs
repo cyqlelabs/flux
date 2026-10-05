@@ -20,6 +20,20 @@ pub fn error(status: StatusCode, kind: &str, message: impl Into<String>) -> Resp
     (status, Json(json!({"error": {"message": message.into(), "type": kind, "code": status.as_u16()}}))).into_response()
 }
 
+/// OpenAI's overflow error; clients such as Qwen Code read the context and prompt sizes from its message.
+fn context_overflow(message: String, api: Api) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": {
+            "type": "invalid_request_error",
+            "param": if api == Api::Chat { "messages" } else { "prompt" },
+            "code": "context_length_exceeded",
+            "message": message,
+        }})),
+    )
+        .into_response()
+}
+
 fn rejection(r: Rejection) -> Response {
     match r {
         Rejection::QueueFull => error(StatusCode::TOO_MANY_REQUESTS, "queue_full", "the request queue is full; retry later"),
@@ -117,20 +131,17 @@ async fn token_request(
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
     let n_ctx = st.supervisor.loaded().await.n_ctx_seq as usize;
-    let requested = body.get("max_completion_tokens").or_else(|| body.get("max_tokens")).and_then(Value::as_u64).map(|v| v as usize);
-    // max_tokens is a ceiling, as in llama-server: agents ask for 32K or more on every turn, so a reply stops
-    // ("length") where the context ends instead of the request failing once the conversation grows.
+    let requested =
+        body.get("max_completion_tokens").or_else(|| body.get("max_tokens")).and_then(Value::as_u64).map(|v| usize::try_from(v).unwrap_or(usize::MAX));
     let room = n_ctx.saturating_sub(prompt.len());
     let max_tokens = requested.unwrap_or(room).min(room);
     if prompt.is_empty() || requested == Some(0) {
         return error(StatusCode::BAD_REQUEST, "invalid_request_error", "the prompt is empty or max_tokens is 0");
     }
-    if room == 0 {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "context_length_exceeded",
-            format!("prompt ({} tokens) leaves no room in the plan's {n_ctx} tokens per sequence; Flux never truncates a prompt", prompt.len()),
-        );
+    let min_reply = st.cfg.serve.min_reply.max(1) as usize;
+    if room < requested.unwrap_or(min_reply).min(min_reply) {
+        let n_prompt = prompt.len();
+        return context_overflow(format!("This model's maximum context length is {n_ctx} tokens. However, your messages resulted in {n_prompt} tokens."), api);
     }
     if let Err(kind) = st.journal.try_begin(&id, prompt.clone()) {
         return error(
@@ -147,9 +158,10 @@ async fn token_request(
     let job = TokenJob { id: id.clone(), prompt, sampling: sampling(&body), stop, max_tokens: max_tokens as u32, render_special, chat };
     let (tx, rx) = mpsc::channel(32);
     let (done_tx, done_rx) = oneshot::channel();
+    let (admission_tx, admission_rx) = oneshot::channel();
     let (st2, id2) = (st.clone(), id.clone());
     tokio::spawn(async move {
-        let o = run_tokens(&st2, job, tx).await;
+        let o = run_tokens(&st2, job, tx, admission_tx).await;
         drop(permit);
         st2.live.finish(&id2, &o);
         if let Some(tps) = o.decode_tps {
@@ -157,6 +169,12 @@ async fn token_request(
         }
         let _ = done_tx.send(o);
     });
+    match admission_rx.await {
+        Ok(Ok(())) => {}
+        Ok(Err(o)) if o.error_code == Some(flux_core::protocol::ErrorCode::ContextFull) => return context_overflow(o.error.unwrap_or_default(), api),
+        Ok(Err(o)) => return error(StatusCode::INTERNAL_SERVER_ERROR, "engine_error", o.error.unwrap_or_else(|| "generation failed before admission".into())),
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "engine_error", "generation task failed before admission"),
+    }
     respond(st, api, id, body.get("stream").and_then(Value::as_bool).unwrap_or(false), parsed, rx, done_rx).await
 }
 
@@ -306,7 +324,11 @@ pub async fn completions(State(st): State<Arc<AppState>>, headers: HeaderMap, Js
 }
 
 pub async fn models(State(st): State<Arc<AppState>>) -> Json<Value> {
-    Json(json!({"object": "list", "data": [{"id": st.model_name, "object": "model", "owned_by": "flux"}]}))
+    let n_ctx = st.supervisor.loaded().await.n_ctx_seq;
+    Json(json!({"object": "list", "data": [{
+        "id": st.model_name, "object": "model", "owned_by": "flux",
+        "context_length": n_ctx, "max_model_len": n_ctx, "meta": {"n_ctx": n_ctx},
+    }]}))
 }
 
 pub async fn request_entry(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {

@@ -2,6 +2,7 @@ use axum::{
     body::{to_bytes, Body},
     extract::State,
     http::{HeaderMap, Request, StatusCode},
+    response::IntoResponse,
     Json,
 };
 use flux_core::{
@@ -59,7 +60,43 @@ async fn scenarios() {
     std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::env::set_var("FLUX_WORKER", worker);
 
-    let st = app(dir.path(), plan("normal"), None).await;
+    let mut context_plan = plan("normal");
+    context_plan.workload.n_ctx_seq = 16384;
+    context_plan.key.ctx_bucket = 16384;
+    let st = app(dir.path(), context_plan, None).await;
+    let model_info = response_json(flux_serve::openai::models(State(st.clone())).await.into_response()).await;
+    for field in ["context_length", "max_model_len"] {
+        assert_eq!(model_info["data"][0][field], 16384);
+    }
+    assert_eq!(model_info["data"][0]["meta"]["n_ctx"], 16384);
+    let overflow = flux_serve::openai::completions(State(st.clone()), HeaderMap::new(), Json(json!({"prompt":vec![1;16284],"max_tokens":32768}))).await;
+    assert_eq!(overflow.status(), StatusCode::BAD_REQUEST);
+    let overflow = response_json(overflow).await;
+    assert_eq!(overflow["error"]["type"], "invalid_request_error");
+    assert_eq!(overflow["error"]["param"], "prompt");
+    assert_eq!(overflow["error"]["code"], "context_length_exceeded");
+    assert_eq!(overflow["error"]["message"], "This model's maximum context length is 16384 tokens. However, your messages resulted in 16284 tokens.");
+    assert_eq!(st.journal.running(), 0);
+    assert_eq!(st.admission.in_use(2), 0);
+    let small_reply = flux_serve::openai::completions(State(st.clone()), HeaderMap::new(), Json(json!({"prompt":vec![1;16284],"max_tokens":100}))).await;
+    assert_eq!(small_reply.status(), StatusCode::OK);
+    for body in [
+        json!({"prompt":vec![1;16285],"max_tokens":100}),
+        json!({"prompt":vec![1;16384],"max_tokens":1}),
+        json!({"prompt":vec![1;16284]}),
+        json!({"prompt":vec![1;12289],"max_tokens":32768}),
+    ] {
+        let r = flux_serve::openai::completions(State(st.clone()), HeaderMap::new(), Json(body)).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(r).await["error"]["code"], "context_length_exceeded");
+    }
+    let precedence = flux_serve::openai::completions(
+        State(st.clone()),
+        HeaderMap::new(),
+        Json(json!({"prompt":vec![1;16284],"max_tokens":32768,"max_completion_tokens":100})),
+    )
+    .await;
+    assert_eq!(precedence.status(), StatusCode::OK);
     let body = response_json(completion(&st, "tail", false).await).await;
     assert_eq!(body["choices"][0]["text"], "hello </");
     assert_eq!(st.journal.get("tail").unwrap().texts.concat(), "hello </");
@@ -73,8 +110,10 @@ async fn scenarios() {
     st.supervisor.current().await.1.kill().await;
     let health = flux_serve::router(st.clone()).oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap()).await.unwrap();
     assert_eq!(health.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let body =
-        response_json(flux_serve::openai::chat(State(st.clone()), HeaderMap::new(), Json(json!({"messages":[{"role":"user","content":"hi"}]}))).await).await;
+    let body = response_json(
+        flux_serve::openai::chat(State(st.clone()), HeaderMap::new(), Json(json!({"messages":[{"role":"user","content":"hi"}],"max_tokens":80}))).await,
+    )
+    .await;
     assert!(body.get("error").is_none(), "{body}");
     assert_eq!(st.supervisor.current().await.0, 1);
     let w = st.supervisor.current().await.1;

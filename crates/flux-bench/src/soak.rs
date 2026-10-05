@@ -261,8 +261,19 @@ pub async fn soak(
         if next_pressure.is_some_and(|t| Instant::now() >= t) {
             // Threshold 1 GiB below what is free now, then a 2 GiB allocation crosses it.
             let threshold = mem_available_mib().saturating_sub(1024);
-            let set = |m: u64| http.post(format!("{}/flux/admission", server.base)).json(&json!({"min_available_mib": m})).send();
-            let _ = set(threshold).await;
+            let previous_reserve = http.get(format!("{}/flux/stats", server.base)).send().await.ok();
+            let previous_reserve = match previous_reserve {
+                Some(r) => r.json::<serde_json::Value>().await.ok().and_then(|v| v["admission"]["host_reserve_bytes"].as_u64()),
+                None => None,
+            };
+            let Some(previous_reserve) = previous_reserve else {
+                // a reserve the episode cannot read back, it could not restore
+                log("fault skipped: /flux/stats did not report the admission reserve");
+                next_pressure = opts.pressure_every.map(|d| Instant::now() + d);
+                continue;
+            };
+            let set = |bytes: u64| http.post(format!("{}/flux/admission", server.base)).json(&json!({"host_reserve_bytes": bytes})).send();
+            let _ = set(threshold << 20).await;
             log(&format!("fault: admission threshold {threshold} MiB, allocating a 2 GiB ballast"));
             report.lock().unwrap().pressure_episodes += 1;
             in_episode.store(true, Ordering::Relaxed);
@@ -277,7 +288,7 @@ pub async fn soak(
                 }
             }
             drop(std::hint::black_box(ballast));
-            let _ = set(cfg.serve.min_available_mib).await;
+            let _ = set(previous_reserve).await;
             // Let the monitor observe recovery before refusals count against the server again.
             tokio::time::sleep(Duration::from_secs(3)).await;
             in_episode.store(false, Ordering::Relaxed);

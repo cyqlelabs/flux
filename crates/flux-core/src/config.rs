@@ -18,6 +18,8 @@ pub struct FluxConfig {
     pub models_dir: PathBuf,
     /// Pinned llama.cpp checkout with its `build/bin`.
     pub llama_dir: PathBuf,
+    /// Percentage of total host RAM left for the OS and other processes.
+    pub host_reserve_percent: u32,
     pub plan: PlanConfig,
     pub serve: ServeConfig,
     /// Additional OpenAI-compatible engines, selectable by name.
@@ -31,8 +33,6 @@ pub struct PlanConfig {
     /// Device memory held back per GPU beyond the backend's own accounting: the CUDA context, cuBLAS
     /// workspace, the temporary-buffer pool and graph instances (about 240 MiB measured). See `device_reserve`.
     pub device_reserve_mib: u64,
-    /// Host memory left for the OS and other processes.
-    pub host_reserve_mib: u64,
     pub finalists: usize,
     pub calibration_prompts: usize,
     pub validation_prompts: usize,
@@ -51,8 +51,8 @@ pub struct ServeConfig {
     pub port: u16,
     pub queue_depth: usize,
     pub max_body_bytes: usize,
-    /// Stop admitting new requests when MemAvailable falls below this.
-    pub min_available_mib: u64,
+    /// Minimum reply space required at admission; max_tokens remains a ceiling.
+    pub min_reply: u32,
     pub journal_ttl_s: u64,
     /// Tokens the server still expects to generate. When decode drift is established and the time it
     /// would save over this horizon exceeds the cost of retuning, the server replans by itself. 0 disables.
@@ -99,6 +99,7 @@ impl Default for FluxConfig {
             models_dir: data.join("models"),
             data_dir: data,
             llama_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../third_party/llama.cpp"),
+            host_reserve_percent: 10,
             plan: PlanConfig::default(),
             serve: ServeConfig::default(),
             engines: BTreeMap::new(),
@@ -116,7 +117,7 @@ impl PlanConfig {
 
 impl Default for PlanConfig {
     fn default() -> Self {
-        PlanConfig { tuning_budget_s: 600.0, device_reserve_mib: 256, host_reserve_mib: 6144, finalists: 3, calibration_prompts: 3, validation_prompts: 4 }
+        PlanConfig { tuning_budget_s: 600.0, device_reserve_mib: 256, finalists: 3, calibration_prompts: 3, validation_prompts: 4 }
     }
 }
 
@@ -133,7 +134,7 @@ impl Default for ServeConfig {
             port: 8090,
             queue_depth: 64,
             max_body_bytes: 8 << 20,
-            min_available_mib: 2048,
+            min_reply: 4096,
             journal_ttl_s: 600,
             retune_horizon_tokens: 0,
         }
@@ -141,6 +142,10 @@ impl Default for ServeConfig {
 }
 
 impl FluxConfig {
+    pub fn host_reserve_bytes(&self, total: u64) -> u64 {
+        host_reserve_bytes(total, self.host_reserve_percent)
+    }
+
     pub fn load() -> Result<FluxConfig> {
         let path = std::env::var_os("FLUX_CONFIG").map(PathBuf::from).unwrap_or_else(|| expand_home("~/.config/flux/flux.toml"));
         if !path.exists() {
@@ -151,7 +156,16 @@ impl FluxConfig {
 
     pub fn load_from(path: &Path) -> Result<FluxConfig> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let values: toml::Value = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        for (section, key) in [("plan", "host_reserve_mib"), ("serve", "min_available_mib")] {
+            anyhow::ensure!(
+                values.get(section).and_then(|v| v.get(key)).is_none(),
+                "{section}.{key} was replaced by top-level host_reserve_percent (default 10)"
+            );
+        }
         let mut cfg: FluxConfig = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        anyhow::ensure!(cfg.host_reserve_percent <= 100, "host_reserve_percent must be between 0 and 100");
+        anyhow::ensure!(cfg.serve.min_reply > 0, "serve.min_reply must be positive");
         for p in [&mut cfg.data_dir, &mut cfg.cache_dir, &mut cfg.models_dir, &mut cfg.llama_dir] {
             *p = expand_home(&p.to_string_lossy());
         }
@@ -177,6 +191,16 @@ impl FluxConfig {
     }
 }
 
+pub fn host_reserve_bytes(total: u64, percent: u32) -> u64 {
+    (total as u128 * percent.min(100) as u128).div_ceil(100) as u64
+}
+
+/// RAM above the reserve that admission waits for before reopening after memory pressure. Serving KV pages
+/// leave it free too, so pages that idle conversations still hold never keep admission closed.
+pub fn reopen_margin(reserve: u64) -> u64 {
+    (reserve / 2).min(1 << 30)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +219,25 @@ mod tests {
         assert_eq!(c.plan.tuning_budget_s, 60.0);
         assert_eq!(c.plan.finalists, 3);
         assert_eq!(c.serve.host, "127.0.0.1");
+        assert_eq!(c.serve.min_reply, 4096);
+        assert_eq!(c.host_reserve_bytes(64 << 30), ((64u64 << 30) + 9) / 10);
         assert_eq!(c.engines["strata"].health_path, "/health");
+    }
+
+    #[test]
+    fn host_reserve_rounds_up_without_overflow() {
+        assert_eq!(host_reserve_bytes(1, 10), 1);
+        assert_eq!(host_reserve_bytes(100, 10), 10);
+        assert_eq!(host_reserve_bytes(u64::MAX, 100), u64::MAX);
+    }
+
+    #[test]
+    fn invalid_reserve_and_reply_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flux.toml");
+        for config in ["host_reserve_percent = 101", "[serve]\nmin_reply = 0", "[plan]\nhost_reserve_mib = 6144", "[serve]\nmin_available_mib = 2048"] {
+            std::fs::write(&path, config).unwrap();
+            assert!(FluxConfig::load_from(&path).is_err());
+        }
     }
 }

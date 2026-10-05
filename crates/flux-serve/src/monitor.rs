@@ -15,7 +15,7 @@ pub struct MemSample {
     pub swapped_in: u64,
 }
 
-fn read_kib(meminfo: &str, key: &str) -> Option<u64> {
+pub(crate) fn read_kib(meminfo: &str, key: &str) -> Option<u64> {
     meminfo.lines().find(|l| l.starts_with(key))?.split_whitespace().nth(1)?.parse().ok()
 }
 
@@ -33,11 +33,11 @@ const SWAP_IN_PAGES_PER_S: u64 = 256;
 /// `min` is available (with plenty free, swap-in is old pages being touched, not pressure); reopens
 /// only once `min` plus a margin (half of `min`, at most 1 GiB) is available again.
 pub fn pressure(s: MemSample, min: u64, currently_closed: bool) -> Option<String> {
-    let need = if currently_closed { min + (min / 2).min(1 << 30) } else { min };
+    let need = if currently_closed { min.saturating_add(flux_core::config::reopen_margin(min)) } else { min };
     let short = if currently_closed { s.available <= need } else { s.available < need };
     if short {
         Some(format!("host memory pressure: {} MiB available, {} MiB required", s.available >> 20, need >> 20))
-    } else if s.swapped_in > SWAP_IN_PAGES_PER_S && s.available < 2 * min {
+    } else if s.swapped_in > SWAP_IN_PAGES_PER_S && s.available < min.saturating_mul(2) {
         Some(format!("host is swapping ({} pages in)", s.swapped_in))
     } else {
         None
@@ -68,7 +68,7 @@ pub fn spawn(st: Arc<AppState>) -> tokio::task::JoinSet<()> {
             let s = MemSample { available: read_kib(&meminfo, "MemAvailable:").unwrap_or(0) * 1024, swapped_in: swap.saturating_sub(last_swap) };
             last_swap = swap;
             let closed_by_us = st.pressure_closed.load(Ordering::Relaxed);
-            match pressure(s, st.min_available_mib.load(Ordering::Relaxed) << 20, closed_by_us) {
+            match pressure(s, st.host_reserve_bytes.load(Ordering::Relaxed), closed_by_us) {
                 Some(reason) => {
                     if !closed_by_us {
                         tracing::warn!("{reason}: admission closed");

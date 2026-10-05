@@ -4,7 +4,7 @@
 use crate::plan::Plan;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Unset fields keep the backend's defaults, so every engine samples the same way for the same request.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -38,6 +38,11 @@ pub struct Sampling {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
+    /// Sets the RAM reserve before the next step: admission's threshold and, plus the reopen margin, the RAM the native page ledger leaves free.
+    Admission {
+        host_reserve_bytes: u64,
+        min_reply: u32,
+    },
     Hello {
         protocol: u32,
     },
@@ -144,6 +149,19 @@ pub struct DeviceMemory {
     pub device: String,
     pub model: u64,
     pub context: u64,
+    /// Reserved address space; paged caches back only the active stream prefixes.
+    #[serde(default)]
+    pub context_capacity: u64,
+    /// Page-rounded KV capacities by placement class, from the backend.
+    #[serde(default)]
+    pub kv_full_read: u64,
+    #[serde(default)]
+    pub kv_dense: u64,
+    #[serde(default)]
+    pub kv_sparse: u64,
+    /// Full-read capacity plus the attention floor on this device.
+    #[serde(default)]
+    pub kv_floor: u64,
     pub compute: u64,
     /// The part of `compute` that stages op-offloaded expert weights during prefill; an expert cache at least
     /// this large on the device holds it instead.
@@ -161,6 +179,8 @@ pub struct WorkerStats {
     pub step_ms_p95: f64,
     pub memory: Vec<DeviceMemory>,
     pub rss_bytes: u64,
+    #[serde(default)]
+    pub kv_pages: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -41,6 +41,7 @@ enum ProbeKind {
     Matmul,
     Copy,
     Contention,
+    HostPages,
     Supports,
 }
 
@@ -92,6 +93,7 @@ fn main() -> Result<()> {
                 ProbeKind::Matmul => flux_native::probe_matmul,
                 ProbeKind::Copy => flux_native::probe_copy,
                 ProbeKind::Contention => flux_native::probe_contention,
+                ProbeKind::HostPages => flux_native::probe_host_pages,
                 ProbeKind::Supports => flux_native::supports,
             };
             print_result(stdin_json().and_then(|r| f(&r)));

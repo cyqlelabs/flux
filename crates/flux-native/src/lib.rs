@@ -76,11 +76,15 @@ mod ffi {
         pub fn fx_probe_matmul(req: *const c_char) -> *mut c_char;
         pub fn fx_probe_copy(req: *const c_char) -> *mut c_char;
         pub fn fx_probe_contention(req: *const c_char) -> *mut c_char;
+        pub fn fx_probe_host_pages(req: *const c_char) -> *mut c_char;
         pub fn fx_supports(req: *const c_char) -> *mut c_char;
 
         pub fn fx_engine_load(params: *const c_char, error: *mut *mut c_char) -> *mut Engine;
         pub fn fx_engine_free(e: *mut Engine);
         pub fn fx_engine_info(e: *mut Engine) -> *mut c_char;
+        pub fn fx_seq_reserve(e: *mut Engine, seq: i32, cells: u32) -> bool;
+        pub fn fx_seq_release(e: *mut Engine, seq: i32);
+        pub fn fx_host_reserve(e: *mut Engine, bytes: u64);
         pub fn fx_tokenize(e: *mut Engine, text: *const c_char, len: i32, add_special: bool, out: *mut i32, cap: i32) -> i32;
         pub fn fx_token_piece(e: *mut Engine, token: i32, special: bool, buf: *mut c_char, cap: i32) -> i32;
         pub fn fx_is_eog(e: *mut Engine, token: i32) -> bool;
@@ -144,6 +148,10 @@ pub fn probe_copy(req: &Value) -> Result<Value> {
 
 pub fn probe_contention(req: &Value) -> Result<Value> {
     call(ffi::fx_probe_contention, req)
+}
+
+pub fn probe_host_pages(req: &Value) -> Result<Value> {
+    call(ffi::fx_probe_host_pages, req)
 }
 
 pub fn supports(req: &Value) -> Result<Value> {
@@ -245,6 +253,18 @@ impl Engine {
 
     pub fn seq_clear(&mut self, seq: i32) {
         unsafe { ffi::fx_seq_clear(self.ptr.as_ptr(), seq) }
+    }
+
+    pub fn seq_reserve(&mut self, seq: i32, cells: u32) -> bool {
+        unsafe { ffi::fx_seq_reserve(self.ptr.as_ptr(), seq, cells) }
+    }
+
+    pub fn seq_release(&mut self, seq: i32) {
+        unsafe { ffi::fx_seq_release(self.ptr.as_ptr(), seq) }
+    }
+
+    pub fn host_reserve(&mut self, bytes: u64) {
+        unsafe { ffi::fx_host_reserve(self.ptr.as_ptr(), bytes) }
     }
 
     /// Saves the sequence's recurrent state at its current end, for prompt reuse.
@@ -394,5 +414,12 @@ mod tests {
     fn cpu_matmul_probe_times_runs() {
         let v = probe_matmul(&serde_json::json!({"device": "CPU", "type": "q8_0", "k": 512, "n": 256, "batches": [1], "iters": 3, "threads": 2})).unwrap();
         assert_eq!(v["results"][0]["micros"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn host_pages_report_unsupported_cpu_backend() {
+        let result = probe_host_pages(&serde_json::json!({"device":"CPU"})).unwrap();
+        assert_eq!(result["unsupported"], "host-page link probing requires a GPU");
+        assert!(result.get("streaming_gbps").is_none());
     }
 }

@@ -62,6 +62,24 @@ The CPU is a device in every plan, not a fallback for what the GPUs cannot hold.
 
 While serving, the CPU computes its experts at the same time as the GPU computes the rest of the layer. Prompt chunks of 32 tokens or more copy those experts to the GPU instead, where the larger batch runs faster. Each chunk copies every expert it uses, so during a long prompt the GPU's expert cache lends its memory to the chunks: a chunk then holds several thousand tokens instead of about a thousand, and the prompt copies the experts fewer times. Flux lends only when that copies fewer bytes in total, counting the cached experts it must copy back before generating.
 
+## Long contexts
+
+`flux plan` gives each model its trained context: 262,144 tokens for Qwen3.8-Flash-Next. The KV cache does not take that memory up front. It reserves address space for the whole context and commits 2 MiB pages as a conversation grows:
+
+- The first 65,536 tokens of attention KV per sequence stay in VRAM, so conversations up to that length run as fast as before. So do the caches every step reads in full, such as the pooled indexer keys and the draft layer.
+- Past that, pages go to pinned RAM on GPUs whose kernels can read it; `flux probe` measures each GPU's rate while the CPU streams weights. Sparse attention, as in Flash-Next, then reads only the cells its indexer selects. Dense attention reads every cell, so dense models decode more slowly at those depths.
+- A prompt chunk deeper than 65,536 tokens either copies each layer's RAM pages to VRAM once or reads them in place. Flux times both and keeps the faster. Chunks also shrink to fit the compute buffers, and borrow the KV page budget that no page holds yet; very long prompts still prefill more slowly.
+- `flux serve` gives KV pages the RAM available when it starts, minus the weights it pins and a reserve of 10% of RAM (`host_reserve_percent`). `flux plan` caps the context only when that RAM cannot hold the trained one.
+
+A request that memory cannot hold fails at admission with OpenAI's `context_length_exceeded` error; a running step never fails for lack of memory. Each request must leave at least `min(max_tokens, serve.min_reply)` tokens for the reply (`min_reply` defaults to 4,096), and `max_tokens` stays a ceiling.
+
+Clients learn the limit in two ways:
+
+- `/v1/models` reports it as `context_length`, `max_model_len` and `meta.n_ctx`.
+- An overflow returns HTTP 400 with the code `context_length_exceeded` and the message "This model's maximum context length is N tokens. However, your messages resulted in M tokens." Qwen Code compresses its history when it sees it.
+
+`flux show <plan>` prints the page budgets. `/flux/stats` reports memory by use: in RAM the pinned weights, KV pages and worker RSS; per GPU the weights, KV and state, and compute buffers.
+
 ## Build
 
 ```sh
@@ -119,7 +137,7 @@ Run `flux <command> --help` for every flag.
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--ctx` | 65536, or the model's trained context if shorter | Tokens per sequence the plan must hold, prompt plus output |
+| `--ctx` | The model's trained context, capped only when RAM cannot hold its KV pages | Tokens per sequence the plan must hold, prompt plus output |
 | `--concurrency` | 1 | Concurrent sequences the plan must hold |
 | `--serving-p95-ms` | off | Optimize aggregate tokens per second under this p95 per-token latency |
 | `--engines` | `native,llama-server` | Engines to compare, including any named in `flux.toml` |
@@ -161,7 +179,7 @@ Run `flux <command> --help` for every flag.
 | `GET /flux/stats` | Report admission, decode drift, and worker counters |
 | `POST /flux/replan` | Drain, plan again, and switch; restore the old plan if the new one fails to load |
 | `POST /flux/tokenize` | Tokenize text with the model's vocabulary |
-| `POST /flux/admission` | Set the free host memory below which new requests are refused |
+| `POST /flux/admission` | Adjust the host-memory reserve with `{"host_reserve_bytes": N}` |
 | `GET /flux/requests/{id}` | Return a journaled request's status and text |
 | `GET /flux/requests/{id}/stream?after=N` | Read retained output starting at event index `N` (default 0) |
 
@@ -180,6 +198,7 @@ Flux reads `$FLUX_CONFIG`, then `~/.config/flux/flux.toml`. Every field has a de
 ```toml
 models_dir = "/data/models"       # where flux fetch writes
 cache_dir = "/data/flux-cache"    # hash index, prepared artifacts, corpora
+host_reserve_percent = 10        # percentage of total RAM kept free
 
 [plan]
 tuning_budget_s = 600
@@ -191,6 +210,7 @@ decode_timeout_s = 120
 client_write_timeout_s = 30
 replan_timeout_s = 3600
 journal_max_bytes = 268435456
+min_reply = 4096
 
 [serve.worker_timeouts]
 hello_s = 30
@@ -207,6 +227,8 @@ architectures = ["qwen3moe"]
 
 Plans, probe reports, logs, and benchmark results live in `$XDG_DATA_HOME/flux`, which defaults to `~/.local/share/flux`. `flux serve` writes worker output to `logs/serve-worker.log` there. All defaults are in `crates/flux-core/src/config.rs`.
 
+Planning and serving use one host-memory reserve, 10% of total RAM by default. The old `plan.host_reserve_mib` and `serve.min_available_mib` settings are rejected with a migration message; use `host_reserve_percent` instead. `/flux/stats` reports the current reserve in bytes. A runtime override through `/flux/admission` lasts until the server restarts. `max_completion_tokens` takes precedence over `max_tokens`.
+
 <details>
 <summary>Environment variables</summary>
 
@@ -218,8 +240,10 @@ Plans, probe reports, logs, and benchmark results live in `$XDG_DATA_HOME/flux`,
 | `FLUX_WORKER` | Path of the worker binary (default: `flux-worker` next to `flux`) |
 | `FLUX_MOE_HOST_PROFILE=1` | Time host (CPU) expert work per step |
 | `FLUX_CUDA_OP_PROFILE=1` | Time each CUDA operation |
+| `FLUX_CUDA_OP_PROFILE=2` | Time every CUDA operation without truncating the op table |
 | `FLUX_MOE_HOST_SYNC=1` | Stop overlapping CPU experts with the GPU |
 | `FLUX_MOE_CACHE_FREEZE=1` | Stop the GPU expert cache from adapting |
+| `FLUX_MOE_TIER_WAIT=1` | Wait for a second GPU's expert tier instead of recomputing its late work on the CPU, so greedy outputs repeat exactly |
 | `GGML_OP_OFFLOAD_MIN_BATCH` | Batch size at which ops on host weights move to a GPU (default 32) |
 
 </details>

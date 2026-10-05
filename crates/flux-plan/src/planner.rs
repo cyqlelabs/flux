@@ -19,7 +19,7 @@ use flux_core::protocol::DeviceMemory;
 use flux_core::worker::{oneshot_job, Worker};
 use flux_probe::sampler::Sampler;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -51,7 +51,7 @@ impl PlanRequest {
     pub fn policy_key(&self, cfg: &FluxConfig) -> String {
         flux_core::fsutil::sha256_hex(
             serde_json::to_string(&json!({
-                "revision": 2, "request": self, "planning": cfg.plan, "engines": cfg.engines
+                "revision": 3, "request": self, "planning": cfg.plan, "host_reserve_percent": cfg.host_reserve_percent, "engines": cfg.engines
             }))
             .expect("planning policy serializes")
             .as_bytes(),
@@ -104,6 +104,9 @@ struct Ctx<'a> {
     n_ctx_seq: u32,
     log: &'a (dyn Fn(&str) + Sync),
     backend_build: String,
+    host_available_at_plan: u64,
+    /// GPUs whose kernels read paged host memory, so attention KV past the floor may live in RAM.
+    host_reads: HashSet<String>,
 }
 
 impl Ctx<'_> {
@@ -128,6 +131,10 @@ impl Ctx<'_> {
             type_v: self.runtime.type_v.clone(),
             op_offload: self.runtime.op_offload,
             kv_unified: false,
+            kv_paging: self.runtime.kv_paging.clone(),
+            qsa_pooled: self.runtime.qsa_pooled,
+            qsa_blocks: self.runtime.qsa_blocks,
+            qsa_indexed: self.runtime.qsa_indexed,
             speculation: None,
             expert_cache: None,
             expert_cache_frozen: false,
@@ -145,8 +152,23 @@ impl Ctx<'_> {
 
     async fn measure_params(&self, params: &BackendParams) -> Result<Vec<DeviceMemory>> {
         let v = oneshot_job(&["measure"], &serde_json::to_value(params)?).await?;
-        Ok(serde_json::from_value(v["memory"].clone())?)
+        let mut m: Vec<DeviceMemory> = serde_json::from_value(v["memory"].clone())?;
+        // The dry run reports paged KV at the floor; a GPU that cannot read host pages keeps all of it in VRAM.
+        for d in m.iter_mut().filter(|d| d.device != CPU && !self.host_reads.contains(&d.device)) {
+            d.context += kv_past_floor(d);
+        }
+        Ok(m)
     }
+}
+
+/// Attention KV a device holds past the VRAM floor at full context.
+fn kv_past_floor(d: &DeviceMemory) -> u64 {
+    (d.kv_dense + d.kv_sparse).saturating_sub(d.kv_floor.saturating_sub(d.kv_full_read))
+}
+
+/// RAM the KV pages of a measured placement take at full context: attention past the floor on GPUs that read host pages.
+fn host_kv(m: &[DeviceMemory], host_reads: &HashSet<String>) -> u64 {
+    m.iter().filter(|d| host_reads.contains(&d.device)).map(kv_past_floor).sum()
 }
 
 /// Tensor-parallel buffers are reported on the backend's meta device as one total; apportion them
@@ -162,6 +184,11 @@ fn apportion_meta(measured: Vec<DeviceMemory>, p: &Placement) -> Vec<DeviceMemor
                 Some(x) => {
                     x.model += share(m.model);
                     x.context += share(m.context);
+                    x.context_capacity += share(m.context_capacity);
+                    x.kv_full_read += share(m.kv_full_read);
+                    x.kv_dense += share(m.kv_dense);
+                    x.kv_sparse += share(m.kv_sparse);
+                    x.kv_floor += share(m.kv_floor);
                     x.compute += share(m.compute);
                     x.staging += share(m.staging);
                 }
@@ -169,6 +196,11 @@ fn apportion_meta(measured: Vec<DeviceMemory>, p: &Placement) -> Vec<DeviceMemor
                     device: d.clone(),
                     model: share(m.model),
                     context: share(m.context),
+                    context_capacity: share(m.context_capacity),
+                    kv_full_read: share(m.kv_full_read),
+                    kv_dense: share(m.kv_dense),
+                    kv_sparse: share(m.kv_sparse),
+                    kv_floor: share(m.kv_floor),
                     compute: share(m.compute),
                     staging: share(m.staging),
                 }),
@@ -271,6 +303,37 @@ fn capped_orders(classes: &[Vec<String>]) -> Vec<Vec<String>> {
     out
 }
 
+/// The longest context, at most the requested one, whose attention KV past the VRAM floor fits in the RAM the weights
+/// leave, and the RAM those pages take. Measured with every layer on the GPU with the most free memory that reads host
+/// pages: weights no GPU can hold stay in RAM whatever the placement.
+async fn ram_context(ctx: &Ctx<'_>, gpus: &[&BackendDevice], host_avail: u64) -> Result<(u32, u64)> {
+    let floor = ctx.runtime.kv_paging.as_ref().map_or(ctx.n_ctx_seq, |p| p.floor_tokens);
+    let Some(g) = gpus.iter().filter(|g| ctx.host_reads.contains(&g.name)).max_by_key(|g| g.mem_free) else { return Ok((ctx.n_ctx_seq, 0)) };
+    if ctx.n_ctx_seq <= floor {
+        return Ok((ctx.n_ctx_seq, 0));
+    }
+    let n_all = ctx.manifest.facts.as_ref().map_or(0, |f| (f.n_layer + f.n_layer_nextn) as usize);
+    let p = Placement {
+        devices: vec![g.name.clone()],
+        layer_device: vec![g.name.clone(); n_all],
+        output_device: g.name.clone(),
+        overrides: vec![],
+        n_gpu_layers: n_all as i32 + 1,
+        tensor_split: vec![1.0],
+        split_mode: SplitMode::Layer,
+    };
+    let need = host_kv(&ctx.measure(&p, ctx.req.n_ubatch).await.context("dry run of the full context")?, &ctx.host_reads);
+    let gpu_room: u64 = gpus.iter().map(|g| g.mem_free.saturating_sub(ctx.cfg.plan.device_reserve(g))).sum();
+    let weights: u64 = ctx.manifest.tensors.iter().map(|t| t.bytes).sum();
+    let room = host_avail.saturating_sub(weights.saturating_sub(gpu_room));
+    if need <= room {
+        return Ok((ctx.n_ctx_seq, need));
+    }
+    let past = (ctx.n_ctx_seq - floor) as u128 * room as u128 / need as u128;
+    let fitted = (floor as u64 + past as u64) / 256 * 256;
+    Ok((fitted as u32, room))
+}
+
 fn mem_available() -> u64 {
     std::fs::read_to_string("/proc/meminfo")
         .ok()
@@ -309,13 +372,14 @@ pub async fn plan(
             }
         }
     }
-    let n_ctx_seq = req.workload.n_ctx_seq.div_ceil(256) * 256;
+    let mut n_ctx_seq = req.workload.n_ctx_seq.div_ceil(256) * 256;
     if facts.n_ctx_train > 0 && n_ctx_seq > facts.n_ctx_train {
         bail!("{n_ctx_seq} tokens per sequence exceeds the trained context of {}; Flux does not change context semantics", facts.n_ctx_train);
     }
 
     let flux_probe::native::Backend { devices, pin, build } = flux_probe::native::backend().await?;
     ensure!(pin == report.backend_revision, "the probe report was measured with backend {}, this build runs {pin}: run `flux probe`", report.backend_revision);
+    ensure!(build == report.backend_build, "the probe report is from a different backend build: run `flux probe`");
     let mut decisions: Vec<Decision> = vec![];
 
     // Device capability: every encoding must have a native kernel, or the device is excluded.
@@ -340,7 +404,9 @@ pub async fn plan(
     }
 
     let threads = report.decode_cpu_bandwidth().map_or(report.inventory.cpu.cores, |b| b.threads);
-    let runtime = RuntimeParams {
+    let host_reserve = cfg.host_reserve_bytes(report.inventory.memory.total);
+    let host_reads: HashSet<String> = gpus.iter().filter(|g| report.host_pages(&g.name).is_some()).map(|g| g.name.clone()).collect();
+    let mut runtime = RuntimeParams {
         // Prompt chunks grow past n_ubatch while the attention reads few cells (the backend measures how far), up to
         // the batch the worker hands it.
         n_batch: PROMPT_BATCH.min(n_ctx_seq).max(req.n_ubatch),
@@ -354,8 +420,35 @@ pub async fn plan(
         mlock: req.mlock,
         op_offload: true,
         speculation: None,
+        // Pages grow with the conversation; the flash-attention layout keeps a prefix of cells on whole pages.
+        kv_paging: Some(KvPaging { floor_tokens: KV_FLOOR_TOKENS.min(n_ctx_seq), stage_prompts: true, host_budget: 0, host_reserve, devices: vec![] }),
+        // Pooled indexer keys and block selection keep the reference's cells, and decode attention reads only those
+        // cells, so KV pages in RAM cost a few scattered reads per step; only indexer models use them.
+        qsa_pooled: true,
+        qsa_blocks: true,
+        qsa_indexed: true,
     };
-    let ctx = Ctx { cfg, manifest, req, runtime: runtime.clone(), n_ctx_seq, log, backend_build: build };
+    let mut ctx =
+        Ctx { cfg, manifest, req, runtime: runtime.clone(), n_ctx_seq, log, backend_build: build, host_available_at_plan: mem_available(), host_reads };
+    let host_avail = ctx.host_available_at_plan.saturating_sub(host_reserve);
+    let (fitted, host_kv_need) = ram_context(&ctx, &gpus, host_avail).await?;
+    decisions.push(Decision {
+        resource: "context".into(),
+        used: true,
+        reason: if fitted < n_ctx_seq {
+            format!("{fitted} tokens per sequence, capped from {n_ctx_seq}: the RAM the weights leave holds no more KV pages")
+        } else if n_ctx_seq == facts.n_ctx_train {
+            format!("{n_ctx_seq} tokens per sequence, the model's trained context")
+        } else {
+            format!("{n_ctx_seq} tokens per sequence, as requested")
+        },
+    });
+    if fitted < n_ctx_seq {
+        n_ctx_seq = fitted;
+        runtime.kv_paging.as_mut().unwrap().floor_tokens = KV_FLOOR_TOKENS.min(n_ctx_seq);
+        ctx.n_ctx_seq = n_ctx_seq;
+        ctx.runtime = runtime.clone();
+    }
     let tk = GgmlType::from_name(&req.type_k).context("unknown cache type")?;
     let tv = GgmlType::from_name(&req.type_v).context("unknown cache type")?;
     let lay = layout(manifest, &facts, req.workload.concurrency as u64, n_ctx_seq as u64, tk, tv, req.mlock);
@@ -389,7 +482,6 @@ pub async fn plan(
         gpus.iter().map(|g| (g.name.clone(), g.mem_free.saturating_sub(reserve(g) + compute.get(&(g.name.clone(), ub)).copied().unwrap_or(0)))).collect()
     };
     let capacity = capacity_for(req.n_ubatch);
-    let host_avail = mem_available().saturating_sub(cfg.plan.host_reserve_mib << 20);
 
     let cost = CostModel::from_report(report, threads);
     let shape = Shape {
@@ -435,7 +527,7 @@ pub async fn plan(
                 order: order.clone(),
                 capacity: caps.clone(),
                 host_experts: !req.expert_residency,
-                host_capacity: (!req.allow_storage_streaming).then(|| host_avail.saturating_sub(host_compute)),
+                host_capacity: (!req.allow_storage_streaming).then(|| host_avail.saturating_sub(host_compute + host_kv_need)),
             };
             let Some(a) = search(&inp) else {
                 rejected.push(format!("order [{}]: no feasible placement", order.join(",")));
@@ -588,8 +680,26 @@ pub async fn plan(
             finalists.push(c.clone());
         }
     }
+    // Other engines allocate the whole KV cache up front, so they can run only plans whose cache stays in VRAM.
+    let paged_to_ram = finalists.first().map_or(0, |f| host_kv(&f.measured, &ctx.host_reads));
+    let engines: Vec<EngineKind> = req
+        .engines
+        .iter()
+        .filter(|e| {
+            let keep = **e == EngineKind::Native || paged_to_ram == 0;
+            if !keep {
+                decisions.push(Decision {
+                    resource: e.to_string(),
+                    used: false,
+                    reason: format!("allocates the KV cache in full; {n_ctx_seq} tokens put {} of it in RAM", fmt_bytes(paged_to_ram)),
+                });
+            }
+            keep
+        })
+        .cloned()
+        .collect();
     let mut runs: Vec<Candidate> = vec![];
-    for e in &req.engines {
+    for e in &engines {
         for (i, f) in finalists.iter().enumerate() {
             // Alternative engines are compared on the best placement only.
             if *e == EngineKind::Native || i == 0 {
@@ -617,7 +727,7 @@ pub async fn plan(
     };
     // llama-server drafts with a draft model or the model's heads, on the fastest predicted placement that
     // leaves room; the native engine drafts with the heads on measured placements, after calibration.
-    let server_spec = req.speculation && req.engines.contains(&EngineKind::LlamaServer) && !drafters.is_empty();
+    let server_spec = req.speculation && engines.contains(&EngineKind::LlamaServer) && !drafters.is_empty();
     let mut draft_base: Option<Candidate> = None;
     if server_spec {
         for c in &cands {
@@ -659,11 +769,11 @@ pub async fn plan(
             }
         }
     }
-    let native_mtp = req.speculation && req.engines.contains(&EngineKind::Native) && drafters.iter().any(|(k, _)| k == "draft-mtp");
+    let native_mtp = req.speculation && engines.contains(&EngineKind::Native) && drafters.iter().any(|(k, _)| k == "draft-mtp");
 
     // Calibration, then a race of the top two on separate validation prompts.
     let budget = Duration::from_secs_f64(cfg.plan.tuning_budget_s);
-    let base_plan = |c: &Candidate| -> Plan { assemble(&ctx, &facts.architecture, &identity, report, &devices, c, host_avail, vec![], None) };
+    let base_plan = |c: &Candidate| -> Plan { assemble(&ctx, &facts.architecture, &identity, report, &devices, c, vec![], None) };
     let mut results: Vec<(usize, CandidateResult, Option<RunSummary>)> = vec![];
     for (i, c) in runs.iter().enumerate() {
         if t_start.elapsed() > budget && !results.is_empty() {
@@ -868,12 +978,16 @@ pub async fn plan(
     // Long prompts: one request a quarter of the planned context deep, so the choice also holds for clients that
     // send long prompts. The contenders are the two best short-prompt runs and the best of every other chunk
     // size and GPU set, the settings long prompts expose; ranking them needs no assumption about the mix of requests.
-    let depth_tokens = (n_ctx_seq / 4).min(n_ctx_seq.saturating_sub(2 * req.decode_tokens));
+    // Past the VRAM floor KV pages may live in RAM: the floor is the deepest prompt every placement serves at full speed.
+    let floor = runtime.kv_paging.as_ref().map_or(n_ctx_seq, |p| p.floor_tokens);
+    let depth_tokens = (n_ctx_seq / 4).min(floor).min(n_ctx_seq.saturating_sub(2 * req.decode_tokens));
     let deep = matches!(req.workload.objective, Objective::Interactive) && depth_tokens >= 4 * req.prompt_tokens;
     if deep {
         let mut contenders: Vec<usize> = ranked.iter().copied().take(2).collect();
+        // A prompt as deep as the floor takes minutes; past the floor the two best short-prompt runs contend alone.
+        let max_contenders = if n_ctx_seq > floor { 2 } else { MAX_CONTENDERS };
         for &k in &ranked {
-            if contenders.len() >= MAX_CONTENDERS {
+            if contenders.len() >= max_contenders {
                 break;
             }
             let run = |c: usize| &runs[results[c].0];
@@ -958,7 +1072,7 @@ pub async fn plan(
             Objective::Serving { max_p95_token_ms } => format!("highest aggregate tokens/s with p95 token latency within {max_p95_token_ms} ms"),
         },
     };
-    let mut plan = assemble(&ctx, &facts.architecture, &identity, report, &devices, chosen, host_avail, decisions, Some(validation));
+    let mut plan = assemble(&ctx, &facts.architecture, &identity, report, &devices, chosen, decisions, Some(validation));
     explain(&mut plan, &lay, &cost, &shape, &devices, chosen, &results.iter().map(|r| (runs[r.0].clone(), r.2.clone())).collect::<Vec<_>>(), &rejected);
     plan.id = plan.compute_id();
     Ok(plan)
@@ -991,7 +1105,6 @@ fn assemble(
     report: &ProbeReport,
     devices: &[BackendDevice],
     c: &Candidate,
-    host_avail: u64,
     decisions: Vec<Decision>,
     validation: Option<ValidationRecord>,
 ) -> Plan {
@@ -1019,6 +1132,68 @@ fn assemble(
         0 => c.assignment.bytes.get(CPU).copied().unwrap_or(0),
         measured => measured,
     };
+    let kv_paging = ctx.runtime.kv_paging.as_ref().map(|p| KvPaging {
+        host_budget: ctx.host_available_at_plan.saturating_sub(p.host_reserve + host_weights + c.host_compute),
+        devices: kv_budgets(ctx, devices, &c.measured),
+        ..p.clone()
+    });
+    let mut decisions = decisions;
+    // The context's RAM cap was estimated before placement; the chosen candidate's own pages decide it.
+    let n_ctx_seq = kv_paging.as_ref().map_or(ctx.n_ctx_seq, |p| {
+        let need = host_kv(&c.measured, &ctx.host_reads);
+        if need <= p.host_budget || ctx.n_ctx_seq <= p.floor_tokens {
+            return ctx.n_ctx_seq;
+        }
+        let past = (ctx.n_ctx_seq - p.floor_tokens) as u128 * p.host_budget as u128 / need as u128;
+        ((p.floor_tokens as u64 + past as u64) / 256 * 256) as u32
+    });
+    if n_ctx_seq < ctx.n_ctx_seq {
+        decisions.push(Decision {
+            resource: "context".into(),
+            used: true,
+            reason: format!("{n_ctx_seq} tokens per sequence, capped from {}: the chosen placement's KV pages need more RAM than it leaves", ctx.n_ctx_seq),
+        });
+    }
+    if let Some(p) = &kv_paging {
+        let places: Vec<String> = p
+            .devices
+            .iter()
+            .map(|d| match report.host_pages(&d.device).filter(|_| d.host_reads) {
+                Some(h) => {
+                    // dense attention reads every cell each step, so its pages past the floor bound decode at depth
+                    let dense: u64 = c.measured.iter().filter(|m| m.device == d.device).map(|m| m.kv_dense).sum();
+                    let past = (dense as u128 * ctx.n_ctx_seq.saturating_sub(p.floor_tokens) as u128 / ctx.n_ctx_seq.max(1) as u128) as u64;
+                    let cost = if past > 0 {
+                        format!(
+                            "; dense attention reads {} per step from RAM at {} tokens, about {:.0} ms",
+                            fmt_bytes(past),
+                            ctx.n_ctx_seq,
+                            h.read_s(past, false) * 1e3
+                        )
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "{} reads RAM pages at {:.1} GB/s streamed, {:.1} scattered, under CPU load{cost}",
+                        d.device, h.streaming_contended_gbps, h.scattered_contended_gbps
+                    )
+                }
+                None => format!("{} keeps all of its KV in VRAM (no host-page reads)", d.device),
+            })
+            .collect();
+        decisions.push(Decision {
+            resource: "KV pages".into(),
+            used: true,
+            reason: format!(
+                "{}/{}; {} tokens per sequence stay in VRAM, then {}; {} of RAM",
+                ctx.runtime.type_k,
+                ctx.runtime.type_v,
+                p.floor_tokens,
+                places.join(", "),
+                fmt_bytes(p.host_budget)
+            ),
+        });
+    }
     let mut plan = Plan {
         schema: PLAN_SCHEMA,
         id: String::new(),
@@ -1029,21 +1204,22 @@ fn assemble(
             backend_revision: report.backend_revision.clone(),
             backend_build: ctx.backend_build.clone(),
             driver: report.inventory.driver_version.clone().unwrap_or_default(),
-            ctx_bucket: ctx_bucket(ctx.n_ctx_seq),
+            // keyed by the request, which `flux plan` looks up again, even when RAM caps the context served
+            ctx_bucket: ctx_bucket(ctx.req.workload.n_ctx_seq.div_ceil(256) * 256),
             concurrency: ctx.req.workload.concurrency,
             policy: ctx.req.policy_key(ctx.cfg),
         },
         model_files: ctx.manifest.paths(),
         architecture: arch.into(),
         engine: c.engine.clone(),
-        workload: Workload { n_ctx_seq: ctx.n_ctx_seq, ..ctx.req.workload.clone() },
+        workload: Workload { n_ctx_seq, ..ctx.req.workload.clone() },
         placement: c.placement.clone(),
-        runtime: RuntimeParams { speculation: c.speculation.clone(), n_ubatch: c.n_ubatch, ..ctx.runtime.clone() },
+        runtime: RuntimeParams { speculation: c.speculation.clone(), n_ubatch: c.n_ubatch, kv_paging, ..ctx.runtime.clone() },
         budgets,
         host: HostBudget {
             capacity: report.inventory.memory.total,
-            available_at_plan: host_avail + (ctx.cfg.plan.host_reserve_mib << 20),
-            os_reserve: ctx.cfg.plan.host_reserve_mib << 20,
+            available_at_plan: ctx.host_available_at_plan,
+            os_reserve: ctx.cfg.host_reserve_bytes(report.inventory.memory.total),
             resident_weights: host_weights,
             mirrored_weights: 0,
             pinned_buffers: if ctx.req.mlock { host_weights } else { 0 },
@@ -1060,6 +1236,26 @@ fn assemble(
     };
     plan.id = plan.compute_id();
     plan
+}
+
+/// VRAM for KV pages per GPU: its floor (plus all of its attention KV when it cannot read host pages) and whatever the
+/// placement leaves free; pages past it go to RAM. `flux serve` adds memory freed since planning.
+fn kv_budgets(ctx: &Ctx, devices: &[BackendDevice], measured: &[DeviceMemory]) -> Vec<KvDeviceBudget> {
+    measured
+        .iter()
+        .filter(|m| m.device != CPU && m.kv_full_read + m.kv_dense + m.kv_sparse > 0)
+        .filter_map(|m| {
+            let d = devices.iter().find(|d| d.name == m.device)?;
+            let spare = d.mem_free.saturating_sub(ctx.cfg.plan.device_reserve(d) + total(measured, &d.name));
+            let host_reads = ctx.host_reads.contains(&d.name);
+            Some(KvDeviceBudget {
+                device: d.name.clone(),
+                bytes: m.kv_floor + if host_reads { 0 } else { kv_past_floor(m) } + spare,
+                full_read_reserve: m.kv_full_read,
+                host_reads,
+            })
+        })
+        .collect()
 }
 
 /// Per-expert residency on `base`: chooses each GPU block's most-routed experts (by `routes`) within the
@@ -1794,6 +1990,9 @@ mod tests {
         assert_ne!(previous, req.policy_key(&cfg));
         previous = req.policy_key(&cfg);
         cfg.plan.validation_prompts += 1;
+        assert_ne!(previous, req.policy_key(&cfg));
+        previous = req.policy_key(&cfg);
+        cfg.host_reserve_percent += 1;
         assert_ne!(previous, req.policy_key(&cfg));
     }
 

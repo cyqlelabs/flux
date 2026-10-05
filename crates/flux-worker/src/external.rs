@@ -158,6 +158,7 @@ impl State {
                     });
                 }
             }
+            Request::Admission { .. } => {}
             Request::Stats { id } => {
                 let stats = WorkerStats { active: self.active.lock().unwrap().len() as u32, rss_bytes: crate::rss_bytes(), ..Default::default() };
                 self.out.send(&Event::Stats { id, stats });

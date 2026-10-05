@@ -35,8 +35,8 @@ pub struct AppState {
     pub admission: Admission,
     pub journal: Journal,
     pub pressure_closed: AtomicBool,
-    /// Admission closes when MemAvailable falls below this (MiB); adjustable at run time.
-    pub min_available_mib: std::sync::atomic::AtomicU64,
+    /// Admission closes when MemAvailable falls below this reserve; adjustable at run time.
+    pub host_reserve_bytes: std::sync::atomic::AtomicU64,
     pub drift: Mutex<monitor::Drift>,
     pub live: live::Live,
     pub model_name: String,
@@ -63,19 +63,22 @@ fn validated_rates(p: &Plan) -> monitor::Rates {
 pub async fn build(cfg: FluxConfig, plan: Plan, replanner: Option<Replanner>) -> Result<Arc<AppState>> {
     anyhow::ensure!(!plan.model_files.is_empty() && plan.workload.concurrency > 0, "plan needs a model and positive concurrency");
     let logs = cfg.data_dir.join("logs");
+    let total = monitor::read_kib(&std::fs::read_to_string("/proc/meminfo")?, "MemTotal:").ok_or_else(|| anyhow::anyhow!("cannot read total host memory"))?;
+    let host_reserve_bytes = cfg.host_reserve_bytes(total.saturating_mul(1024));
     std::fs::create_dir_all(&logs)?;
     let model_name = plan.model_files[0].file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     let concurrency = plan.workload.concurrency as usize;
     let rates = validated_rates(&plan);
     let tuning = plan.clone();
     let supervisor = Supervisor::start_with(plan, logs.join("serve-worker.log"), cfg.serve.worker_timeouts.clone()).await?;
+    supervisor.current().await.1.send(&flux_core::protocol::Request::Admission { host_reserve_bytes, min_reply: cfg.serve.min_reply }).await?;
     let drift = monitor::Drift::new(rates, retune_cost_s(&tuning, supervisor.loaded().await.load_ms));
     let level = supervisor.current().await.1.level.clone();
     Ok(Arc::new(AppState {
         admission: Admission::new(concurrency, cfg.serve.queue_depth),
         journal: Journal::with_limit(Duration::from_secs(cfg.serve.journal_ttl_s), cfg.serve.journal_max_bytes),
         pressure_closed: AtomicBool::new(false),
-        min_available_mib: std::sync::atomic::AtomicU64::new(cfg.serve.min_available_mib),
+        host_reserve_bytes: std::sync::atomic::AtomicU64::new(host_reserve_bytes),
         drift: Mutex::new(drift),
         live: live::Live::default(),
         model_name,
@@ -106,6 +109,8 @@ pub fn router(st: Arc<AppState>) -> Router {
         .route("/flux/requests/{id}", get(openai::request_entry))
         .route("/flux/requests/{id}/stream", get(openai::resume))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(limit))
+        // the extractors' own 2 MB default would refuse long contexts below the configured limit
+        .layer(axum::extract::DefaultBodyLimit::max(limit))
         .with_state(st)
 }
 
@@ -132,14 +137,25 @@ async fn health(State(st): State<Arc<AppState>>) -> Response {
     (status, Json(json!({"status": if closed.is_some() { "closed" } else { "ok" }, "reason": closed, "plan": st.supervisor.plan().await.id}))).into_response()
 }
 
-/// Adjusts the host-memory admission threshold (`{"min_available_mib": N}`); the server binds locally.
+/// Adjusts the host-memory reserve in bytes; the server binds locally.
 async fn admission(State(st): State<Arc<AppState>>, Json(body): Json<serde_json::Value>) -> Response {
-    match body.get("min_available_mib").and_then(|v| v.as_u64()) {
+    match body.get("host_reserve_bytes").and_then(|v| v.as_u64()) {
         Some(m) => {
-            st.min_available_mib.store(m, std::sync::atomic::Ordering::Relaxed);
-            Json(json!({"min_available_mib": m})).into_response()
+            // stored first: requests resend the stored reserve, and one that read the old value must not undo this
+            st.host_reserve_bytes.store(m, std::sync::atomic::Ordering::Relaxed);
+            if let Err(e) = st
+                .supervisor
+                .current()
+                .await
+                .1
+                .send(&flux_core::protocol::Request::Admission { host_reserve_bytes: m, min_reply: st.cfg.serve.min_reply })
+                .await
+            {
+                return openai::error(StatusCode::SERVICE_UNAVAILABLE, "worker_unavailable", e.to_string());
+            }
+            Json(json!({"host_reserve_bytes": m})).into_response()
         }
-        None => openai::error(StatusCode::BAD_REQUEST, "invalid_request_error", "expected {\"min_available_mib\": N}"),
+        None => openai::error(StatusCode::BAD_REQUEST, "invalid_request_error", "expected {\"host_reserve_bytes\": N}"),
     }
 }
 
@@ -164,12 +180,26 @@ async fn stats(State(st): State<Arc<AppState>>) -> Response {
     let Ok(_slot) = st.control_slots.try_acquire() else { return openai::error(StatusCode::TOO_MANY_REQUESTS, "control_busy", "control queue full") };
     let (gen, w) = st.supervisor.current().await;
     let worker = if st.level == "tokens" || w.engine != "native" { w.stats().await.ok() } else { None };
+    let host_weights = st.supervisor.plan().await.host.resident_weights;
+    // KV pages live in VRAM up to each GPU's budget and in pinned RAM past it
+    let memory = worker.as_ref().map(|w| {
+        let kv_ram: u64 = w.kv_pages.as_object().map_or(0, |classes| classes.values().filter_map(|c| c["ram_bytes"].as_u64()).sum());
+        let vram: Vec<_> = w
+            .memory
+            .iter()
+            .filter(|m| m.device != "CPU")
+            .map(|m| json!({"device": m.device, "weights": m.model, "kv_and_state": m.context, "compute": m.compute}))
+            .collect();
+        json!({"ram": {"host_weights": host_weights, "kv_pages": kv_ram, "worker_rss": w.rss_bytes}, "vram": vram})
+    });
     let d = st.drift.lock().unwrap();
     Json(json!({
         "uptime_s": st.started.elapsed().as_secs(),
         "worker_generation": gen,
         "engine": w.engine,
         "admission": {
+            "host_reserve_bytes": st.host_reserve_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            "min_reply": st.cfg.serve.min_reply,
             "closed": st.admission.closed_reason(),
             "running": st.admission.in_use(st.concurrency),
             "waiting": st.admission.waiting(),
@@ -179,6 +209,7 @@ async fn stats(State(st): State<Arc<AppState>>) -> Response {
         "journal_running": st.journal.running(),
         "drift": {"baseline_tps": d.baseline_tps, "agent_baseline_tps": d.agent_tps, "recent_tps": d.recent_tps, "recent_vs_expected": d.recent_ratio, "drifted": d.drifted},
         "requests": st.live.snapshot(),
+        "memory": memory,
         "worker": worker,
     }))
     .into_response()

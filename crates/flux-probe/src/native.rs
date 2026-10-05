@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use flux_core::config::FluxConfig;
 use flux_core::fsutil::{read_json, write_json_atomic};
 use flux_core::ggml_type::GgmlType;
-use flux_core::hardware::{BackendDevice, ContentionProbe, CopyCurve, CopyDirection, CopyPoint, CpuBandwidth, KernelProbe, ProbeReport};
+use flux_core::hardware::{BackendDevice, ContentionProbe, CopyCurve, CopyDirection, CopyPoint, CpuBandwidth, HostPageProbe, KernelProbe, ProbeReport};
 use flux_core::model::ModelManifest;
 use flux_core::stats::Summary;
 use flux_core::worker::oneshot_job;
@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-pub const SCHEMA: u32 = 1;
+pub const SCHEMA: u32 = 2;
 
 pub struct ProbeOptions<'a> {
     pub quick: bool,
@@ -82,6 +82,29 @@ fn dram_sized(s: &Shape, min_bytes: u64) -> Shape {
 
 /// Larger than the last-level cache of any desktop CPU.
 const CPU_PROBE_BYTES: u64 = 512 << 20;
+
+fn host_page_probe_bytes() -> u64 {
+    let llc = std::fs::read_dir("/sys/devices/system/cpu/cpu0/cache")
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| std::fs::read_to_string(e.path().join("size")).ok())
+        .filter_map(|s| {
+            let s = s.trim();
+            let (digits, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+            let scale = match unit {
+                "K" => 1024,
+                "M" => 1 << 20,
+                "" => 1,
+                _ => return None,
+            };
+            digits.parse::<u64>().ok()?.checked_mul(scale)
+        })
+        .max()
+        .unwrap_or(0);
+    CPU_PROBE_BYTES.max(llc.saturating_mul(2)).div_ceil(2 << 20) * (2 << 20)
+}
 
 fn generic_shapes() -> Vec<Shape> {
     ["q4_K", "q8_0", "f16"].iter().map(|t| Shape { ggml_type: GgmlType::from_name(t).unwrap(), k: 4096, n: 4096, source: None }).collect()
@@ -163,7 +186,7 @@ pub async fn backend() -> Result<Backend> {
 
 /// Runs every probe and returns the report; `log` receives one line per step.
 pub async fn run(opts: &ProbeOptions<'_>, log: &(dyn Fn(&str) + Sync)) -> Result<ProbeReport> {
-    let Backend { devices, pin, .. } = backend().await?;
+    let Backend { devices, pin, build } = backend().await?;
     let inventory = tokio::task::spawn_blocking(move || crate::inventory::inventory(devices)).await??;
     let gpus: Vec<&BackendDevice> = inventory.backend_devices.iter().filter(|d| d.kind == "gpu").collect();
     let iters = if opts.quick { 4 } else { 10 };
@@ -217,6 +240,35 @@ pub async fn run(opts: &ProbeOptions<'_>, log: &(dyn Fn(&str) + Sync)) -> Result
     }
     let best_threads = flux_core::hardware::decode_threads(&cpu_bandwidth, cores).map_or(cores, |b| b.threads);
 
+    let mut host_pages = vec![];
+    for g in &gpus {
+        log(&format!("host-page reads {}: streaming and four-cell blocks under CPU load", g.name));
+        let bytes = host_page_probe_bytes();
+        // A failed read check rules out RAM pages on this GPU; it does not invalidate the rest of the probe.
+        let v = oneshot_job(&["probe", "host-pages"], &json!({"device":g.name,"bytes":bytes,"threads":best_threads,"seconds":seconds}))
+            .await
+            .unwrap_or_else(|e| json!({"unsupported": format!("{e:#}")}));
+        let unsupported = v["unsupported"].as_str().map(str::to_owned);
+        if let Some(reason) = &unsupported {
+            log(&format!("{} host pages unavailable: {reason}", g.name));
+            host_pages.push(HostPageProbe {
+                device: g.name.clone(),
+                buffer_bytes: 0,
+                block_cells: 4,
+                cpu_threads: best_threads,
+                streaming_gbps: 0.0,
+                scattered_gbps: 0.0,
+                streaming_contended_gbps: 0.0,
+                scattered_contended_gbps: 0.0,
+                unsupported,
+            });
+        } else {
+            let mut result = v;
+            result["device"] = json!(g.name);
+            host_pages.push(serde_json::from_value(result).context("invalid host-page probe result")?);
+        }
+    }
+
     let mut kernels = vec![];
     let prefill = if opts.quick { 256 } else { 512 };
     for dev in gpus.iter().map(|g| (g.name.as_str(), 0u32, g.mem_free)).chain(std::iter::once(("CPU", best_threads, u64::MAX))) {
@@ -256,6 +308,7 @@ pub async fn run(opts: &ProbeOptions<'_>, log: &(dyn Fn(&str) + Sync)) -> Result
         schema: SCHEMA,
         topology: inventory.topology_fingerprint(),
         backend_revision: pin,
+        backend_build: build,
         created: chrono::Utc::now(),
         inventory,
         copies,
@@ -263,6 +316,7 @@ pub async fn run(opts: &ProbeOptions<'_>, log: &(dyn Fn(&str) + Sync)) -> Result
         kernels,
         cpu_bandwidth,
         storage,
+        host_pages,
     })
 }
 
@@ -294,8 +348,10 @@ pub fn save(cfg: &FluxConfig, r: &ProbeReport, model: Option<&ModelManifest>) ->
 }
 
 /// A stored report for this topology and backend, if one exists.
-pub fn load(cfg: &FluxConfig, topology: &str, backend_revision: &str, model: Option<&ModelManifest>) -> Option<ProbeReport> {
-    read_json::<ProbeReport>(&report_path(cfg, topology, model)).ok().filter(|r| r.schema == SCHEMA && r.backend_revision == backend_revision)
+pub fn load(cfg: &FluxConfig, topology: &str, backend_revision: &str, backend_build: &str, model: Option<&ModelManifest>) -> Option<ProbeReport> {
+    read_json::<ProbeReport>(&report_path(cfg, topology, model))
+        .ok()
+        .filter(|r| r.schema == SCHEMA && r.backend_revision == backend_revision && r.backend_build == backend_build)
 }
 
 #[cfg(test)]

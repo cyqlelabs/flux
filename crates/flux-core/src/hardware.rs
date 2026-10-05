@@ -206,11 +206,75 @@ pub struct StorageProbe {
     pub gbps: Summary,
 }
 
+/// Kernel reads of paged host memory, in GB/s; transfer curves measure a different path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostPageProbe {
+    pub device: String,
+    pub buffer_bytes: u64,
+    pub block_cells: u32,
+    pub cpu_threads: u32,
+    pub streaming_gbps: f64,
+    pub scattered_gbps: f64,
+    pub streaming_contended_gbps: f64,
+    pub scattered_contended_gbps: f64,
+    /// Unsupported VMM or host allocations retain the reason and zero rates.
+    pub unsupported: Option<String>,
+}
+
+impl HostPageProbe {
+    /// Kernels on this GPU read paged host memory: the probe ran and measured both access patterns.
+    pub fn supported(&self) -> bool {
+        self.unsupported.is_none() && [self.streaming_contended_gbps, self.scattered_contended_gbps].iter().all(|g| g.is_finite() && *g > 0.0)
+    }
+
+    /// Seconds a decode step spends reading `bytes` of KV from host pages while the CPU streams weights; sparse
+    /// attention reads scattered blocks of cells, dense attention streams them.
+    pub fn read_s(&self, bytes: u64, sparse: bool) -> f64 {
+        let gbps = if sparse { self.scattered_contended_gbps } else { self.streaming_contended_gbps };
+        if self.supported() {
+            bytes as f64 / (gbps * 1e9)
+        } else {
+            f64::INFINITY
+        }
+    }
+}
+
+#[cfg(test)]
+mod host_page_tests {
+    use super::*;
+
+    #[test]
+    fn host_reads_use_the_contended_kernel_rate() {
+        let mut p = HostPageProbe {
+            device: "CUDA0".into(),
+            buffer_bytes: 512 << 20,
+            block_cells: 4,
+            cpu_threads: 8,
+            streaming_gbps: 20.0,
+            scattered_gbps: 10.0,
+            streaming_contended_gbps: 5.0,
+            scattered_contended_gbps: 2.0,
+            unsupported: None,
+        };
+        assert!(p.supported());
+        assert_eq!(p.read_s(5_000_000_000, false), 1.0);
+        assert_eq!(p.read_s(2_000_000_000, true), 1.0);
+        p.scattered_contended_gbps = 0.0;
+        assert!(!p.supported());
+        p.scattered_contended_gbps = 2.0;
+        p.unsupported = Some("no host VMM".into());
+        assert!(!p.supported());
+        assert!(p.read_s(1, false).is_infinite());
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProbeReport {
     pub schema: u32,
     pub topology: String,
     pub backend_revision: String,
+    #[serde(default)]
+    pub backend_build: String,
     pub created: chrono::DateTime<chrono::Utc>,
     pub inventory: HardwareInventory,
     pub copies: Vec<CopyCurve>,
@@ -218,11 +282,18 @@ pub struct ProbeReport {
     pub kernels: Vec<KernelProbe>,
     pub cpu_bandwidth: Vec<CpuBandwidth>,
     pub storage: Vec<StorageProbe>,
+    #[serde(default)]
+    pub host_pages: Vec<HostPageProbe>,
 }
 
 impl ProbeReport {
     pub fn copy_curve(&self, device: &str, direction: CopyDirection, pinned: bool) -> Option<&CopyCurve> {
         self.copies.iter().find(|c| c.device == device && c.direction == direction && c.pinned == pinned && c.peer.is_none())
+    }
+
+    /// Whether `device` reads paged host memory, per the host-page probe.
+    pub fn host_pages(&self, device: &str) -> Option<&HostPageProbe> {
+        self.host_pages.iter().find(|p| p.device == device && p.supported())
     }
 
     /// Decode CPU bandwidth and the thread count chosen for it (see `decode_threads`).

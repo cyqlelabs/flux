@@ -70,11 +70,13 @@ pub struct NativeWorker {
     out: Out,
     engine: Option<Engine>,
     n_ctx_seq: u32,
+    min_reply: u32,
     n_batch: usize,
     /// Draft tokens per step when the plan speculates (0 otherwise).
     spec_n_max: usize,
     /// Recurrent state: prompt reuse restores it from checkpoints taken at each sequence's marks.
     recurrent: bool,
+    paged: bool,
     seqs: Vec<Seq>,
     free: Vec<i32>,
     /// Tokens each idle slot still holds from its last request, reused by the next prompt sharing them.
@@ -92,9 +94,11 @@ impl NativeWorker {
             out,
             engine: None,
             n_ctx_seq: 0,
+            min_reply: 4096,
             n_batch: 0,
             spec_n_max: 0,
             recurrent: false,
+            paged: false,
             seqs: vec![],
             free: vec![],
             cached: vec![],
@@ -171,6 +175,10 @@ impl NativeWorker {
             };
         }
         match r {
+            Request::Admission { host_reserve_bytes, min_reply } => {
+                self.min_reply = min_reply.max(1);
+                self.engine.as_mut().unwrap().host_reserve(host_reserve_bytes.saturating_add(flux_core::config::reopen_margin(host_reserve_bytes)));
+            }
             Request::Hello { protocol } if protocol != PROTOCOL_VERSION => {
                 self.error(None, None, ErrorCode::Protocol, format!("worker speaks protocol {PROTOCOL_VERSION}, supervisor sent {protocol}"))
             }
@@ -259,6 +267,7 @@ impl NativeWorker {
                 self.n_batch = info["n_batch"].as_u64().unwrap_or(params.n_batch as u64) as usize;
                 self.spec_n_max = info["spec_n_max"].as_u64().unwrap_or(0) as usize;
                 self.recurrent = info["recurrent"].as_bool().unwrap_or(false);
+                self.paged = params.kv_paging.is_some();
                 let n_seq = info["n_seq"].as_u64().unwrap_or(params.n_seq as u64) as u32;
                 self.free = (0..n_seq as i32).rev().collect();
                 self.cached = vec![vec![]; n_seq as usize];
@@ -305,11 +314,33 @@ impl NativeWorker {
         let reuse = common(&self.cached[slot as usize]);
         let kept = self.engine.as_mut().unwrap().seq_keep(slot, reuse);
         self.cached[slot as usize].clear();
+        let reserve = (prompt.len() as u32).saturating_add(max_tokens.min(self.min_reply)).saturating_add(self.spec_n_max as u32).min(self.n_ctx_seq);
+        if !self.engine.as_mut().unwrap().seq_reserve(slot, reserve) {
+            let mut low = kept as u32;
+            let mut high = reserve;
+            while low + 1 < high {
+                let mid = low + (high - low) / 2;
+                if self.engine.as_mut().unwrap().seq_reserve(slot, mid) {
+                    low = mid;
+                } else {
+                    high = mid;
+                }
+            }
+            self.engine.as_mut().unwrap().seq_clear(slot);
+            self.engine.as_mut().unwrap().seq_release(slot);
+            self.free.push(slot);
+            return self.reject(
+                &req,
+                ErrorCode::ContextFull,
+                format!("This model's maximum context length is {low} tokens. However, your messages resulted in {} tokens. The available memory cannot reserve the prompt and reply floor.", prompt.len()),
+            );
+        }
         let engine = self.engine.as_ref().unwrap();
         let runner_up = sampling.runner_up.unwrap_or(false);
         let mut sampler = match Sampler::new(engine, &serde_json::to_value(sampling).unwrap()) {
             Ok(s) => s,
             Err(e) => {
+                self.engine.as_mut().unwrap().seq_release(slot);
                 self.free.push(slot);
                 return self.reject(&req, ErrorCode::BadRequest, e.to_string());
             }
@@ -346,10 +377,30 @@ impl NativeWorker {
     }
 
     fn step(&mut self) {
+        let mut undrafted = HashSet::new();
+        // Reserve before either drafter or target runs. Admission already holds the reply floor.
+        for i in (0..self.seqs.len()).rev() {
+            let s = &self.seqs[i];
+            if s.wants_decode() {
+                let cells = (s.pos as u32).saturating_add(1 + self.spec_n_max as u32).min(self.n_ctx_seq);
+                if !self.engine.as_mut().unwrap().seq_reserve(s.slot, cells) {
+                    if self.engine.as_mut().unwrap().seq_reserve(s.slot, (s.pos as u32).saturating_add(1).min(self.n_ctx_seq)) {
+                        undrafted.insert(s.slot);
+                    } else {
+                        self.finish(i, FinishReason::Length);
+                    }
+                }
+            }
+        }
         // Rotate batch priority so a batch smaller than the active set cannot starve later slots.
         if self.seqs.len() > 1 {
             self.seqs.rotate_left(1);
         }
+        // Separate paged streams keep their own depth: a mixed graph reads every stream through the deepest
+        // stream's padded KV prefix, so only decoding streams within twice each other's depth share a step.
+        let selected = self.paged.then(|| self.seqs.iter().position(|s| s.wants_decode() || !s.prefill_done())).flatten();
+        let lead = selected.filter(|&i| self.seqs[i].wants_decode()).map(|i| self.seqs[i].pos.max(1));
+        let joins = |s: &Seq| lead.is_some_and(|d| s.pos.max(1) <= 2 * d && d <= 2 * s.pos.max(1));
         let (mut tokens, mut pos, mut seqid, mut logits) = (vec![], vec![], vec![], vec![]);
         // (sequence index, batch row, draft) for the rows sampled after the step; the draft follows the row.
         let mut sample_rows: Vec<(usize, i32, Vec<i32>)> = vec![];
@@ -361,10 +412,14 @@ impl NativeWorker {
             if !self.seqs[i].wants_decode() {
                 continue;
             }
+            if self.paged && selected != Some(i) && !joins(&self.seqs[i]) {
+                continue;
+            }
             let s = &self.seqs[i];
             // Every drafted token must be emittable: within credit, max_tokens and the planned context.
             let room = (s.credit as usize).min((s.max_tokens - s.emitted) as usize).min((self.n_ctx_seq as i32 - s.pos) as usize);
-            let n_draft = self.spec_n_max.min(room.saturating_sub(1)).min(self.n_batch.saturating_sub(tokens.len() + 1));
+            let n_draft =
+                if undrafted.contains(&s.slot) { 0 } else { self.spec_n_max.min(room.saturating_sub(1)).min(self.n_batch.saturating_sub(tokens.len() + 1)) };
             let draft = if n_draft > 0 { self.engine.as_mut().unwrap().spec_draft(s.slot, s.pos, s.next.unwrap(), &s.kv, n_draft) } else { vec![] };
             sample_rows.push((i, tokens.len() as i32, draft.clone()));
             decode_rows.push(i);
@@ -378,7 +433,7 @@ impl NativeWorker {
         let budget = self.n_batch.saturating_sub(tokens.len());
         let mut chunk: Option<(usize, usize)> = None;
         if budget > 0 {
-            if let Some(i) = self.seqs.iter().position(|s| !s.prefill_done()) {
+            if let Some(i) = self.seqs.iter().enumerate().position(|(i, s)| !s.prefill_done() && (!self.paged || selected == Some(i))) {
                 let s = &self.seqs[i];
                 // Recurrent models stop at each mark first: the state there is checkpointed for reuse.
                 let end = if self.recurrent { s.marks.iter().copied().find(|&m| m > s.prefilled).unwrap_or(s.prompt.len()) } else { s.prompt.len() };
@@ -555,6 +610,7 @@ impl NativeWorker {
         } else {
             self.cached[s.slot as usize] = std::mem::take(&mut s.kv);
         }
+        self.engine.as_mut().unwrap().seq_release(s.slot);
         self.free.push(s.slot);
     }
 
@@ -571,6 +627,7 @@ impl NativeWorker {
             step_ms_p95: pct(0.95),
             memory: self.engine.as_ref().and_then(|e| e.info().ok()).map(|i| memory_of(&i)).unwrap_or_default(),
             rss_bytes: crate::rss_bytes(),
+            kv_pages: self.engine.as_ref().and_then(|e| e.info().ok()).and_then(|i| i.get("kv_pages").cloned()).unwrap_or_default(),
         }
     }
 }

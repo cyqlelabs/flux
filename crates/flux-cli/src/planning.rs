@@ -50,10 +50,10 @@ pub async fn corpus(cfg: &FluxConfig) -> Result<Corpus> {
 
 /// The stored probe report for this topology, backend and model, or a fresh one.
 pub async fn probe_report(cfg: &FluxConfig, model: Option<&ModelManifest>, quick: bool, fresh: bool) -> Result<ProbeReport> {
-    let native::Backend { devices, pin, .. } = native::backend().await?;
+    let native::Backend { devices, pin, build } = native::backend().await?;
     let topology = tokio::task::spawn_blocking(move || flux_probe::inventory::inventory(devices)).await??.topology_fingerprint();
     if !fresh {
-        if let Some(r) = native::load(cfg, &topology, &pin, model) {
+        if let Some(r) = native::load(cfg, &topology, &pin, &build, model) {
             log(&format!("using probe report from {}", r.created.format("%Y-%m-%d %H:%M")));
             return Ok(r);
         }
@@ -107,6 +107,22 @@ pub fn print_probe(r: &ProbeReport) {
     }
     for c in &r.contention {
         println!("contention  {}: {:.1} GB/s alone, {:.1} GB/s contended", c.scenario, c.alone_gbps, c.contended_gbps);
+    }
+    for p in &r.host_pages {
+        if let Some(reason) = &p.unsupported {
+            println!("host pages  {}: unavailable ({reason})", p.device);
+        } else {
+            println!(
+                "host pages  {}: stream {:.1}/{:.1}, blocks {:.1}/{:.1} GB/s alone/contended ({} CPU threads, {})",
+                p.device,
+                p.streaming_gbps,
+                p.streaming_contended_gbps,
+                p.scattered_gbps,
+                p.scattered_contended_gbps,
+                p.cpu_threads,
+                fmt_bytes(p.buffer_bytes)
+            );
+        }
     }
     for b in &r.cpu_bandwidth {
         println!("cpu         {:>2} threads: {:.1} GB/s weight reads", b.threads, b.gbps.p50);
@@ -177,6 +193,23 @@ pub fn print_plan(p: &Plan) {
         "runtime     {} threads ({} batch), ubatch {}, flash-attn {}, KV {}/{}",
         p.runtime.n_threads, p.runtime.n_threads_batch, p.runtime.n_ubatch, p.runtime.flash_attn, p.runtime.type_k, p.runtime.type_v
     );
+    if let Some(k) = &p.runtime.kv_paging {
+        println!(
+            "kv pages    {} tokens per sequence in VRAM, then up to {} of RAM ({} kept free; serving recomputes both)",
+            k.floor_tokens,
+            fmt_bytes(k.host_budget),
+            fmt_bytes(k.host_reserve)
+        );
+        for d in &k.devices {
+            println!(
+                "            {}: {} of VRAM, {} of it for caches read in full; {}",
+                d.device,
+                fmt_bytes(d.bytes),
+                fmt_bytes(d.full_read_reserve),
+                if d.host_reads { "RAM past it" } else { "no RAM pages" }
+            );
+        }
+    }
     for b in p.budgets.iter().filter(|b| p.placement.uses_device(&b.device)) {
         let m = b.measured.unwrap_or(b.predicted);
         println!(
@@ -264,6 +297,28 @@ pub async fn fit(cfg: &FluxConfig, mut plan: Plan) -> Result<Plan> {
             fmt_bytes(short),
             plan.id,
             plan.expert_cache.as_ref().map_or(0, |c| c.hot_experts)
+        );
+    }
+    // KV pages get the RAM free now, after the weights the worker pins, and the VRAM spare now in place of the spare at planning.
+    if let Some(k) = plan.runtime.kv_paging.as_mut() {
+        let meminfo = std::fs::read_to_string("/proc/meminfo")?;
+        let kib = |key: &str| -> Option<u64> { meminfo.lines().find(|l| l.starts_with(key))?.split_whitespace().nth(1)?.parse::<u64>().ok() };
+        let total = kib("MemTotal:").context("cannot read total host memory")? * 1024;
+        let available = kib("MemAvailable:").context("cannot read available host memory")? * 1024;
+        k.host_reserve = cfg.host_reserve_bytes(total);
+        k.host_budget = available.saturating_sub(k.host_reserve + plan.host.resident_weights + plan.host.state_and_scratch);
+        for d in &mut k.devices {
+            let (Some(b), Some(free)) = (budgets.iter().find(|b| b.device == d.device), devices.iter().find(|x| x.name == d.device).map(|x| x.mem_free)) else {
+                continue;
+            };
+            let spare = |free: u64| free.saturating_sub(b.reserve).saturating_sub(b.required());
+            d.bytes = d.bytes.saturating_sub(spare(b.free_at_plan)) + spare(free);
+        }
+        tracing::info!(
+            "KV pages: {} of RAM ({} kept free), VRAM {}",
+            fmt_bytes(k.host_budget),
+            fmt_bytes(k.host_reserve),
+            k.devices.iter().map(|d| format!("{} {}", d.device, fmt_bytes(d.bytes))).collect::<Vec<_>>().join(", ")
         );
     }
     Ok(plan)

@@ -1,11 +1,11 @@
 //! Bounded streaming and request lifecycle. Partial replies fail explicitly on worker loss:
 //! token IDs cannot restore detokenization, parser IDs, or sampler state.
 use crate::{journal::Status, AppState};
-use flux_core::protocol::{Event, FinishReason, Sampling};
+use flux_core::protocol::{ErrorCode, Event, FinishReason, Request, Sampling};
 use flux_core::worker::ChatOptions;
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, time::Duration};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 const CREDIT: u32 = 16;
 const MAX_RESTARTS: u32 = 2;
@@ -21,6 +21,7 @@ pub struct Outcome {
     pub n_prompt: u32,
     pub n_completion: u32,
     pub error: Option<String>,
+    pub error_code: Option<ErrorCode>,
     pub decode_tps: Option<f64>,
     pub message: Option<Value>,
     pub finish_reason: Option<String>,
@@ -68,14 +69,25 @@ async fn deliver(st: &AppState, tx: &mpsc::Sender<Piece>, p: Piece, measured: &m
     }
 }
 
-pub async fn run_tokens(st: &AppState, job: TokenJob, tx: mpsc::Sender<Piece>) -> Outcome {
-    let mut outcome = token_inner(st, &job, &tx).await;
+pub async fn run_tokens(st: &AppState, job: TokenJob, tx: mpsc::Sender<Piece>, admission: oneshot::Sender<Result<(), Outcome>>) -> Outcome {
+    let mut admission = Some(admission);
+    let mut outcome = token_inner(st, &job, &tx, &mut admission).await;
     outcome.n_prompt = job.prompt.len() as u32;
     finish(st, &job.id, &mut outcome);
+    if let Some(admission) = admission {
+        let _ = admission.send(Err(outcome.clone()));
+    }
     outcome
 }
 
-async fn token_inner(st: &AppState, job: &TokenJob, tx: &mpsc::Sender<Piece>) -> Outcome {
+/// Lets the HTTP handler send its headers: past this point a failure streams instead of returning a status.
+fn admit(admission: &mut Option<oneshot::Sender<Result<(), Outcome>>>) {
+    if let Some(admission) = admission.take() {
+        let _ = admission.send(Ok(()));
+    }
+}
+
+async fn token_inner(st: &AppState, job: &TokenJob, tx: &mpsc::Sender<Piece>, admission: &mut Option<oneshot::Sender<Result<(), Outcome>>>) -> Outcome {
     let mut emitted = 0;
     for attempt in 0..=MAX_RESTARTS {
         let (generation, w) = st.supervisor.current().await;
@@ -84,9 +96,20 @@ async fn token_inner(st: &AppState, job: &TokenJob, tx: &mpsc::Sender<Piece>) ->
         let mut times = Vec::new();
         let mut error = None;
         let mut prefilling = true;
-        let started =
-            w.start(&req, job.prompt.clone(), job.sampling.clone(), job.stop.clone(), job.max_tokens, job.render_special.clone(), job.chat.clone()).await;
+        // A restarted worker has lost the run-time reserve, so every attempt sends it again.
+        let admission_control =
+            Request::Admission { host_reserve_bytes: st.host_reserve_bytes.load(std::sync::atomic::Ordering::Relaxed), min_reply: st.cfg.serve.min_reply };
+        let started = match w.send(&admission_control).await {
+            Ok(()) => {
+                w.start(&req, job.prompt.clone(), job.sampling.clone(), job.stop.clone(), job.max_tokens, job.render_special.clone(), job.chat.clone()).await
+            }
+            Err(e) => Err(e),
+        };
         if let Ok(mut rx) = started {
+            // Only the native worker rejects at admission; an external engine's first event comes after its prefill.
+            if w.engine != "native" {
+                admit(admission);
+            }
             let mut credit = CREDIT;
             if w.credit(&req, CREDIT).await.is_ok() {
                 loop {
@@ -101,6 +124,9 @@ async fn token_inner(st: &AppState, job: &TokenJob, tx: &mpsc::Sender<Piece>) ->
                             return Outcome { reason: Some(FinishReason::Cancelled), n_completion: emitted, ..Default::default() };
                         }
                     };
+                    if matches!(ev, Some(Event::Prefilling { .. } | Event::Prefilled { .. } | Event::Token { .. })) {
+                        admit(admission);
+                    }
                     match ev {
                         Some(Event::Prefilling { done, reused, ms, .. }) => st.live.prompt(&job.id, done, reused, ms),
                         Some(Event::Prefilled { n_prompt, reused, ms, .. }) => {
@@ -129,6 +155,9 @@ async fn token_inner(st: &AppState, job: &TokenJob, tx: &mpsc::Sender<Piece>) ->
                             }
                         }
                         Some(Event::Error { message, .. }) if message == "worker process exited" => {}
+                        Some(Event::Error { code: ErrorCode::ContextFull, message, .. }) if emitted == 0 => {
+                            return Outcome { error_code: Some(ErrorCode::ContextFull), ..failure(message) };
+                        }
                         Some(Event::Error { message, .. }) => error = Some(message),
                         Some(Event::Finished { reason: FinishReason::Error, .. }) if error.is_none() => break,
                         Some(Event::Finished { reason, n_decoded, tail, deltas, message, .. }) => {

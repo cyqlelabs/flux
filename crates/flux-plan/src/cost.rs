@@ -277,6 +277,7 @@ pub(crate) mod tests {
             schema: 1,
             topology: "t".into(),
             backend_revision: "r".into(),
+            backend_build: "b".into(),
             created: chrono::Utc::now(),
             inventory: inv,
             copies: vec![
@@ -289,6 +290,7 @@ pub(crate) mod tests {
             kernels,
             cpu_bandwidth: vec![],
             storage: vec![],
+            host_pages: vec![],
         }
     }
 

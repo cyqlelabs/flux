@@ -29,6 +29,14 @@ pub struct BackendParams {
     pub op_offload: bool,
     pub kv_unified: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_paging: Option<crate::plan::KvPaging>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub qsa_pooled: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub qsa_blocks: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub qsa_indexed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speculation: Option<Speculation>,
     /// Layers whose experts a GPU cache serves (native engine), with their initial cached experts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -136,6 +144,10 @@ mod tests {
             type_v: "f16".into(),
             op_offload: true,
             kv_unified: false,
+            kv_paging: None,
+            qsa_pooled: false,
+            qsa_blocks: false,
+            qsa_indexed: false,
             speculation: Some(Speculation { kind: "draft-mtp".into(), draft_model: None, n_max: 3, draft_vocab: None }),
             expert_cache: None,
             expert_cache_frozen: false,
