@@ -78,7 +78,9 @@ Clients learn the limit in two ways:
 - `/v1/models` reports it as `context_length`, `max_model_len` and `meta.n_ctx`.
 - An overflow returns HTTP 400 with the code `context_length_exceeded` and the message "This model's maximum context length is N tokens. However, your messages resulted in M tokens." Qwen Code compresses its history when it sees it.
 
-`flux show <plan>` prints the page budgets. `/flux/stats` reports memory by use: in RAM the pinned weights, KV pages and worker RSS; per GPU the weights, KV and state, and compute buffers.
+Agents often return to an earlier conversation after a side request. When a prompt replaces a slot's conversation, the worker parks a copy of the old one's state in RAM, and a later prompt that returns to it restores the copy instead of recomputing the prefix. Parked conversations share the KV pages' RAM budget; the least recently used go first.
+
+`flux show <plan>` prints the page budgets. `/flux/stats` reports memory by use: in RAM the pinned weights, KV pages, parked conversations and worker RSS; per GPU the weights, KV and state, and compute buffers.
 
 ## Build
 

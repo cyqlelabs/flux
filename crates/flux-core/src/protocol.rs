@@ -181,6 +181,9 @@ pub struct WorkerStats {
     pub rss_bytes: u64,
     #[serde(default)]
     pub kv_pages: serde_json::Value,
+    /// Host RAM holding parked conversations.
+    #[serde(default)]
+    pub parked_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

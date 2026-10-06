@@ -72,6 +72,14 @@ bool fx_seq_checkpoint(fx_engine * e, int32_t seq);
 // Keeps the sequence's first `keep` positions where its state can be recovered: by trimming (attention-only
 // models) or from the latest checkpoint within `keep` (recurrent models), else not at all. Returns how many it kept.
 int32_t fx_seq_keep(fx_engine * e, int32_t seq, int32_t keep);
+// Conversation cache. Bytes a copy of the sequence's whole state takes: KV, recurrent and drafter state, checkpoints.
+uint64_t fx_seq_state_size(fx_engine * e, int32_t seq);
+// Copies the sequence's whole state to host memory under `id`, leaving the sequence as it is; returns the bytes
+// held, 0 when the copy failed.
+uint64_t fx_seq_park(fx_engine * e, int32_t seq, int64_t id);
+// Replaces the sequence with a copy of parked state `id`, which stays parked. False leaves the sequence empty.
+bool fx_seq_restore(fx_engine * e, int32_t seq, int64_t id);
+void fx_park_drop(fx_engine * e, int64_t id);
 
 // Speculation (engines loaded with a draft-mtp plan). Drafts up to n_max tokens after `last`, which sits at
 // `pos`, given the n_hist tokens before it; returns how many were written to out.

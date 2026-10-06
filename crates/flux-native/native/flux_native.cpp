@@ -706,6 +706,13 @@ struct fx_engine {
     std::map<int32_t, std::vector<checkpoint>> checkpoints;
     static constexpr size_t max_checkpoints = 4;
     bool checkpoint_size_logged = false;
+    // Conversations copied to host memory before another prompt takes their sequence, so one that comes back
+    // resumes from its whole state instead of recomputing its prompt.
+    struct parked_state {
+        std::vector<uint8_t> target, drafter, pending;
+        std::vector<checkpoint> checkpoints;
+    };
+    std::map<int64_t, parked_state> parked;
 
     ~fx_engine() {
         if (spec) common_speculative_free(spec);
@@ -1751,6 +1758,89 @@ int32_t fx_seq_keep(fx_engine * e, int32_t seq, int32_t keep) {
     }
     fx_seq_clear(e, seq);
     return 0;
+}
+
+uint64_t fx_seq_state_size(fx_engine * e, int32_t seq) {
+    try {
+        uint64_t n = llama_state_seq_get_size_ext(e->ctx, seq, 0);
+        if (e->ctx_dft) {
+            n += llama_state_seq_get_size_ext(e->ctx_dft, seq, 0);
+        }
+        const auto it = e->checkpoints.find(seq);
+        if (it != e->checkpoints.end()) {
+            for (const auto & c : it->second) {
+                n += c.data.size() + c.draft.size();
+            }
+        }
+        return n;
+    } catch (const std::exception & ex) {
+        fprintf(stderr, "sizing sequence %d failed: %s\n", seq, ex.what());
+        return 0;
+    }
+}
+
+uint64_t fx_seq_park(fx_engine * e, int32_t seq, int64_t id) {
+    try {
+        fx_engine::parked_state p;
+        p.target.resize(llama_state_seq_get_size_ext(e->ctx, seq, 0));
+        if (llama_state_seq_get_data_ext(e->ctx, p.target.data(), p.target.size(), seq, 0) != p.target.size()) {
+            return 0;
+        }
+        if (e->ctx_dft) {
+            p.drafter.resize(llama_state_seq_get_size_ext(e->ctx_dft, seq, 0));
+            if (llama_state_seq_get_data_ext(e->ctx_dft, p.drafter.data(), p.drafter.size(), seq, 0) != p.drafter.size()) {
+                return 0;
+            }
+        }
+        if (!e->spec || !common_speculative_get_state(e->spec, seq, p.pending)) {
+            p.pending.clear();
+        }
+        const auto it = e->checkpoints.find(seq);
+        if (it != e->checkpoints.end()) {
+            p.checkpoints = it->second;
+        }
+        uint64_t bytes = p.target.size() + p.drafter.size() + p.pending.size();
+        for (const auto & c : p.checkpoints) {
+            bytes += c.data.size() + c.draft.size();
+        }
+        e->parked[id] = std::move(p);
+        return bytes;
+    } catch (const std::exception & ex) {
+        fprintf(stderr, "parking sequence %d failed: %s\n", seq, ex.what());
+        return 0;
+    }
+}
+
+bool fx_seq_restore(fx_engine * e, int32_t seq, int64_t id) {
+    const auto it = e->parked.find(id);
+    if (it == e->parked.end()) {
+        return false;
+    }
+    const auto & p = it->second;
+    // The ledger takes back the sequence's pages before the restore commits its own.
+    fx_seq_clear(e, seq);
+    fx_seq_release(e, seq);
+    try {
+        if (llama_state_seq_set_data_ext(e->ctx, p.target.data(), p.target.size(), seq, 0) == p.target.size() &&
+                (!e->ctx_dft || llama_state_seq_set_data_ext(e->ctx_dft, p.drafter.data(), p.drafter.size(), seq, 0) == p.drafter.size())) {
+            if (e->spec && !p.pending.empty()) {
+                common_speculative_set_state(e->spec, seq, p.pending);
+            }
+            if (!p.checkpoints.empty()) {
+                e->checkpoints[seq] = p.checkpoints;
+            }
+            return true;
+        }
+    } catch (const std::exception & ex) {
+        fprintf(stderr, "restoring sequence %d failed: %s\n", seq, ex.what());
+    }
+    fx_seq_clear(e, seq);
+    fx_seq_release(e, seq);
+    return false;
+}
+
+void fx_park_drop(fx_engine * e, int64_t id) {
+    e->parked.erase(id);
 }
 
 int32_t fx_spec_draft(fx_engine * e, int32_t seq, int32_t pos, int32_t last, const int32_t * hist, int32_t n_hist, int32_t n_max, int32_t * out) {

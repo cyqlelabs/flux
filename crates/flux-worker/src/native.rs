@@ -4,12 +4,13 @@
 use crate::out::Out;
 use crate::text::{Pushed, TextStream};
 use anyhow::Result;
+use flux_core::fmt_bytes;
 use flux_core::protocol::{DeviceMemory, ErrorCode, Event, FinishReason, Request, Sampling, WorkerStats, PROTOCOL_VERSION};
 use flux_native::{ChatParser, Engine, Sampler};
 use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
-use std::sync::mpsc::{Receiver, TryRecvError};
-use std::time::Instant;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
+use std::time::{Duration, Instant};
 
 struct Seq {
     req: String,
@@ -20,6 +21,8 @@ struct Seq {
     reused: usize,
     /// Prompt positions where recurrent models checkpoint their state for later reuse, ascending.
     marks: Vec<usize>,
+    /// Where the prompt's last message ends: a later prompt sharing less is another conversation.
+    turn: usize,
     /// Next KV position to write.
     pos: i32,
     /// Tokens written to the slot's KV, kept for prompt reuse when the sequence finishes.
@@ -66,6 +69,14 @@ impl Seq {
     }
 }
 
+/// A conversation copied to host RAM when another prompt took its slot.
+struct Parked {
+    id: i64,
+    tokens: Vec<i32>,
+    turn: usize,
+    bytes: u64,
+}
+
 pub struct NativeWorker {
     out: Out,
     engine: Option<Engine>,
@@ -81,6 +92,17 @@ pub struct NativeWorker {
     free: Vec<i32>,
     /// Tokens each idle slot still holds from its last request, reused by the next prompt sharing them.
     cached: Vec<Vec<i32>>,
+    /// The `turn` of each idle slot's last request.
+    turns: Vec<usize>,
+    /// Parked conversations, least recently used first.
+    parked: Vec<Parked>,
+    next_park: i64,
+    /// Host RAM that KV pages and parked conversations share: what was free at load past the weights and the reserve.
+    host_budget: u64,
+    /// The most RAM one KV cell can commit (0 without KV pages in RAM).
+    cell_bytes: u64,
+    /// RAM kept free for the rest of the system: the serve's reserve plus its reopen margin.
+    host_reserve: u64,
     start: Instant,
     steps: u64,
     prefilled: u64,
@@ -102,6 +124,12 @@ impl NativeWorker {
             seqs: vec![],
             free: vec![],
             cached: vec![],
+            turns: vec![],
+            parked: vec![],
+            next_park: 0,
+            host_budget: 0,
+            cell_bytes: 0,
+            host_reserve: 0,
             start: Instant::now(),
             steps: 0,
             prefilled: 0,
@@ -125,10 +153,20 @@ impl NativeWorker {
                     Err(TryRecvError::Empty) => None,
                     Err(TryRecvError::Disconnected) => return Ok(()),
                 }
-            } else {
+            } else if self.parked.is_empty() {
                 match rx.recv() {
                     Ok(r) => Some(r),
                     Err(_) => return Ok(()),
+                }
+            } else {
+                // Idle with conversations parked: give their RAM back when the rest of the system needs it.
+                match rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(r) => Some(r),
+                    Err(RecvTimeoutError::Timeout) => {
+                        self.make_room(0);
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return Ok(()),
                 }
             };
             match req {
@@ -177,7 +215,8 @@ impl NativeWorker {
         match r {
             Request::Admission { host_reserve_bytes, min_reply } => {
                 self.min_reply = min_reply.max(1);
-                self.engine.as_mut().unwrap().host_reserve(host_reserve_bytes.saturating_add(flux_core::config::reopen_margin(host_reserve_bytes)));
+                self.host_reserve = host_reserve_bytes.saturating_add(flux_core::config::reopen_margin(host_reserve_bytes));
+                self.engine.as_mut().unwrap().host_reserve(self.host_reserve);
             }
             Request::Hello { protocol } if protocol != PROTOCOL_VERSION => {
                 self.error(None, None, ErrorCode::Protocol, format!("worker speaks protocol {PROTOCOL_VERSION}, supervisor sent {protocol}"))
@@ -241,6 +280,7 @@ impl NativeWorker {
                 engine.seq_clear(seq);
                 if let Some(c) = self.cached.get_mut(seq as usize) {
                     c.clear();
+                    self.turns[seq as usize] = 0;
                 }
                 match if routes { engine.route_stats(&req) } else { engine.trace(&req) } {
                     Ok(report) => self.out.send(&Event::Traced { id, report }),
@@ -257,6 +297,7 @@ impl NativeWorker {
             return self.error(None, None, ErrorCode::LoadFailed, "a model is already loaded; start a new worker");
         }
         let params = plan.backend_params();
+        let available = crate::mem_available();
         let t0 = Instant::now();
         let mut json = serde_json::to_value(&params).expect("params serialize");
         json["trace"] = trace.into();
@@ -271,6 +312,13 @@ impl NativeWorker {
                 let n_seq = info["n_seq"].as_u64().unwrap_or(params.n_seq as u64) as u32;
                 self.free = (0..n_seq as i32).rev().collect();
                 self.cached = vec![vec![]; n_seq as usize];
+                self.turns = vec![0; n_seq as usize];
+                // The serve sizes the KV pages' RAM when it starts; without them the same rule applies here.
+                self.host_budget = params.kv_paging.as_ref().map_or(available.saturating_sub(plan.host.required()), |k| k.host_budget);
+                if self.paged {
+                    let capacity: u64 = info["memory"].as_array().map_or(0, |m| m.iter().filter_map(|d| d["context_capacity"].as_u64()).sum());
+                    self.cell_bytes = capacity / info["n_ctx"].as_u64().unwrap_or(1).max(1);
+                }
                 self.engine = Some(e);
                 self.out.send(&Event::Loaded { load_ms: t0.elapsed().as_secs_f64() * 1e3, n_ctx_seq: self.n_ctx_seq, n_seq, memory: memory_of(&info) });
             }
@@ -304,18 +352,13 @@ impl NativeWorker {
                 format!("prompt ({}) + max_tokens ({max_tokens}) exceeds the planned context of {} per sequence", prompt.len(), self.n_ctx_seq),
             );
         }
-        // The idle slot holding the longest prefix of this prompt; at least the last prompt token is decoded
-        // again, since its logits pick the first output token.
-        let common = |c: &Vec<i32>| c.iter().zip(&prompt).take_while(|(a, b)| a == b).count().min(prompt.len() - 1);
-        let Some(at) = (0..self.free.len()).max_by_key(|&k| (common(&self.cached[self.free[k] as usize]), k)) else {
+        let Some((slot, kept)) = self.claim_slot(&prompt) else {
             return self.reject(&req, ErrorCode::Busy, "all planned sequences are in use");
         };
-        let slot = self.free.remove(at);
-        let reuse = common(&self.cached[slot as usize]);
-        let kept = self.engine.as_mut().unwrap().seq_keep(slot, reuse);
-        self.cached[slot as usize].clear();
         let reserve = (prompt.len() as u32).saturating_add(max_tokens.min(self.min_reply)).saturating_add(self.spec_n_max as u32).min(self.n_ctx_seq);
-        if !self.engine.as_mut().unwrap().seq_reserve(slot, reserve) {
+        // RAM the reservation may commit comes out of the room parked conversations hold.
+        self.make_room(reserve.saturating_sub(kept as u32) as u64 * self.cell_bytes);
+        if !self.reserve(slot, reserve) {
             let mut low = kept as u32;
             let mut high = reserve;
             while low + 1 < high {
@@ -346,6 +389,7 @@ impl NativeWorker {
             }
         };
         prompt.iter().for_each(|&t| sampler.accept_prompt(t));
+        let turn = checkpoints.iter().map(|&c| c as usize).max().unwrap_or(prompt.len() - 1);
         // The template's boundaries (end of the system prompt, end of the last message) and one short of the end: a
         // side request reuses the first, a new user turn the second, a continuation after tool results the third.
         let mut marks: Vec<usize> = checkpoints.iter().map(|&c| c as usize).chain([prompt.len() - 1]).filter(|&m| m > kept && m < prompt.len()).collect();
@@ -359,6 +403,7 @@ impl NativeWorker {
             prefilled: kept,
             reused: kept,
             marks,
+            turn,
             pos: kept as i32,
             sampler,
             max_tokens,
@@ -380,12 +425,11 @@ impl NativeWorker {
         let mut undrafted = HashSet::new();
         // Reserve before either drafter or target runs. Admission already holds the reply floor.
         for i in (0..self.seqs.len()).rev() {
-            let s = &self.seqs[i];
-            if s.wants_decode() {
-                let cells = (s.pos as u32).saturating_add(1 + self.spec_n_max as u32).min(self.n_ctx_seq);
-                if !self.engine.as_mut().unwrap().seq_reserve(s.slot, cells) {
-                    if self.engine.as_mut().unwrap().seq_reserve(s.slot, (s.pos as u32).saturating_add(1).min(self.n_ctx_seq)) {
-                        undrafted.insert(s.slot);
+            if self.seqs[i].wants_decode() {
+                let (slot, pos) = (self.seqs[i].slot, self.seqs[i].pos as u32);
+                if !self.engine.as_mut().unwrap().seq_reserve(slot, pos.saturating_add(1 + self.spec_n_max as u32).min(self.n_ctx_seq)) {
+                    if self.reserve(slot, pos.saturating_add(1).min(self.n_ctx_seq)) {
+                        undrafted.insert(slot);
                     } else {
                         self.finish(i, FinishReason::Length);
                     }
@@ -609,6 +653,7 @@ impl NativeWorker {
             self.engine.as_mut().unwrap().seq_clear(s.slot);
         } else {
             self.cached[s.slot as usize] = std::mem::take(&mut s.kv);
+            self.turns[s.slot as usize] = s.turn;
         }
         self.engine.as_mut().unwrap().seq_release(s.slot);
         self.free.push(s.slot);
@@ -628,7 +673,134 @@ impl NativeWorker {
             memory: self.engine.as_ref().and_then(|e| e.info().ok()).map(|i| memory_of(&i)).unwrap_or_default(),
             rss_bytes: crate::rss_bytes(),
             kv_pages: self.engine.as_ref().and_then(|e| e.info().ok()).and_then(|i| i.get("kv_pages").cloned()).unwrap_or_default(),
+            parked_bytes: self.parked_bytes(),
         }
+    }
+
+    /// The idle slot for `prompt`, holding the longest prefix of it that an idle slot or a parked conversation has,
+    /// and how many prompt tokens it kept; None when every slot is busy.
+    fn claim_slot(&mut self, prompt: &[i32]) -> Option<(i32, usize)> {
+        // At least the last prompt token is decoded again, since its logits pick the first output token.
+        let common = |c: &[i32]| c.iter().zip(prompt).take_while(|(a, b)| a == b).count().min(prompt.len() - 1);
+        let at = (0..self.free.len()).max_by_key(|&k| (common(&self.cached[self.free[k] as usize]), k))?;
+        let slot = self.free.remove(at);
+        let s = slot as usize;
+        // A prompt that leaves the slot's conversation before the end of its last message starts another one (a
+        // client's side request, a subagent). That conversation is parked, or its next turn recomputes it.
+        if common(&self.cached[s]) < self.turns[s].min(self.cached[s].len()) {
+            self.park(slot);
+        }
+        let here = common(&self.cached[s]);
+        if let Some((shared, k)) = self.parked.iter().enumerate().map(|(k, p)| (common(&p.tokens), k)).max().filter(|&(n, _)| n > here) {
+            self.restore(slot, k, shared);
+        }
+        let kept = self.engine.as_mut().unwrap().seq_keep(slot, common(&self.cached[s]));
+        self.cached[s].clear();
+        Some((slot, kept))
+    }
+
+    /// Reserves KV cells for `slot`, dropping parked conversations while the pages do not fit.
+    fn reserve(&mut self, slot: i32, cells: u32) -> bool {
+        while !self.engine.as_mut().unwrap().seq_reserve(slot, cells) {
+            if !self.evict() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Copies the conversation `slot` holds to host RAM when it fits there, dropping older parked ones as needed.
+    fn park(&mut self, slot: i32) {
+        let s = slot as usize;
+        let need = self.engine.as_mut().unwrap().seq_state_size(slot);
+        if need == 0 {
+            return;
+        }
+        // Whether it fits once every other parked conversation is gone.
+        let fits = need + self.kv_ram() <= self.host_budget && need + self.host_reserve <= crate::mem_available() + self.parked_bytes();
+        if !fits || !self.make_room(need) {
+            eprintln!("slot {slot}: its conversation of {} tokens needs {} of RAM, more than is free; not parked", self.cached[s].len(), fmt_bytes(need));
+            return;
+        }
+        let t0 = Instant::now();
+        let id = self.next_park;
+        self.next_park += 1;
+        match self.engine.as_mut().unwrap().seq_park(slot, id) {
+            0 => eprintln!("slot {slot}: parking its conversation failed"),
+            bytes => {
+                eprintln!(
+                    "slot {slot}: parked its conversation of {} tokens, {} in {:.0} ms",
+                    self.cached[s].len(),
+                    fmt_bytes(bytes),
+                    t0.elapsed().as_secs_f64() * 1e3
+                );
+                self.parked.push(Parked { id, tokens: self.cached[s].clone(), turn: self.turns[s], bytes });
+            }
+        }
+    }
+
+    /// Copies parked conversation `k` into `slot`. It stays parked unless the prompt, sharing `shared` tokens with
+    /// it, continues it past its last message; the slot then carries it on.
+    fn restore(&mut self, slot: i32, k: usize, shared: usize) {
+        let s = slot as usize;
+        let p = self.parked.remove(k);
+        // Its KV pages may land in RAM beside the other parked conversations.
+        let pages = p.tokens.len() as u64 * self.cell_bytes;
+        while self.parked_bytes() + p.bytes + self.kv_ram() + pages > self.host_budget && self.evict() {}
+        let t0 = Instant::now();
+        let restored = self.engine.as_mut().unwrap().seq_restore(slot, p.id);
+        if restored {
+            eprintln!(
+                "slot {slot}: restored a parked conversation of {} tokens, {} in {:.0} ms",
+                p.tokens.len(),
+                fmt_bytes(p.bytes),
+                t0.elapsed().as_secs_f64() * 1e3
+            );
+            self.cached[s] = p.tokens.clone();
+            self.turns[s] = p.turn;
+        } else {
+            eprintln!("slot {slot}: restoring a parked conversation of {} tokens failed; its prompt is recomputed", p.tokens.len());
+            self.cached[s].clear();
+        }
+        if restored && shared >= p.turn.min(p.tokens.len()) {
+            self.engine.as_mut().unwrap().park_drop(p.id);
+        } else {
+            self.parked.push(p);
+        }
+    }
+
+    /// Drops the least recently used parked conversations until `extra` more bytes fit: beside them and the KV pages
+    /// within the host budget, and in the RAM available above the reserve. False when they cannot.
+    fn make_room(&mut self, extra: u64) -> bool {
+        loop {
+            if self.parked_bytes() + self.kv_ram() + extra <= self.host_budget && extra + self.host_reserve <= crate::mem_available() {
+                return true;
+            }
+            if !self.evict() {
+                return false;
+            }
+        }
+    }
+
+    /// Drops the least recently used parked conversation; false when none is left.
+    fn evict(&mut self) -> bool {
+        if self.parked.is_empty() {
+            return false;
+        }
+        let p = self.parked.remove(0);
+        self.engine.as_mut().unwrap().park_drop(p.id);
+        eprintln!("dropped a parked conversation of {} tokens, {}", p.tokens.len(), fmt_bytes(p.bytes));
+        true
+    }
+
+    fn parked_bytes(&self) -> u64 {
+        self.parked.iter().map(|p| p.bytes).sum()
+    }
+
+    /// RAM the KV pages hold now.
+    fn kv_ram(&self) -> u64 {
+        let info = self.engine.as_ref().and_then(|e| e.info().ok()).unwrap_or_default();
+        info["kv_pages"].as_object().map_or(0, |classes| classes.values().filter_map(|c| c["ram_bytes"].as_u64()).sum())
     }
 }
 

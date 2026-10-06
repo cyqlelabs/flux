@@ -190,7 +190,7 @@ async fn stats(State(st): State<Arc<AppState>>) -> Response {
             .filter(|m| m.device != "CPU")
             .map(|m| json!({"device": m.device, "weights": m.model, "kv_and_state": m.context, "compute": m.compute}))
             .collect();
-        json!({"ram": {"host_weights": host_weights, "kv_pages": kv_ram, "worker_rss": w.rss_bytes}, "vram": vram})
+        json!({"ram": {"host_weights": host_weights, "kv_pages": kv_ram, "parked_conversations": w.parked_bytes, "worker_rss": w.rss_bytes}, "vram": vram})
     });
     let d = st.drift.lock().unwrap();
     Json(json!({

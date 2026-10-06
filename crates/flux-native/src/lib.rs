@@ -98,6 +98,10 @@ mod ffi {
         pub fn fx_seq_clear(e: *mut Engine, seq: i32);
         pub fn fx_seq_checkpoint(e: *mut Engine, seq: i32) -> bool;
         pub fn fx_seq_keep(e: *mut Engine, seq: i32, keep: i32) -> i32;
+        pub fn fx_seq_state_size(e: *mut Engine, seq: i32) -> u64;
+        pub fn fx_seq_park(e: *mut Engine, seq: i32, id: i64) -> u64;
+        pub fn fx_seq_restore(e: *mut Engine, seq: i32, id: i64) -> bool;
+        pub fn fx_park_drop(e: *mut Engine, id: i64);
         pub fn fx_spec_draft(e: *mut Engine, seq: i32, pos: i32, last: i32, hist: *const i32, n_hist: i32, n_max: i32, out: *mut i32) -> i32;
         pub fn fx_spec_accept(e: *mut Engine, seq: i32, pos: i32, n_accepted: i32) -> bool;
 
@@ -275,6 +279,25 @@ impl Engine {
     /// Keeps up to `keep` leading positions of the sequence; returns how many it could keep.
     pub fn seq_keep(&mut self, seq: i32, keep: usize) -> usize {
         unsafe { ffi::fx_seq_keep(self.ptr.as_ptr(), seq, keep as i32) }.max(0) as usize
+    }
+
+    /// Bytes a parked copy of the sequence would take.
+    pub fn seq_state_size(&mut self, seq: i32) -> u64 {
+        unsafe { ffi::fx_seq_state_size(self.ptr.as_ptr(), seq) }
+    }
+
+    /// Copies the sequence's whole state to host memory under `id`; the bytes held, 0 when the copy failed.
+    pub fn seq_park(&mut self, seq: i32, id: i64) -> u64 {
+        unsafe { ffi::fx_seq_park(self.ptr.as_ptr(), seq, id) }
+    }
+
+    /// Replaces the sequence with a copy of parked state `id`; false leaves the sequence empty.
+    pub fn seq_restore(&mut self, seq: i32, id: i64) -> bool {
+        unsafe { ffi::fx_seq_restore(self.ptr.as_ptr(), seq, id) }
+    }
+
+    pub fn park_drop(&mut self, id: i64) {
+        unsafe { ffi::fx_park_drop(self.ptr.as_ptr(), id) }
     }
 
     /// The most likely token of a decoded row other than `chosen`.

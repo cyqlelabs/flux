@@ -57,6 +57,13 @@ pub fn rss_bytes() -> u64 {
     pages * unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64
 }
 
+/// The kernel's estimate of RAM available without swapping.
+pub fn mem_available() -> u64 {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let kib: u64 = meminfo.lines().find(|l| l.starts_with("MemAvailable:")).and_then(|l| l.split_whitespace().nth(1)?.parse().ok()).unwrap_or(0);
+    kib * 1024
+}
+
 fn stdin_json() -> Result<serde_json::Value> {
     let mut s = String::new();
     std::io::stdin().read_to_string(&mut s)?;

@@ -20,7 +20,7 @@ Implementation checkpoints (these do not replace the acceptance criteria below):
 - T14: done for decode, which uses indexed attention whenever eligible: at 57K with KV in RAM, attention falls from 11.7 to 1.85 ms per graph. Prompt chunks stay masked: indexed prefill took 471 s at 57K against 183 s.
 - Long prompts: 131,000 and 200,000-token prompts complete with coherent output. Prompt chunks borrow each GPU's unused KV page budget, which brought the 131K prompt from 991 to 758 s. Through `flux serve`, a 140K prompt, its next turn (10 s, prefix reused), the overflow error and a RAM-shortage rejection all behave as specified ([variable-context-baseline.md](variable-context-baseline.md)).
 - 262K plan `660c47ab9561158f` (final backend, fresh probe, default config): 46.7 tok/s decode on short prompts, 37.9 on agent conversations, and a 60,545-token prompt at 458 tok/s with decode at 38.6 tok/s after it. A 65K plan on an earlier build of this backend decoded at 39.5 to 43.0 tok/s against 40.3 for its 262K plan, so the 262K reservations cost at most 6%, and T16/T17 are not worth their complexity now. A Qwen Code session through `flux serve` reached about 130K tokens without errors.
-- Open: short-prompt decode is still 7% below the 50.4 tok/s of plan `6a8bd99efd67d8b0` (2026-10-04). Earlier plans in this work decoded at about 40 tok/s with 12 decode threads, chosen by a probe that ran while other programs used the CPU; the fresh probe chose 6. Also open: T15, T18, and planning on GPUs that cannot read host pages (the default context then stops at the floor).
+- Open: short-prompt decode is still 7% below the 50.4 tok/s of plan `6a8bd99efd67d8b0` (2026-10-04). Earlier plans in this work decoded at about 40 tok/s with 12 decode threads, chosen by a probe that ran while other programs used the CPU; the fresh probe chose 6. Also open: T15, a GPU check of T18, and planning on GPUs that cannot read host pages (the default context then stops at the floor).
 
 Flux will serve every model at its own trained context. The KV cache grows with the conversation: its pages live in VRAM while the GPU has room and in pinned RAM after that. Short conversations keep today's speed, long ones run instead of failing, idle RAM does work, and a request that cannot fit fails at admission with the error clients already handle. Every size and placement comes from the model's GGUF or from a measurement; nothing depends on one model or one machine.
 
@@ -203,6 +203,12 @@ Agents return to earlier prefixes: sub-tasks, retries, history compression, swit
 - Full pages from cell 0 map into the new stream read-only, without a copy. The partial last page is copied, because the new conversation writes into it.
 - Restores never use `seq_cp` across streams, which copies whole streams.
 - Build it only if serve logs show prompt reuse falling to the system prompt after agents' side requests; the per-slot checkpoints already cover ordinary turns.
+
+Built on 2026-10-06 with copies instead of mapped pages. Qwen Code's permission classifier triggered it: its side request replaced a 60,629-token conversation, so the next turn recomputed all 61,190 tokens (about 2 minutes) instead of reusing 60,185.
+
+- When a prompt leaves a slot's conversation before the end of its last message, the worker copies the conversation's whole state to host RAM: KV, recurrent and drafter state, and checkpoints.
+- A prompt sharing more with a parked conversation than with its slot gets a copy back. The copy stays parked unless the prompt continues that conversation.
+- Parked conversations share the KV pages' RAM budget. The least recently used go first: when a reservation fails, before a reservation could commit pages past the budget, and when available RAM falls under the reserve.
 
 ### D11. Clients learn the limit
 
@@ -466,6 +472,8 @@ The policy measures, per page, the decode time KV loses without it and the exper
 #### T18. Prompt cache of past conversations
 
 Built only if serve logs show prompt reuse falling to the system prompt after side requests. Finished conversations keep their KV pages and recurrent checkpoints in RAM, restored as D10 describes.
+
+Status: built (D10), not yet verified on a GPU.
 
 - Acceptance: returning to an earlier session, or a sub-task sharing a long prefix, starts without recomputing that prefix; RAM use stays within the budget; outputs match a recomputed prefix.
 - Verification: a scripted agent workload that alternates two sessions; time to first token with and without the cache.
