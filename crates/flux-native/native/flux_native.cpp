@@ -10,6 +10,7 @@
 #include "llama-memory.h"
 #include "llama-context.h"
 #include "llama.h"
+#include "ngram-map.h"
 #include "sampling.h"
 #include "speculative.h"
 
@@ -679,8 +680,8 @@ struct fx_engine {
     // Speculation: the next-token heads run in their own context against the target's hidden states.
     llama_context * ctx_dft = nullptr;
     common_speculative * spec = nullptr;
-    // Drafts a round may verify, and those the heads draft: a longer draft copies earlier context.
-    int32_t spec_n_max = 0, spec_heads_max = 0;
+    // Drafts a round may verify.
+    int32_t spec_n_max = 0;
     // Verification rounds, drafted and accepted tokens, and time spent drafting, verifying, sampling the
     // verified rows and following the target (microseconds), logged periodically.
     int64_t spec_rounds = 0, spec_drafted = 0, spec_accepted = 0, spec_draft_us = 0, spec_verify_us = 0, spec_sample_us = 0, spec_follow_us = 0;
@@ -1220,7 +1221,6 @@ fx_engine * fx_engine_load(const char * params_json, char ** error) {
                 return nullptr;
             }
             e->spec_n_max = p.spec_window();
-            e->spec_heads_max = p.spec_n_max;
             e->spec_copied.assign(llama_n_seq_max(e->ctx), false);
         }
         if (e->page_ledger) {
@@ -1845,6 +1845,7 @@ void fx_park_drop(fx_engine * e, int64_t id) {
 
 int32_t fx_spec_draft(fx_engine * e, int32_t seq, int32_t pos, int32_t last, const int32_t * hist, int32_t n_hist, int32_t n_max, int32_t * out) {
     llama_tokens draft;
+    bool copied = false;
     try {
         const int64_t t0 = ggml_time_us();
         // the copying drafter searches the context for the tokens before `last`
@@ -1852,6 +1853,8 @@ int32_t fx_spec_draft(fx_engine * e, int32_t seq, int32_t pos, int32_t last, con
         common_speculative_get_draft_params(e->spec, seq) = {true, n_max, pos, last, &prompt, &draft};
         common_speculative_draft(e->spec);
         e->spec_draft_us += ggml_time_us() - t0;
+        // The copying drafter outranks the heads and drafts as many tokens, so only its own search tells a copy apart.
+        copied = !draft.empty() && !common_ngram_simple_draft({load_params::ngram_match, load_params::ngram_match}, prompt, last).empty();
     } catch (const std::exception & ex) {
         // Drafting is an optimization: a failed draft verifies nothing extra.
         fprintf(stderr, "drafting failed: %s\n", ex.what());
@@ -1861,7 +1864,7 @@ int32_t fx_spec_draft(fx_engine * e, int32_t seq, int32_t pos, int32_t last, con
     llama_memory_seq_rm(llama_get_memory(e->ctx_dft), seq, pos, -1);
     draft.resize(std::min<size_t>(draft.size(), (size_t) std::max(n_max, 0)));
     e->spec_drafted += (int64_t) draft.size();
-    e->spec_copied[seq] = (int32_t) draft.size() > e->spec_heads_max;
+    e->spec_copied[seq] = copied;
     e->spec_copy_drafted += e->spec_copied[seq] ? (int64_t) draft.size() : 0;
     std::copy(draft.begin(), draft.end(), out);
     return (int32_t) draft.size();

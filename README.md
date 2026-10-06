@@ -55,10 +55,11 @@ Expert caching and the second-GPU tier apply only to mixture-of-experts models; 
 
 The CPU is a device in every plan, not a fallback for what the GPUs cannot hold. When it plans, Flux:
 
-1. Times RAM bandwidth at several thread counts and keeps the fewest threads within 10% of the best, because threads past saturation only add synchronization.
+1. Times RAM bandwidth at several thread counts and proposes the fewest threads within 10% of the best, because threads past saturation only add synchronization.
 2. Times the model's own tensor shapes and quantization types on the CPU, both for single-token decoding and for prompt chunks.
 3. Puts whole layers on the CPU, or keeps a layer's experts in RAM for the CPU to compute, then fills spare GPU memory with the experts that save the most time per byte.
 4. Runs the finalists, CPU work included, on real prompts, so the CPU's share is measured rather than assumed.
+5. When the CPU computes layers or experts for an interactive plan, decodes the chosen plan again at each other thread count up to one per physical core, and keeps the fewest threads within 3% of the fastest, because each step waits for its slowest thread.
 
 While serving, the CPU computes its experts at the same time as the GPU computes the rest of the layer. Prompt chunks of 32 tokens or more copy those experts to the GPU instead, where the larger batch runs faster. Each chunk copies every expert it uses, so during a long prompt the GPU's expert cache lends its memory to the chunks: a chunk then holds several thousand tokens instead of about a thousand, and the prompt copies the experts fewer times. Flux lends only when that copies fewer bytes in total, counting the cached experts it must copy back before generating.
 

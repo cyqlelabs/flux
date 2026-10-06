@@ -51,7 +51,7 @@ impl PlanRequest {
     pub fn policy_key(&self, cfg: &FluxConfig) -> String {
         flux_core::fsutil::sha256_hex(
             serde_json::to_string(&json!({
-                "revision": 3, "request": self, "planning": cfg.plan, "host_reserve_percent": cfg.host_reserve_percent, "engines": cfg.engines
+                "revision": 4, "request": self, "planning": cfg.plan, "host_reserve_percent": cfg.host_reserve_percent, "engines": cfg.engines
             }))
             .expect("planning policy serializes")
             .as_bytes(),
@@ -1061,6 +1061,39 @@ pub async fn plan(
     ensure!(!finals.is_empty(), "no candidate passed held-out validation and workload constraints");
     let best = validated[finals[0]].0;
     let chosen = &runs[results[best].0];
+    // Decode threads: a step waits for its slowest thread, so peak bandwidth only proposes a count. An interactive
+    // plan that computes on the CPU also decodes at every other swept count up to one per physical core.
+    let mut n_threads = ctx.runtime.n_threads;
+    let mut threads_reason = format!("{n_threads} threads (fewest per physical core near the best measured bandwidth)");
+    let cpu_work = chosen.placement.layer_device.iter().any(|d| d == CPU) || chosen.placement.overrides.iter().any(|o| o.device == CPU);
+    let interactive = matches!(req.workload.objective, Objective::Interactive);
+    if let (true, Some(m)) = (cpu_work && interactive, results[best].1.validation.clone()) {
+        let mut trials = vec![(n_threads, m)];
+        for t in report.cpu_bandwidth.iter().map(|b| b.threads).filter(|&t| t <= report.inventory.cpu.cores && t != n_threads) {
+            log(&format!("decoding {} with {t} threads", chosen.label));
+            let mut plan = base_plan(chosen);
+            plan.runtime.n_threads = t;
+            plan.id = plan.compute_id();
+            match measured_run(&ctx, &plan, corpus, Role::Validation, cfg.plan.validation_prompts, &devices).await {
+                Ok((m, s)) if eligible(&s, req.workload.objective, req.min_decode_tps) => trials.push((t, m)),
+                Ok(_) => rejected.push(format!("{t} decode threads: validation violates requested latency or throughput constraints")),
+                Err(e) => rejected.push(format!("{t} decode threads: {e:#}")),
+            }
+        }
+        if trials.len() > 1 {
+            let k = fewest_fast_threads(&trials);
+            let rates = |m: &Measurement| match &m.agent_decode_tps {
+                Some(a) => format!("{:.1} tok/s, {:.1} on agent conversations", m.decode_tps.p50, a.p50),
+                None => format!("{:.1} tok/s", m.decode_tps.p50),
+            };
+            n_threads = trials[k].0;
+            threads_reason = format!(
+                "{n_threads} threads, the fewest within 3% of the fastest measured decode ({})",
+                trials.iter().map(|(t, m)| format!("{t} threads: {}", rates(m))).collect::<Vec<_>>().join("; ")
+            );
+            results[best].1.validation = Some(trials.swap_remove(k).1);
+        }
+    }
     let validation = ValidationRecord {
         tuning_seconds: t_start.elapsed().as_secs_f64(),
         tuning_budget_seconds: cfg.plan.tuning_budget_s,
@@ -1090,7 +1123,18 @@ pub async fn plan(
         },
     };
     let mut plan = assemble(&ctx, &facts.architecture, &identity, report, &devices, chosen, decisions, Some(validation));
-    explain(&mut plan, &lay, &cost, &shape, &devices, chosen, &results.iter().map(|r| (runs[r.0].clone(), r.2.clone())).collect::<Vec<_>>(), &rejected);
+    plan.runtime.n_threads = n_threads;
+    explain(
+        &mut plan,
+        &lay,
+        &cost,
+        &shape,
+        &devices,
+        chosen,
+        &results.iter().map(|r| (runs[r.0].clone(), r.2.clone())).collect::<Vec<_>>(),
+        &rejected,
+        &threads_reason,
+    );
     plan.id = plan.compute_id();
     Ok(plan)
 }
@@ -1674,6 +1718,16 @@ async fn greedy_tokens(ctx: &Ctx<'_>, plan: &Plan, corpus: &Corpus) -> Result<Ve
 /// Contenders measured at depth, besides the two best short-prompt runs.
 const MAX_CONTENDERS: usize = 4;
 
+/// The fewest threads whose worst decode rate, each condition relative to the best trial there, is within 3% of the
+/// best trial's. The conditions are prose and, where validation measured it, agent conversations.
+fn fewest_fast_threads(trials: &[(u32, Measurement)]) -> usize {
+    let rates = |m: &Measurement| [Some(m.decode_tps.p50), m.agent_decode_tps.as_ref().map(|a| a.p50)];
+    let top: Vec<f64> = (0..2).map(|c| trials.iter().filter_map(|(_, m)| rates(m)[c]).fold(0.0, f64::max).max(1e-12)).collect();
+    let worst: Vec<f64> = trials.iter().map(|(_, m)| rates(m).iter().zip(&top).filter_map(|(r, t)| r.map(|r| r / t)).fold(f64::MAX, f64::min)).collect();
+    let best = worst.iter().copied().fold(0.0, f64::max);
+    (0..trials.len()).filter(|&i| worst[i] >= best - 0.03).min_by_key(|&i| trials[i].0).expect("the best trial qualifies")
+}
+
 /// Orders candidates by their worst condition, each condition's rate taken relative to the best candidate there:
 /// decode and first-token time on short prompts, prefill and decode on the long one. No condition is assumed
 /// more common than another. Within 3% of the best worst case, the higher geometric mean wins.
@@ -1874,6 +1928,7 @@ fn explain(
     chosen: &Candidate,
     measured: &[(Candidate, Option<RunSummary>)],
     rejected: &[String],
+    threads_reason: &str,
 ) {
     let rate = |c: &Candidate| measured.iter().find(|(m, _)| m.label == c.label).and_then(|(_, s)| s.as_ref().map(|s| s.decode_tps.p50));
     let chosen_rate = rate(chosen);
@@ -1921,7 +1976,7 @@ fn explain(
     let cpu_blocks = a.layer_device.iter().filter(|d| *d == CPU).count();
     let host_experts: Vec<(usize, usize)> =
         a.on_cpu.iter().enumerate().flat_map(|(i, v)| v.iter().enumerate().filter(|(_, &h)| h).map(move |(k, _)| (i, k))).collect();
-    let mut cpu = format!("token embeddings; {} threads (fewest per physical core near the best measured bandwidth)", plan.runtime.n_threads);
+    let mut cpu = format!("token embeddings; {threads_reason}");
     if cpu_blocks > 0 {
         cpu = format!("blocks 0-{} ({}); {cpu}", cpu_blocks - 1, fmt_bytes(lay.blocks[..cpu_blocks].iter().map(|b| b.dense_bytes() + b.expert_bytes()).sum()));
     }
