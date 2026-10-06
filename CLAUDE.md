@@ -20,7 +20,7 @@ Flux's backend changes live in `patches/llama.cpp/*.patch` as `git diff` output 
 
 To change the backend, follow [Changing the llama.cpp backend](README.md#changing-the-llamacpp-backend) in `README.md`: edit `third_party/llama.cpp` in place, rebuild, then regenerate both patches with the commands given there.
 
-`flux-native/build.rs` hashes the patches into `FLUX_BACKEND_BUILD`, which is part of every plan's `ProfileKey`. Any patch change therefore invalidates all saved plans, so run `flux plan` again (or pass `--replan`).
+`flux-native/build.rs` hashes the patches, the submodule's working tree, the built libraries and the `flux-native` and `flux-worker` sources into `FLUX_BACKEND_BUILD`, which is part of every plan's `ProfileKey` and every probe report. A change to any of them therefore invalidates all saved plans and probes: `flux serve` refuses the old plan, so run `flux plan` again.
 
 ## Architecture
 

@@ -299,7 +299,7 @@ git -C third_party/llama.cpp diff -- . ':!ggml/src/ggml-cpu/arch-fallback.h' ':!
   > patches/llama.cpp/0001-flux-backend-extensions.patch
 ```
 
-The patches are hashed into every plan's key, so any patch change invalidates all saved plans. Run `flux plan --replan` afterwards. The default build compiles only the CPU and CUDA backends, so patch edits to Metal, Vulkan, SYCL, and other backends go unchecked.
+Every plan's key includes a hash of the patches, the built libraries, and the `flux-native` and `flux-worker` sources, so a change to any of them invalidates all saved plans and probe reports. Run `flux plan` again afterwards. The default build compiles only the CPU and CUDA backends, so patch edits to Metal, Vulkan, SYCL, and other backends go unchecked.
 
 ## License
 
