@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" width="220" alt="Flux logo: a manual citrus squeezer with a drop falling from its spout">
+  <img src="assets/logo.png" width="220" alt="Flux logo: a cheerful cartoon elephant in a driver's cap squeezed onto a tiny red car">
 </p>
 
 <h1 align="center">Flux</h1>
