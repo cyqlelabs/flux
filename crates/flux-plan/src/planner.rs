@@ -6,7 +6,7 @@ use crate::layers::{layout, Layout};
 use crate::params::{backend_mapping, placement};
 use crate::run::{agent_prompt, bench_sampling, chat_prompt, run_all, summarize, RunSummary};
 use crate::search::{prefill_s, search, units, Assignment, SearchInput};
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use flux_core::backend::BackendParams;
 use flux_core::config::FluxConfig;
 use flux_core::corpus::{Corpus, Role};
@@ -982,6 +982,7 @@ pub async fn plan(
     let floor = runtime.kv_paging.as_ref().map_or(n_ctx_seq, |p| p.floor_tokens);
     let depth_tokens = (n_ctx_seq / 4).min(floor).min(n_ctx_seq.saturating_sub(2 * req.decode_tokens));
     let deep = matches!(req.workload.objective, Objective::Interactive) && depth_tokens >= 4 * req.prompt_tokens;
+    let mut sessions: HashMap<usize, Result<(Measurement, RunSummary)>> = HashMap::new();
     if deep {
         let mut contenders: Vec<usize> = ranked.iter().copied().take(2).collect();
         // A prompt as deep as the floor takes minutes; past the floor the two best short-prompt runs contend alone.
@@ -995,10 +996,20 @@ pub async fn plan(
                 contenders.push(k);
             }
         }
+        // Validation takes the two best contenders, so with at most two each one validates and then takes its long prompt on one load.
+        let fused = contenders.len() <= 2;
         for k in contenders {
-            log(&format!("long prompt on {}", results[k].1.label));
             let plan = base_plan(&runs[results[k].0]);
-            match depth_run(&ctx, &plan, corpus, depth_tokens).await {
+            let depth = if fused {
+                log(&format!("validating {}", results[k].1.label));
+                let (validation, depth) = validation_depth_run(&ctx, &plan, &results[k].1.label, corpus, depth_tokens, &devices).await;
+                sessions.insert(k, validation);
+                depth
+            } else {
+                log(&format!("long prompt on {}", results[k].1.label));
+                depth_run(&ctx, &plan, corpus, depth_tokens).await
+            };
+            match depth {
                 Ok(d) => {
                     log(&format!(
                         "  {} prompt tokens at {:.0} tok/s ({:.1} s to the first token), decode {:.2} tok/s",
@@ -1025,8 +1036,14 @@ pub async fn plan(
     let deep = deep && results[ranked[0]].1.depth.is_some();
     let mut validated: Vec<(usize, RunSummary)> = vec![];
     for &k in ranked.iter().take(2) {
-        log(&format!("validating {}", results[k].1.label));
-        match measured_run(&ctx, &base_plan(&runs[results[k].0]), corpus, Role::Validation, cfg.plan.validation_prompts, &devices).await {
+        let run = match sessions.remove(&k) {
+            Some(run) => run,
+            None => {
+                log(&format!("validating {}", results[k].1.label));
+                measured_run(&ctx, &base_plan(&runs[results[k].0]), corpus, Role::Validation, cfg.plan.validation_prompts, &devices).await
+            }
+        };
+        match run {
             Ok((m, s)) if eligible(&s, req.workload.objective, req.min_decode_tps) => {
                 results[k].1.validation = Some(m);
                 validated.push((k, s));
@@ -1687,44 +1704,91 @@ fn robust(ks: &mut [usize], short: &dyn Fn(usize) -> RunSummary, deep: &dyn Fn(u
     });
 }
 
-/// One long request on a candidate: prefill rate and decode rate at that depth.
-async fn depth_run(ctx: &Ctx<'_>, plan: &Plan, corpus: &Corpus, n_tokens: u32) -> Result<DepthMeasurement> {
+/// A worker for `plan` that logs to the plan's file.
+async fn spawn(ctx: &Ctx<'_>, plan: &Plan) -> Result<Worker> {
     let logs = ctx.cfg.data_dir.join("logs");
     std::fs::create_dir_all(&logs)?;
-    let w = Worker::spawn(&plan.engine, Some(&logs.join(format!("plan-{}.log", plan.id)))).await?;
+    Worker::spawn(&plan.engine, Some(&logs.join(format!("plan-{}.log", plan.id)))).await
+}
+
+/// One long request on a candidate: prefill rate and decode rate at that depth.
+async fn depth_run(ctx: &Ctx<'_>, plan: &Plan, corpus: &Corpus, n_tokens: u32) -> Result<DepthMeasurement> {
+    let w = spawn(ctx, plan).await?;
     let result = async {
         tokio::time::timeout(Duration::from_secs(1800), w.load(plan)).await.context("load timed out")??;
-        let r = if w.level == "chat" {
-            let p = corpus.text(Role::Calibration, 500, n_tokens as usize * 4);
-            crate::run::run_chats(&w, vec![p], ctx.req.decode_tokens, 1).await?.remove(0)
-        } else {
-            let warm = chat_prompt(&w, corpus, Role::Calibration, 999, 32).await?;
-            crate::run::run_stream(&w, "warmup", warm, 8, bench_sampling()).await?;
-            let p = chat_prompt(&w, corpus, Role::Calibration, 500, n_tokens as usize).await?;
-            crate::run::run_stream(&w, "depth", p, ctx.req.decode_tokens, bench_sampling()).await?
-        };
-        if let Some(e) = &r.error {
-            bail!("{e}");
-        }
-        let summary = summarize(std::slice::from_ref(&r), r.total_s).context("no completed long-context measurement")?;
-        ensure!(eligible(&summary, ctx.req.workload.objective, ctx.req.min_decode_tps), "long-context validation violates workload constraints");
-        Ok(DepthMeasurement {
-            prompt_tokens: r.n_prompt as u32,
-            ttft_ms: r.ttft_s * 1e3,
-            prefill_tps: r.n_prompt as f64 / r.ttft_s.max(1e-9),
-            decode_tps: r.decode_rate().context("too few tokens to time decoding")?,
-        })
+        long_prompt(ctx, &w, corpus, n_tokens).await
     }
     .await;
     w.shutdown().await;
     result
 }
 
+/// Validation, then the long request, on one load of `plan`. Validation runs first, as it does on its own.
+async fn validation_depth_run(
+    ctx: &Ctx<'_>,
+    plan: &Plan,
+    label: &str,
+    corpus: &Corpus,
+    n_tokens: u32,
+    devices: &[BackendDevice],
+) -> (Result<(Measurement, RunSummary)>, Result<DepthMeasurement>) {
+    let w = match spawn(ctx, plan).await {
+        Ok(w) => w,
+        Err(e) => return (Err(anyhow!("{e:#}")), Err(e)),
+    };
+    let validation = measure(ctx, &w, plan, corpus, Role::Validation, ctx.cfg.plan.validation_prompts, devices).await;
+    (ctx.log)(&format!("long prompt on {label}"));
+    let depth = long_prompt(ctx, &w, corpus, n_tokens).await;
+    w.shutdown().await;
+    let depth = match &validation {
+        Err(v) => depth.map_err(|e| e.context(format!("after failed validation ({v:#})"))),
+        Ok(_) => depth,
+    };
+    (validation, depth)
+}
+
+/// One long request on a loaded worker.
+async fn long_prompt(ctx: &Ctx<'_>, w: &Worker, corpus: &Corpus, n_tokens: u32) -> Result<DepthMeasurement> {
+    let r = if w.level == "chat" {
+        let p = corpus.text(Role::Calibration, 500, n_tokens as usize * 4);
+        crate::run::run_chats(w, vec![p], ctx.req.decode_tokens, 1).await?.remove(0)
+    } else {
+        let warm = chat_prompt(w, corpus, Role::Calibration, 999, 32).await?;
+        crate::run::run_stream(w, "warmup", warm, 8, bench_sampling()).await?;
+        let p = chat_prompt(w, corpus, Role::Calibration, 500, n_tokens as usize).await?;
+        crate::run::run_stream(w, "depth", p, ctx.req.decode_tokens, bench_sampling()).await?
+    };
+    if let Some(e) = &r.error {
+        bail!("{e}");
+    }
+    let summary = summarize(std::slice::from_ref(&r), r.total_s).context("no completed long-context measurement")?;
+    ensure!(eligible(&summary, ctx.req.workload.objective, ctx.req.min_decode_tps), "long-context validation violates workload constraints");
+    Ok(DepthMeasurement {
+        prompt_tokens: r.n_prompt as u32,
+        ttft_ms: r.ttft_s * 1e3,
+        prefill_tps: r.n_prompt as f64 / r.ttft_s.max(1e-9),
+        decode_tps: r.decode_rate().context("too few tokens to time decoding")?,
+    })
+}
+
 /// One measured session: load, warm up, run prompts, record distributions and peak memory.
 async fn measured_run(ctx: &Ctx<'_>, plan: &Plan, corpus: &Corpus, role: Role, n: usize, devices: &[BackendDevice]) -> Result<(Measurement, RunSummary)> {
-    let logs = ctx.cfg.data_dir.join("logs");
-    std::fs::create_dir_all(&logs)?;
-    let w = Worker::spawn(&plan.engine, Some(&logs.join(format!("plan-{}.log", plan.id)))).await?;
+    let w = spawn(ctx, plan).await?;
+    let result = measure(ctx, &w, plan, corpus, role, n, devices).await;
+    w.shutdown().await;
+    result
+}
+
+/// `measured_run` on a started worker, which stays up afterwards.
+async fn measure(
+    ctx: &Ctx<'_>,
+    w: &Worker,
+    plan: &Plan,
+    corpus: &Corpus,
+    role: Role,
+    n: usize,
+    devices: &[BackendDevice],
+) -> Result<(Measurement, RunSummary)> {
     let sampler = Sampler::start(devices, w.pid().await, Duration::from_millis(50));
     let result = async {
         tokio::time::timeout(Duration::from_secs(1800), w.load(plan)).await.context("load timed out")??;
@@ -1736,7 +1800,7 @@ async fn measured_run(ctx: &Ctx<'_>, plan: &Plan, corpus: &Corpus, role: Role, n
                 Objective::Interactive => 1,
                 _ => ctx.req.workload.concurrency as usize,
             };
-            let results = crate::run::run_chats(&w, prompts, ctx.req.decode_tokens, concurrency).await?;
+            let results = crate::run::run_chats(w, prompts, ctx.req.decode_tokens, concurrency).await?;
             ensure!(
                 results.iter().all(|r| r.error.is_none()),
                 "chat engine lacks complete token timing/usage or failed validation: {:?}",
@@ -1747,16 +1811,16 @@ async fn measured_run(ctx: &Ctx<'_>, plan: &Plan, corpus: &Corpus, role: Role, n
         }
         let mut prompts = vec![];
         for i in 0..n {
-            prompts.push(chat_prompt(&w, corpus, role, offset + i * 7, ctx.req.prompt_tokens as usize).await?);
+            prompts.push(chat_prompt(w, corpus, role, offset + i * 7, ctx.req.prompt_tokens as usize).await?);
         }
-        let warm = chat_prompt(&w, corpus, role, 999, 32).await?;
-        crate::run::run_stream(&w, "warmup", warm, 8, bench_sampling()).await?;
+        let warm = chat_prompt(w, corpus, role, 999, 32).await?;
+        crate::run::run_stream(w, "warmup", warm, 8, bench_sampling()).await?;
         let concurrency = match ctx.req.workload.objective {
             Objective::Interactive => 1,
             Objective::Serving { .. } => ctx.req.workload.concurrency as usize,
         };
         let t0 = Instant::now();
-        let results = run_all(&w, "cal", prompts, ctx.req.decode_tokens, concurrency, bench_sampling()).await?;
+        let results = run_all(w, "cal", prompts, ctx.req.decode_tokens, concurrency, bench_sampling()).await?;
         let wall = t0.elapsed().as_secs_f64();
         let errors: Vec<String> = results.iter().filter_map(|r| r.error.clone()).collect();
         ensure!(errors.is_empty(), "{}", errors.join("; "));
@@ -1764,10 +1828,10 @@ async fn measured_run(ctx: &Ctx<'_>, plan: &Plan, corpus: &Corpus, role: Role, n
         let agent = if role == Role::Validation {
             let mut prompts = vec![];
             for i in 0..n {
-                prompts.push(agent_prompt(&w, i, n).await?);
+                prompts.push(agent_prompt(w, i, n).await?);
             }
             let t0 = Instant::now();
-            let results = run_all(&w, "agent", prompts, ctx.req.decode_tokens, concurrency, bench_sampling()).await?;
+            let results = run_all(w, "agent", prompts, ctx.req.decode_tokens, concurrency, bench_sampling()).await?;
             ensure!(results.iter().all(|r| r.error.is_none()), "agent validation failed");
             let a = summarize(&results, t0.elapsed().as_secs_f64()).context("no completed agent validation streams")?;
             ensure!(eligible(&a, ctx.req.workload.objective, ctx.req.min_decode_tps), "agent validation violates workload constraints");
@@ -1779,7 +1843,6 @@ async fn measured_run(ctx: &Ctx<'_>, plan: &Plan, corpus: &Corpus, role: Role, n
     }
     .await;
     let peaks = sampler.finish();
-    w.shutdown().await;
     let (s, agent_decode_tps) = result?;
     (ctx.log)(&format!(
         "  peak host RSS {}, devices {:?}",
