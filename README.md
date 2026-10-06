@@ -53,35 +53,21 @@ Expert caching and the second-GPU tier apply only to mixture-of-experts models; 
 
 ## How Flux uses the CPU
 
-The CPU is a device in every plan, not a fallback for what the GPUs cannot hold. When it plans, Flux:
+The CPU is a device in every plan, not a fallback for what the GPUs cannot hold. Flux times its RAM bandwidth and the model's own kernels on it, places whole layers or a layer's experts on it, and fills spare GPU memory with the experts that save the most time per byte. The finalists run on real prompts, CPU work included, so the CPU's share and its thread count are measured rather than assumed.
 
-1. Times RAM bandwidth at several thread counts and proposes the fewest threads within 10% of the best, because threads past saturation only add synchronization.
-2. Times the model's own tensor shapes and quantization types on the CPU, both for single-token decoding and for prompt chunks.
-3. Puts whole layers on the CPU, or keeps a layer's experts in RAM for the CPU to compute, then fills spare GPU memory with the experts that save the most time per byte.
-4. Runs the finalists, CPU work included, on real prompts, so the CPU's share is measured rather than assumed.
-5. When the CPU computes layers or experts for an interactive plan, decodes the chosen plan again at each other thread count up to one per physical core, and keeps the fewest threads within 3% of the fastest, because each step waits for its slowest thread.
-
-While serving, the CPU computes its experts at the same time as the GPU computes the rest of the layer. Prompt chunks of 32 tokens or more copy those experts to the GPU instead, where the larger batch runs faster. Each chunk copies every expert it uses, so during a long prompt the GPU's expert cache lends its memory to the chunks: a chunk then holds several thousand tokens instead of about a thousand, and the prompt copies the experts fewer times. Flux lends only when that copies fewer bytes in total, counting the cached experts it must copy back before generating.
+While serving, the CPU computes its experts while the GPU computes the rest of the layer. Prompt chunks of 32 tokens or more copy those experts to the GPU instead, where the larger batch runs faster.
 
 ## Long contexts
 
-`flux plan` gives each model its trained context: 262,144 tokens for Qwen3.8-Flash-Next. The KV cache does not take that memory up front. It reserves address space for the whole context and commits 2 MiB pages as a conversation grows:
+`flux plan` gives each model its trained context: 262,144 tokens for Qwen3.8-Flash-Next. The KV cache commits memory as a conversation grows, not up front:
 
-- The first 65,536 tokens of attention KV per sequence stay in VRAM, so conversations up to that length run as fast as before. So do the caches every step reads in full, such as the pooled indexer keys and the draft layer.
-- Past that, pages go to pinned RAM on GPUs whose kernels can read it; `flux probe` measures each GPU's rate while the CPU streams weights. Sparse attention, as in Flash-Next, then reads only the cells its indexer selects. Dense attention reads every cell, so dense models decode more slowly at those depths.
-- A prompt chunk deeper than 65,536 tokens either copies each layer's RAM pages to VRAM once or reads them in place. Flux times both and keeps the faster. Chunks also shrink to fit the compute buffers, and borrow the KV page budget that no page holds yet; very long prompts still prefill more slowly.
-- `flux serve` gives KV pages the RAM available when it starts, minus the weights it pins and a reserve of 10% of RAM (`host_reserve_percent`). `flux plan` caps the context only when that RAM cannot hold the trained one.
+- The first 65,536 tokens of attention KV per sequence stay in VRAM, so conversations up to that length run at full speed.
+- Past that, KV pages go to pinned RAM on GPUs that can read it. Sparse attention, as in Flash-Next, reads only the cells it selects; dense models decode more slowly at those depths, and very long prompts prefill more slowly.
+- `flux serve` gives KV pages the RAM available when it starts, minus the weights it pins and the host reserve (`host_reserve_percent`, 10%). `flux plan` caps the context only when that RAM cannot hold the trained one.
 
-A request that memory cannot hold fails at admission with OpenAI's `context_length_exceeded` error; a running step never fails for lack of memory. Each request must leave at least `min(max_tokens, serve.min_reply)` tokens for the reply (`min_reply` defaults to 4,096), and `max_tokens` stays a ceiling.
+A request that does not fit fails at admission with HTTP 400 and OpenAI's `context_length_exceeded` error, which clients such as Qwen Code answer by compressing their history; a running step never fails for lack of memory. Each request must leave room for `min(max_tokens, serve.min_reply)` reply tokens (`min_reply` defaults to 4,096). `/v1/models` reports the limit as `context_length`, `max_model_len` and `meta.n_ctx`.
 
-Clients learn the limit in two ways:
-
-- `/v1/models` reports it as `context_length`, `max_model_len` and `meta.n_ctx`.
-- An overflow returns HTTP 400 with the code `context_length_exceeded` and the message "This model's maximum context length is N tokens. However, your messages resulted in M tokens." Qwen Code compresses its history when it sees it.
-
-Agents often return to an earlier conversation after a side request. When a prompt replaces a slot's conversation, the worker parks a copy of the old one's state in RAM, and a later prompt that returns to it restores the copy instead of recomputing the prefix. Parked conversations share the KV pages' RAM budget; the least recently used go first.
-
-`flux show <plan>` prints the page budgets. `/flux/stats` reports memory by use: in RAM the pinned weights, KV pages, parked conversations and worker RSS; per GPU the weights, KV and state, and compute buffers.
+When a prompt replaces a conversation, the worker parks the old one's state in RAM, so an agent that returns to it after a side request skips recomputing the prefix. `flux show <plan>` prints the page budgets, and `/flux/stats` reports memory by use.
 
 ## Build
 
@@ -95,7 +81,7 @@ scripts/build-backend.sh
 cargo build --release -p flux-cli -p flux-worker
 ```
 
-`build-backend.sh` ensures `third_party/llama.cpp` matches `backend.pin`, applies the patches in `patches/llama.cpp/`, and builds llama.cpp for CUDA compute capabilities 7.5 and 8.6 (RTX 20 and RTX 30 series). If you have a different GPU (e.g. RTX 40-series/8.9, A100/8.0), set `CUDA_ARCHS` appropriately: `CUDA_ARCHS=89 scripts/build-backend.sh`. The `flux` and `flux-worker` binaries land in `target/release/`.
+`build-backend.sh` ensures `third_party/llama.cpp` matches `backend.pin`, applies the patches in `patches/llama.cpp/`, and builds llama.cpp for CUDA compute capabilities 7.5 and 8.6 (RTX 20 and RTX 30 series). For other GPUs set `CUDA_ARCHS`, for example `CUDA_ARCHS=89 scripts/build-backend.sh` for the RTX 40 series. The `flux` and `flux-worker` binaries land in `target/release/`.
 
 `scripts/package.sh` builds a relocatable tarball in `dist/` that bundles both binaries, the llama.cpp libraries, and a starter `flux.toml`.
 
@@ -108,7 +94,7 @@ flux plan path/to/model.gguf
 flux serve <plan-id>
 ```
 
-The first `flux plan` probes the hardware, downloads the WikiText-2 prompt corpus, and then times the finalist placements within a tuning budget of 600 seconds (`--budget-s` changes it). Drafting and the GPU expert cache then build on the fastest placement and on the fastest one that uses another set of GPUs, however long the finalists took. The cache starts with the experts used most on WikiText-2 prompts and on a built-in set of coding-agent conversations, because agents and prose pick different experts. When the plan targets single-stream speed, the best few then run one long prompt: a quarter of the planned context, capped at the 65,536 tokens whose KV stays in VRAM. Flux keeps the plan whose worst case across short and long prompts is closest to the best, so no prompt length is assumed. Flux then validates the top two on held-out prompts and on the agent conversations. While serving, it compares the decode speed of requests that carry tools with the rate it measured on those conversations. Later runs for the same model, machine, and workload reuse the saved plan; pass `--replan` to measure again. `flux serve` accepts any unique prefix of a plan id, and `flux plans` lists them.
+The first `flux plan` probes the hardware, downloads the WikiText-2 prompt corpus, and times the finalist placements within a 600-second tuning budget (`--budget-s` changes it). It validates the top two on held-out prompts and on a built-in set of coding-agent conversations, then saves the winner. Later runs for the same model, machine, and workload reuse the saved plan; pass `--replan` to measure again. `flux plans` lists saved plans, and `flux serve` accepts any unique prefix of a plan id.
 
 The server listens on `127.0.0.1:8090`:
 
@@ -186,13 +172,9 @@ Run `flux <command> --help` for every flag.
 | `GET /flux/requests/{id}` | Return a journaled request's status and text |
 | `GET /flux/requests/{id}/stream?after=N` | Read retained output starting at event index `N` (default 0) |
 
-A request's id is its `x-request-id` header or, when that is absent, the `id` in the response.
+A request's id is its `x-request-id` header or, when that is absent, the `id` in the response. Output is journaled in memory for 600 seconds after a request completes (earlier under memory pressure), so a client that drops its connection can resume the stream: each event carries an `index`, and `after=N+1` continues after event `N`. An expired request returns 404.
 
-The resume endpoint emits versioned events with an `index` and SSE `id`. Each event retains a token and text, structured chat deltas, an external chat chunk, or terminal message and usage metadata. To continue after event `N`, request `after=N+1`. Tails and terminal events also occupy indexes. The journal is held in memory, defaults to a 256 MiB accounting budget and 600 seconds of completed-request retention, and may evict completed requests earlier under pressure. An expired request returns 404; expiration during replay is explicit.
-
-Idle worker failures recover automatically. If a worker fails after emitting any token, that request ends with an explicit error and its retained output remains available until expiry. Start a new request to generate again. Live replanning completes or restores the previous plan even if its HTTP caller disconnects; independent memory-pressure closures remain in force.
-
-Saved plans identify the complete workload policy and backend build. Rebuild Flux and replan after backend libraries change; plans created before these identity checks must be regenerated. Certification requires held-out execution, complete fixed-length output, and the requested latency and minimum throughput constraints. Chat engines must supply per-token logprobs and completion usage for token timing and certification.
+A worker that fails while idle restarts on its own. One that fails mid-request ends that request with an explicit error; start a new request to generate again.
 
 ## Configuration
 
@@ -228,9 +210,11 @@ args = ["--port", "{port}", "--model", "{model}", "--ctx-size", "{ctx}"]
 architectures = ["qwen3moe"]
 ```
 
+A registered engine must stream per-token logprobs and completion usage, which Flux needs to time it.
+
 Plans, probe reports, logs, and benchmark results live in `$XDG_DATA_HOME/flux`, which defaults to `~/.local/share/flux`. `flux serve` writes worker output to `logs/serve-worker.log` there. All defaults are in `crates/flux-core/src/config.rs`.
 
-Planning and serving use one host-memory reserve, 10% of total RAM by default. The old `plan.host_reserve_mib` and `serve.min_available_mib` settings are rejected with a migration message; use `host_reserve_percent` instead. `/flux/stats` reports the current reserve in bytes. A runtime override through `/flux/admission` lasts until the server restarts. `max_completion_tokens` takes precedence over `max_tokens`.
+Planning and serving share the host-memory reserve. `POST /flux/admission` overrides it until the server restarts, and `/flux/stats` reports the current value.
 
 <details>
 <summary>Environment variables</summary>
@@ -274,7 +258,7 @@ Only `flux-worker` links llama.cpp, so a native crash never takes down `flux`. P
 | `flux-native` | C ABI bridge to llama.cpp that exchanges JSON for complex values |
 | `flux-worker` | The `flux-worker` binary |
 
-A saved plan never changes. Flux files it under a key built from the model's file hashes, the hardware topology, the backend revision and build, the driver, the context bucket, the concurrency, and the planning flags and `flux.toml` settings. A change to any of them needs a new plan.
+A saved plan never changes. It is keyed by the model's file hashes, the hardware, the backend build, the driver, and the planning flags and settings, so a change to any of them needs a new plan.
 
 If a GPU has less free memory when `flux serve` starts than the plan was measured to need, the server drops that GPU's least-routed cached experts and logs a warning. When the cached experts cannot cover the shortfall, it refuses the plan; free the memory or run `flux plan <model> --replan`.
 
