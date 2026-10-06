@@ -49,7 +49,7 @@ The rebuilt 512 MiB host-page probe (four-cell scattered reads, six concurrent C
 | RTX 3060 | 22.471 GB/s | 21.170 GB/s | 9.639 GB/s | 8.910 GB/s |
 | RTX 2060 | 2.928 GB/s | 2.875 GB/s | 2.928 GB/s | 2.868 GB/s |
 
-Report: `/tmp/flux-variable-context/data/probes/0168a722be8d844e-7dd8036e721e.json`. Placement must use the contended measurements.
+Report: `/tmp/flux-variable-context/data/probes/0168a722be8d844e-7dd8036e721e.json`, which did not survive a reboot. Placement must use the contended measurements.
 
 ## Pooled keys and block selection (T4, T5)
 

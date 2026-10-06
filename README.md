@@ -107,7 +107,7 @@ flux plan path/to/model.gguf
 flux serve <plan-id>
 ```
 
-The first `flux plan` probes the hardware, downloads the WikiText-2 prompt corpus, and then times the finalist placements within a tuning budget of 600 seconds (`--budget-s` changes it). Drafting and the GPU expert cache then build on the fastest placement and on the fastest one that uses another set of GPUs, however long the finalists took. The cache starts with the experts used most on WikiText-2 prompts and on a built-in set of coding-agent conversations, because agents and prose pick different experts. The best few then run one long prompt, a quarter of the planned context, and Flux keeps the plan whose worst case across short and long prompts is closest to the best, so no prompt length is assumed. Flux then validates the top two on held-out prompts and on the agent conversations. While serving, it compares the decode speed of requests that carry tools with the rate it measured on those conversations. Later runs for the same model, machine, and workload reuse the saved plan; pass `--replan` to measure again. `flux serve` accepts any unique prefix of a plan id, and `flux plans` lists them.
+The first `flux plan` probes the hardware, downloads the WikiText-2 prompt corpus, and then times the finalist placements within a tuning budget of 600 seconds (`--budget-s` changes it). Drafting and the GPU expert cache then build on the fastest placement and on the fastest one that uses another set of GPUs, however long the finalists took. The cache starts with the experts used most on WikiText-2 prompts and on a built-in set of coding-agent conversations, because agents and prose pick different experts. When the plan targets single-stream speed, the best few then run one long prompt: a quarter of the planned context, capped at the 65,536 tokens whose KV stays in VRAM. Flux keeps the plan whose worst case across short and long prompts is closest to the best, so no prompt length is assumed. Flux then validates the top two on held-out prompts and on the agent conversations. While serving, it compares the decode speed of requests that carry tools with the rate it measured on those conversations. Later runs for the same model, machine, and workload reuse the saved plan; pass `--replan` to measure again. `flux serve` accepts any unique prefix of a plan id, and `flux plans` lists them.
 
 The server listens on `127.0.0.1:8090`:
 
@@ -246,6 +246,7 @@ Planning and serving use one host-memory reserve, 10% of total RAM by default. T
 | `FLUX_MOE_HOST_SYNC=1` | Stop overlapping CPU experts with the GPU |
 | `FLUX_MOE_CACHE_FREEZE=1` | Stop the GPU expert cache from adapting |
 | `FLUX_MOE_TIER_WAIT=1` | Wait for a second GPU's expert tier instead of recomputing its late work on the CPU, so greedy outputs repeat exactly |
+| `FLUX_MOE_ROUTE_DUMP=<path>` | Write each MoE layer's expert selection counts to this file as 16-bit (layer, expert, count) records |
 | `GGML_OP_OFFLOAD_MIN_BATCH` | Batch size at which ops on host weights move to a GPU (default 32) |
 
 </details>
@@ -272,7 +273,9 @@ Only `flux-worker` links llama.cpp, so a native crash never takes down `flux`. P
 | `flux-native` | C ABI bridge to llama.cpp that exchanges JSON for complex values |
 | `flux-worker` | The `flux-worker` binary |
 
-A saved plan never changes. Flux files it under a key built from the model's file hashes, the hardware topology, the backend revision and build, the driver, the context bucket, and the concurrency. A change to any of them needs a new plan.
+A saved plan never changes. Flux files it under a key built from the model's file hashes, the hardware topology, the backend revision and build, the driver, the context bucket, the concurrency, and the planning flags and `flux.toml` settings. A change to any of them needs a new plan.
+
+If a GPU has less free memory when `flux serve` starts than the plan was measured to need, the server drops that GPU's least-routed cached experts and logs a warning. When the cached experts cannot cover the shortfall, it refuses the plan; free the memory or run `flux plan <model> --replan`.
 
 ## Development
 
