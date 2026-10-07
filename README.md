@@ -279,9 +279,13 @@ Flux's backend changes live in `patches/llama.cpp/` as `git diff` output against
 ```sh
 git -C third_party/llama.cpp diff -- ggml/src/ggml-cpu/arch-fallback.h ggml/src/ggml-cpu/arch/x86/quants.c \
   > patches/llama.cpp/0002-flux-q2_0-avx2.patch
-git -C third_party/llama.cpp diff -- . ':!ggml/src/ggml-cpu/arch-fallback.h' ':!ggml/src/ggml-cpu/arch/x86/quants.c' \
-  > patches/llama.cpp/0001-flux-backend-extensions.patch
+{ git -C third_party/llama.cpp diff -- . ':!ggml/src/ggml-cpu/arch-fallback.h' ':!ggml/src/ggml-cpu/arch/x86/quants.c'
+  for f in $(git -C third_party/llama.cpp ls-files --others --exclude-standard | sort); do
+    git -C third_party/llama.cpp diff --no-index /dev/null "$f"
+  done; } > patches/llama.cpp/0001-flux-backend-extensions.patch
 ```
+
+The loop adds the files the patch creates, which `git diff` leaves out.
 
 Every plan's key includes a hash of the patches, the built libraries, and the `flux-native` and `flux-worker` sources, so a change to any of them invalidates all saved plans and probe reports. Run `flux plan` again afterwards. The default build compiles only the CPU and CUDA backends, so patch edits to Metal, Vulkan, SYCL, and other backends go unchecked.
 
