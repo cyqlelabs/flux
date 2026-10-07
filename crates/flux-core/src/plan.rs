@@ -409,6 +409,22 @@ pub struct ExpertCache {
     /// Keeps residency fixed: certification and quality gates need reproducible runs.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub frozen: bool,
+    /// How the cache adapts while decoding; None keeps the backend's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<CachePolicy>,
+}
+
+/// The adaptation rounds of an expert cache (`llama_moe_cache_policy`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CachePolicy {
+    /// Decode graphs per round.
+    pub n_interval: u32,
+    /// Each round multiplies the routing scores by this before adding the round's selections.
+    pub decay: f32,
+    /// A missing expert replaces a cached one whose score it exceeds by this factor.
+    pub ratio: f32,
+    /// The swaps of a round copy for at most this share of the last round's time over each GPU's host link.
+    pub copy_share: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -462,6 +478,7 @@ impl Plan {
             speculation: r.speculation.clone(),
             expert_cache: self.expert_cache.as_ref().map(|c| c.spec.clone()),
             expert_cache_frozen: self.expert_cache.as_ref().is_some_and(|c| c.frozen),
+            expert_cache_policy: self.expert_cache.as_ref().and_then(|c| c.policy.clone()),
         }
     }
 

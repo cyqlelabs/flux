@@ -234,6 +234,7 @@ struct load_params {
             }
         }
         cache_frozen = j.value("expert_cache_frozen", false);
+        cache_policy = j.value("expert_cache_policy", json());
 
         // Speculation drafts with the model's own next-token heads; the target keeps one recurrent-state
         // snapshot per draft token so a partly rejected draft rolls back without re-decoding.
@@ -270,6 +271,7 @@ struct load_params {
     };
     std::vector<tier_spec> cache_tiers;
     bool cache_frozen = false;
+    json cache_policy; // null keeps the backend's default
 };
 
 // The next-token heads' draft context: same placement and threads as the target, MTP graph, no rollback
@@ -1189,6 +1191,12 @@ fx_engine * fx_engine_load(const char * params_json, char ** error) {
             }
             if (p.cache_frozen) {
                 llama_moe_cache_freeze(e->ctx, true);
+            }
+            if (const json & cp = p.cache_policy; cp.is_object() &&
+                    llama_moe_cache_policy(e->ctx, cp.at("n_interval").get<int32_t>(), cp.at("decay").get<float>(), cp.at("ratio").get<float>(),
+                                           cp.at("copy_share").get<float>()) != 0) {
+                *error = dup("backend rejected the expert cache policy (see worker log)");
+                return nullptr;
             }
             // Prompt uploads and the tiers reach full speed only once the host experts are page-locked: wait,
             // so a loaded engine runs (and is measured) at its real speed from the first request.

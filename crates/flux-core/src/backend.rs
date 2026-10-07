@@ -44,6 +44,8 @@ pub struct BackendParams {
     /// Keeps the cache's residency fixed, for reproducible runs (rollback certification).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub expert_cache_frozen: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expert_cache_policy: Option<crate::plan::CachePolicy>,
 }
 
 impl BackendParams {
@@ -151,6 +153,7 @@ mod tests {
             speculation: Some(Speculation { kind: "draft-mtp".into(), draft_model: None, n_max: 3, draft_vocab: None }),
             expert_cache: None,
             expert_cache_frozen: false,
+            expert_cache_policy: None,
         };
         let a = p.llama_server_args().join(" ");
         assert!(a.ends_with("--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0"));

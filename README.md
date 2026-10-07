@@ -53,7 +53,7 @@ Expert caching and the second-GPU tier apply only to mixture-of-experts models; 
 
 ## How Flux uses the CPU
 
-The CPU is a device in every plan, not a fallback for what the GPUs cannot hold. Flux times its RAM bandwidth and the model's own kernels on it, places whole layers or a layer's experts on it, and fills spare GPU memory with the experts that save the most time per byte. The finalists run on real prompts, CPU work included, so the CPU's share and its thread count are measured rather than assumed.
+The CPU is a device in every plan, not a fallback for what the GPUs cannot hold. Flux times its RAM bandwidth and the model's own kernels on it, places whole layers or a layer's experts on it, and fills spare GPU memory with the experts that save the most time per byte. The finalists run on real prompts, CPU work included, so the CPU's share, its thread count, the number of drafted tokens, and how fast the expert cache adapts are measured rather than assumed.
 
 While serving, the CPU computes its experts while the GPU computes the rest of the layer. Prompt chunks of 32 tokens or more copy those experts to the GPU instead, where the larger batch runs faster.
 

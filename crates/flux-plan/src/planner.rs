@@ -51,7 +51,7 @@ impl PlanRequest {
     pub fn policy_key(&self, cfg: &FluxConfig) -> String {
         flux_core::fsutil::sha256_hex(
             serde_json::to_string(&json!({
-                "revision": 4, "request": self, "planning": cfg.plan, "host_reserve_percent": cfg.host_reserve_percent, "engines": cfg.engines
+                "revision": 5, "request": self, "planning": cfg.plan, "host_reserve_percent": cfg.host_reserve_percent, "engines": cfg.engines
             }))
             .expect("planning policy serializes")
             .as_bytes(),
@@ -138,6 +138,7 @@ impl Ctx<'_> {
             speculation: None,
             expert_cache: None,
             expert_cache_frozen: false,
+            expert_cache_policy: None,
         }
     }
 
@@ -912,11 +913,12 @@ pub async fn plan(
             };
             let shape = Shape { ubatch: ub, ..shape };
             // Drafting on the cache later loads the heads, their draft context and the rollback snapshots:
-            // measure what that adds on the base placement and keep it free.
+            // measure what that adds on the base placement and keep it free, for one more drafted token than
+            // calibrated, which the final draft-length trial may pick.
             let mut head_room: HashMap<String, u64> = HashMap::new();
             if native_mtp {
                 let params = BackendParams {
-                    speculation: Some(Speculation { kind: "draft-mtp".into(), draft_model: None, n_max: spec_n_max, draft_vocab: None }),
+                    speculation: Some(Speculation { kind: "draft-mtp".into(), draft_model: None, n_max: spec_n_max + 1, draft_vocab: None }),
                     ..ctx.params(&ctx.manifest.files[0].path, &base.placement, ub)
                 };
                 match ctx.measure_params(&params).await {
@@ -1060,18 +1062,96 @@ pub async fn plan(
     }
     ensure!(!finals.is_empty(), "no candidate passed held-out validation and workload constraints");
     let best = validated[finals[0]].0;
-    let chosen = &runs[results[best].0];
+    let mut chosen = runs[results[best].0].clone();
+    let interactive = matches!(req.workload.objective, Objective::Interactive);
+    // Cache adaptation: calibration starts every prompt near the traced residency, so only the long, mixed validation
+    // traffic shows how fast the cache should follow it. Decode the chosen plan with the responsive policy too.
+    let mut policy_reason = None;
+    if let (true, Some(cache), Some(m)) = (interactive, chosen.cache.clone(), results[best].1.validation.clone()) {
+        let mut c = chosen.clone();
+        c.cache = Some(ExpertCache { policy: Some(RESPONSIVE_POLICY), ..cache });
+        log(&format!("decoding {} with the responsive expert cache", chosen.label));
+        match measured_run(&ctx, &base_plan(&c), corpus, Role::Validation, cfg.plan.validation_prompts, &devices).await {
+            Ok((r, s)) if eligible(&s, req.workload.objective, req.min_decode_tps) => {
+                let worst = worst_relative(&[&m, &r]);
+                let faster = worst[1] > worst[0] + 0.03;
+                policy_reason = Some(format!(
+                    "{} adaptation ({} vs {} with rounds of {} graphs and {:.0}% copy time)",
+                    if faster { "responsive" } else { "default" },
+                    rates_text(&m),
+                    rates_text(&r),
+                    RESPONSIVE_POLICY.n_interval,
+                    RESPONSIVE_POLICY.copy_share * 100.0
+                ));
+                if faster {
+                    chosen = c;
+                    results[best].1.validation = Some(r);
+                }
+            }
+            Ok(_) => rejected.push("responsive expert cache: validation violates requested latency or throughput constraints".into()),
+            Err(e) => rejected.push(format!("responsive expert cache: {e:#}")),
+        }
+    }
+    // Draft length: the plain placement picked it, measured on prose. On the expert cache every drafted token in the
+    // verify batch routes its own experts, and its misses run on the CPU, so decode the chosen plan at the
+    // neighbouring lengths too, on prose and agent conversations. The cache left room for one more (head_room).
+    let mut draft_reason = None;
+    // the candidate's label names its calibrated length; the record names the chosen one
+    let mut chosen_label = chosen.label.clone();
+    let mtp = chosen.speculation.clone().filter(|s| s.kind == "draft-mtp");
+    if let (true, Some(sp), true, Some(m)) = (interactive, mtp, chosen.cache.is_some(), results[best].1.validation.clone()) {
+        let mut trials = vec![(sp.n_max, m)];
+        let plain = Candidate { speculation: None, ..chosen.clone() };
+        match reference_tokens(&ctx, &base_plan(&plain), hybrid, corpus).await {
+            Ok(reference) => {
+                for n in [sp.n_max.saturating_sub(1), sp.n_max + 1].into_iter().filter(|&n| n >= 1) {
+                    let c = Candidate { speculation: Some(Speculation { n_max: n, ..sp.clone() }), ..chosen.clone() };
+                    let plan = base_plan(&c);
+                    if let Some(a) = &reference {
+                        match certified(&ctx, &plan, a, corpus).await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                rejected.push(format!("{n} drafted tokens: rollback not certified"));
+                                continue;
+                            }
+                            Err(e) => {
+                                rejected.push(format!("{n} drafted tokens: rollback certification failed: {e:#}"));
+                                continue;
+                            }
+                        }
+                    }
+                    log(&format!("decoding {} with {n} drafted tokens", chosen.label));
+                    match measured_run(&ctx, &plan, corpus, Role::Validation, cfg.plan.validation_prompts, &devices).await {
+                        Ok((m, s)) if eligible(&s, req.workload.objective, req.min_decode_tps) => trials.push((n, m)),
+                        Ok(_) => rejected.push(format!("{n} drafted tokens: validation violates requested latency or throughput constraints")),
+                        Err(e) => rejected.push(format!("{n} drafted tokens: {e:#}")),
+                    }
+                }
+            }
+            Err(e) => rejected.push(format!("draft lengths on {}: greedy reference failed: {e:#}", chosen.label)),
+        }
+        if trials.len() > 1 {
+            let k = fewest_fast(&trials);
+            let n = trials[k].0;
+            draft_reason = Some(format!(
+                "{n} drafted tokens, the fewest within 3% of the fastest measured decode on the expert cache ({})",
+                trials.iter().map(|(n, m)| format!("{n}: {}", rates_text(m))).collect::<Vec<_>>().join("; ")
+            ));
+            chosen_label = chosen.label.replacen(&format!("draft-mtp {}", sp.n_max), &format!("draft-mtp {n}"), 1);
+            chosen.speculation = Some(Speculation { n_max: n, ..sp });
+            results[best].1.validation = Some(trials.swap_remove(k).1);
+        }
+    }
     // Decode threads: a step waits for its slowest thread, so peak bandwidth only proposes a count. An interactive
     // plan that computes on the CPU also decodes at every other swept count up to one per physical core.
     let mut n_threads = ctx.runtime.n_threads;
     let mut threads_reason = format!("{n_threads} threads (fewest per physical core near the best measured bandwidth)");
     let cpu_work = chosen.placement.layer_device.iter().any(|d| d == CPU) || chosen.placement.overrides.iter().any(|o| o.device == CPU);
-    let interactive = matches!(req.workload.objective, Objective::Interactive);
     if let (true, Some(m)) = (cpu_work && interactive, results[best].1.validation.clone()) {
         let mut trials = vec![(n_threads, m)];
         for t in report.cpu_bandwidth.iter().map(|b| b.threads).filter(|&t| t <= report.inventory.cpu.cores && t != n_threads) {
             log(&format!("decoding {} with {t} threads", chosen.label));
-            let mut plan = base_plan(chosen);
+            let mut plan = base_plan(&chosen);
             plan.runtime.n_threads = t;
             plan.id = plan.compute_id();
             match measured_run(&ctx, &plan, corpus, Role::Validation, cfg.plan.validation_prompts, &devices).await {
@@ -1081,15 +1161,11 @@ pub async fn plan(
             }
         }
         if trials.len() > 1 {
-            let k = fewest_fast_threads(&trials);
-            let rates = |m: &Measurement| match &m.agent_decode_tps {
-                Some(a) => format!("{:.1} tok/s, {:.1} on agent conversations", m.decode_tps.p50, a.p50),
-                None => format!("{:.1} tok/s", m.decode_tps.p50),
-            };
+            let k = fewest_fast(&trials);
             n_threads = trials[k].0;
             threads_reason = format!(
                 "{n_threads} threads, the fewest within 3% of the fastest measured decode ({})",
-                trials.iter().map(|(t, m)| format!("{t} threads: {}", rates(m))).collect::<Vec<_>>().join("; ")
+                trials.iter().map(|(t, m)| format!("{t} threads: {}", rates_text(m))).collect::<Vec<_>>().join("; ")
             );
             results[best].1.validation = Some(trials.swap_remove(k).1);
         }
@@ -1110,7 +1186,7 @@ pub async fn plan(
                 }
             })
             .collect(),
-        chosen: chosen.label.clone(),
+        chosen: chosen_label,
         reason: match req.workload.objective {
             Objective::Interactive if deep => format!(
                 "best worst case over decode rate and first-token time on short prompts ({} tokens) and on a long one ({depth_tokens} tokens), each relative to the best candidate there (within 3% are ties, won by the higher geometric mean)",
@@ -1122,7 +1198,7 @@ pub async fn plan(
             Objective::Serving { max_p95_token_ms } => format!("highest aggregate tokens/s with p95 token latency within {max_p95_token_ms} ms"),
         },
     };
-    let mut plan = assemble(&ctx, &facts.architecture, &identity, report, &devices, chosen, decisions, Some(validation));
+    let mut plan = assemble(&ctx, &facts.architecture, &identity, report, &devices, &chosen, decisions, Some(validation));
     plan.runtime.n_threads = n_threads;
     explain(
         &mut plan,
@@ -1130,10 +1206,12 @@ pub async fn plan(
         &cost,
         &shape,
         &devices,
-        chosen,
+        &chosen,
         &results.iter().map(|r| (runs[r.0].clone(), r.2.clone())).collect::<Vec<_>>(),
         &rejected,
         &threads_reason,
+        draft_reason.as_deref(),
+        policy_reason.as_deref(),
     );
     plan.id = plan.compute_id();
     Ok(plan)
@@ -1390,6 +1468,7 @@ async fn expert_cache(
                     gpu_served: r.gpu_served,
                     gpu_served_by_tensors: r.gpu_served_by_tensors,
                     frozen: false,
+                    policy: None,
                 }),
                 ..base.clone()
             }));
@@ -1466,6 +1545,12 @@ async fn trace_routes(ctx: &Ctx<'_>, plan: &Plan, corpus: &Corpus) -> Result<Rou
 
 /// Drafting's runtime growth beyond the buffers measured with the heads (batches, sampler scratch).
 const SPEC_MARGIN: u64 = 64 << 20;
+
+/// The expert cache policy the final trial compares with the backend's default (8 graphs per round, decay 0.9,
+/// ratio 1.1, 2% copy share): rounds four times as often with the same memory per graph (0.97^4 ~ 0.9) and five
+/// times the copy share, so the cache follows a conversation's shifts in routing sooner. Kept only when measured
+/// faster.
+const RESPONSIVE_POLICY: CachePolicy = CachePolicy { n_interval: 2, decay: 0.97, ratio: 1.1, copy_share: 0.1 };
 
 /// Room a separate draft model needs next to the target's weights on each of the plan's GPUs.
 const DRAFT_MODEL_ROOM: u64 = 768 << 20;
@@ -1637,18 +1722,7 @@ async fn calibrate(
 ) -> (CandidateResult, Option<RunSummary>) {
     let failed = |why: String| failed_result(c, why);
     if let Some(a) = reference {
-        // Verification batches round differently from single-token steps, so greedy output may flip at a
-        // near-tie: where the drafted run first departs, it must pick the plain run's runner-up. A wrong
-        // rollback leaves stale state, whose choice there is arbitrary.
-        let cert = async {
-            let b = greedy_tokens(ctx, plan, corpus).await?;
-            Ok::<bool, anyhow::Error>(a.iter().zip(&b).all(|((x, alts), (y, _))| match x.iter().zip(y).position(|(p, q)| p != q) {
-                None => true,
-                Some(d) => alts[d] == Some(y[d]),
-            }))
-        }
-        .await;
-        match cert {
+        match certified(ctx, plan, a, corpus).await {
             Ok(true) => (ctx.log)("  rollback certified: greedy output matches without drafting up to near-ties"),
             Ok(false) => {
                 let why = "rollback not certified: greedy output departs from the plain run at a non-tie".to_string();
@@ -1685,6 +1759,18 @@ async fn calibrate(
     }
 }
 
+/// Whether drafting rolls recurrent state back exactly: `plan`'s greedy output matches `reference`, the same plan's
+/// without drafting. Verification batches round differently from single-token steps, so greedy output may flip at a
+/// near-tie: where the drafted run first departs, it must pick the plain run's runner-up. A wrong rollback leaves
+/// stale state, whose choice there is arbitrary.
+async fn certified(ctx: &Ctx<'_>, plan: &Plan, reference: &[Greedy], corpus: &Corpus) -> Result<bool> {
+    let b = greedy_tokens(ctx, plan, corpus).await?;
+    Ok(reference.iter().zip(&b).all(|((x, alts), (y, _))| match x.iter().zip(y).position(|(p, q)| p != q) {
+        None => true,
+        Some(d) => alts[d] == Some(y[d]),
+    }))
+}
+
 /// Greedy tokens of one certification prompt, with each row's runner-up (two validation prompts compare
 /// two configurations of the same artifact).
 type Greedy = (Vec<i32>, Vec<Option<i32>>);
@@ -1718,12 +1804,25 @@ async fn greedy_tokens(ctx: &Ctx<'_>, plan: &Plan, corpus: &Corpus) -> Result<Ve
 /// Contenders measured at depth, besides the two best short-prompt runs.
 const MAX_CONTENDERS: usize = 4;
 
-/// The fewest threads whose worst decode rate, each condition relative to the best trial there, is within 3% of the
-/// best trial's. The conditions are prose and, where validation measured it, agent conversations.
-fn fewest_fast_threads(trials: &[(u32, Measurement)]) -> usize {
+fn rates_text(m: &Measurement) -> String {
+    match &m.agent_decode_tps {
+        Some(a) => format!("{:.1} tok/s, {:.1} on agent conversations", m.decode_tps.p50, a.p50),
+        None => format!("{:.1} tok/s", m.decode_tps.p50),
+    }
+}
+
+/// Each trial's worst decode rate, each condition relative to the best trial there. The conditions are prose and,
+/// where validation measured it, agent conversations.
+fn worst_relative(trials: &[&Measurement]) -> Vec<f64> {
     let rates = |m: &Measurement| [Some(m.decode_tps.p50), m.agent_decode_tps.as_ref().map(|a| a.p50)];
-    let top: Vec<f64> = (0..2).map(|c| trials.iter().filter_map(|(_, m)| rates(m)[c]).fold(0.0, f64::max).max(1e-12)).collect();
-    let worst: Vec<f64> = trials.iter().map(|(_, m)| rates(m).iter().zip(&top).filter_map(|(r, t)| r.map(|r| r / t)).fold(f64::MAX, f64::min)).collect();
+    let top: Vec<f64> = (0..2).map(|c| trials.iter().filter_map(|m| rates(m)[c]).fold(0.0, f64::max).max(1e-12)).collect();
+    trials.iter().map(|m| rates(m).iter().zip(&top).filter_map(|(r, t)| r.map(|r| r / t)).fold(f64::MAX, f64::min)).collect()
+}
+
+/// The trial with the smallest setting (threads, drafted tokens) whose worst relative decode rate is within 3% of the
+/// best trial's.
+fn fewest_fast(trials: &[(u32, Measurement)]) -> usize {
+    let worst = worst_relative(&trials.iter().map(|(_, m)| m).collect::<Vec<_>>());
     let best = worst.iter().copied().fold(0.0, f64::max);
     (0..trials.len()).filter(|&i| worst[i] >= best - 0.03).min_by_key(|&i| trials[i].0).expect("the best trial qualifies")
 }
@@ -1929,6 +2028,8 @@ fn explain(
     measured: &[(Candidate, Option<RunSummary>)],
     rejected: &[String],
     threads_reason: &str,
+    draft_reason: Option<&str>,
+    policy_reason: Option<&str>,
 ) {
     let rate = |c: &Candidate| measured.iter().find(|(m, _)| m.label == c.label).and_then(|(_, s)| s.as_ref().map(|s| s.decode_tps.p50));
     let chosen_rate = rate(chosen);
@@ -2028,7 +2129,11 @@ fn explain(
                     s.hot_experts,
                     s.gpu_served * 100.0,
                     s.gpu_served_by_tensors * 100.0,
-                    if chosen.cache.is_some() { "" } else { "; not faster" }
+                    match (chosen.cache.is_some(), policy_reason) {
+                        (false, _) => "; not faster".to_string(),
+                        (true, Some(why)) => format!("; {why}"),
+                        (true, None) => String::new(),
+                    }
                 ),
                 (Some(_), _, _) => "per-expert cache candidate failed to run".into(),
                 _ => "whole expert tensors; per-expert residency not applicable (see candidates)".into(),
@@ -2041,7 +2146,10 @@ fn explain(
         resource: "speculation".into(),
         used: chosen.speculation.is_some(),
         reason: match (&chosen.speculation, spec_rate, plain_rate) {
-            (Some(sp), Some(s), Some(p)) => format!("{} with {} drafted tokens: {s:.2} tok/s vs {p:.2} tok/s without", sp.kind, sp.n_max),
+            (Some(sp), Some(s), Some(p)) => match draft_reason {
+                Some(why) => format!("{}: {s:.2} tok/s vs {p:.2} tok/s without; {why}", sp.kind),
+                None => format!("{} with {} drafted tokens: {s:.2} tok/s vs {p:.2} tok/s without", sp.kind, sp.n_max),
+            },
             (None, Some(s), Some(p)) => format!("measured {s:.2} tok/s with drafting vs {p:.2} tok/s without; not faster"),
             _ if measured.iter().any(|(c, _)| c.speculation.is_some()) => "drafting candidates failed or were not certified".into(),
             _ => "not measured (opt-in with --speculation; needs next-token heads or a draft model)".into(),
