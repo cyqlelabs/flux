@@ -357,10 +357,10 @@ impl NativeWorker {
                 format!("prompt ({}) + max_tokens ({max_tokens}) exceeds the planned context of {} per sequence", prompt.len(), self.n_ctx_seq),
             );
         }
-        let Some((slot, kept)) = self.claim_slot(&prompt) else {
+        let reserve = (prompt.len() as u32).saturating_add(max_tokens.min(self.min_reply)).saturating_add(self.spec_n_max as u32).min(self.n_ctx_seq);
+        let Some((slot, kept)) = self.claim_slot(&prompt, reserve) else {
             return self.reject(&req, ErrorCode::Busy, "all planned sequences are in use");
         };
-        let reserve = (prompt.len() as u32).saturating_add(max_tokens.min(self.min_reply)).saturating_add(self.spec_n_max as u32).min(self.n_ctx_seq);
         // RAM the reservation may commit comes out of the room parked conversations hold.
         self.make_room(reserve.saturating_sub(kept as u32) as u64 * self.cell_bytes);
         if !self.reserve(slot, reserve) {
@@ -700,20 +700,21 @@ impl NativeWorker {
         }
     }
 
-    /// The idle slot for `prompt`, holding the longest prefix of it that an idle slot or a parked conversation has,
-    /// and how many prompt tokens it kept; None when every slot is busy.
-    fn claim_slot(&mut self, prompt: &[i32]) -> Option<(i32, usize)> {
+    /// The idle slot for `prompt`, which will reserve `reserve` cells, holding the longest prefix of it that an idle
+    /// slot or a parked conversation has, and how many prompt tokens it kept; None when every slot is busy.
+    fn claim_slot(&mut self, prompt: &[i32], reserve: u32) -> Option<(i32, usize)> {
         // At least the last prompt token is decoded again, since its logits pick the first output token.
         let common = |c: &[i32]| c.iter().zip(prompt).take_while(|(a, b)| a == b).count().min(prompt.len() - 1);
         let at = (0..self.free.len()).max_by_key(|&k| (common(&self.cached[self.free[k] as usize]), k))?;
         let slot = self.free.remove(at);
         let s = slot as usize;
         // A prompt that leaves the slot's conversation before the end of its last message starts another one (a
-        // client's side request, a subagent). That conversation is parked, or its next turn recomputes it.
-        if common(&self.cached[s]) < self.turns[s].min(self.cached[s].len()) {
-            self.park(slot);
-        }
+        // client's side request, a subagent). That conversation is parked beside the pages the prompt will commit,
+        // or its next turn recomputes it.
         let here = common(&self.cached[s]);
+        if here < self.turns[s].min(self.cached[s].len()) {
+            self.park(slot, (reserve as usize).saturating_sub(here) as u64 * self.cell_bytes);
+        }
         if let Some((shared, k)) = self.parked.iter().enumerate().map(|(k, p)| (common(&p.tokens), k)).max().filter(|&(n, _)| n > here) {
             self.restore(slot, k, shared);
         }
@@ -732,17 +733,22 @@ impl NativeWorker {
         true
     }
 
-    /// Copies the conversation `slot` holds to host RAM when it fits there, dropping older parked ones as needed.
-    fn park(&mut self, slot: i32) {
+    /// Copies the conversation `slot` holds to host RAM when it fits there beside `incoming` bytes of KV pages the
+    /// next prompt may commit, dropping older parked ones as needed.
+    fn park(&mut self, slot: i32, incoming: u64) {
         let s = slot as usize;
         let need = self.engine.as_mut().unwrap().seq_state_size(slot);
         if need == 0 {
             return;
         }
-        // Whether it fits once every other parked conversation is gone.
-        let fits = need + self.kv_ram() <= self.host_budget && need + self.host_reserve <= crate::mem_available() + self.parked_bytes();
-        if !fits || !self.make_room(need) {
-            eprintln!("slot {slot}: its conversation of {} tokens needs {} of RAM, more than is free; not parked", self.cached[s].len(), fmt_bytes(need));
+        // Whether it fits once every other parked conversation is gone; otherwise the prompt would drop it at once.
+        let fits = need + incoming + self.kv_ram() <= self.host_budget && need + incoming + self.host_reserve <= crate::mem_available() + self.parked_bytes();
+        if !fits || !self.make_room(need + incoming) {
+            eprintln!(
+                "slot {slot}: its conversation of {} tokens needs {} of RAM, more than is free beside the next prompt; not parked",
+                self.cached[s].len(),
+                fmt_bytes(need)
+            );
             return;
         }
         let t0 = Instant::now();

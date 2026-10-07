@@ -206,7 +206,7 @@ Agents return to earlier prefixes: sub-tasks, retries, history compression, swit
 
 Built on 2026-10-06 with copies instead of mapped pages. Qwen Code's permission classifier triggered it: its side request replaced a 60,629-token conversation, so the next turn recomputed all 61,190 tokens (about 2 minutes) instead of reusing 60,185.
 
-- When a prompt leaves a slot's conversation before the end of its last message, the worker copies the conversation's whole state to host RAM: KV, recurrent and drafter state, and checkpoints.
+- When a prompt leaves a slot's conversation before the end of its last message, the worker copies the conversation's whole state to host RAM: KV, recurrent and drafter state, and checkpoints. It skips the copy when the copy and the pages the new prompt will commit do not both fit, since the prompt would drop the copy at once.
 - A prompt sharing more with a parked conversation than with its slot gets a copy back. The copy stays parked unless the prompt continues that conversation.
 - Parked conversations share the KV pages' RAM budget. The least recently used go first: when a reservation fails, before a reservation could commit pages past the budget, and when available RAM falls under the reserve.
 
