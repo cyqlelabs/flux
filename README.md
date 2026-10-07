@@ -94,7 +94,7 @@ flux plan path/to/model.gguf
 flux serve <plan-id>
 ```
 
-The first `flux plan` probes the hardware, downloads the WikiText-2 prompt corpus, and times the finalist placements within a 600-second tuning budget (`--budget-s` changes it). It validates the top two on held-out prompts and on a built-in set of coding-agent conversations, then saves the winner. Later runs for the same model, machine, and workload reuse the saved plan; pass `--replan` to measure again. `flux plans` lists saved plans, and `flux serve` accepts any unique prefix of a plan id.
+The first `flux plan` takes several minutes; `flux serve` then starts in seconds. Planning probes the hardware, downloads the WikiText-2 prompt corpus, and times the finalist placements within a 600-second tuning budget (`--budget-s` changes it). It validates the top two on held-out prompts and on a built-in set of coding-agent conversations, then saves the winner. Later runs for the same model, machine, and workload reuse the saved plan; pass `--replan` to measure again. `flux plans` lists saved plans, and `flux serve` accepts any unique prefix of a plan id.
 
 The server listens on `127.0.0.1:8090`:
 
