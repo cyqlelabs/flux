@@ -14,7 +14,13 @@ use futures::stream::{self, Stream, StreamExt};
 use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
+
+/// Clients abort a response that stays silent while a long prompt is read: Qwen Code waits 120 s for headers and
+/// 240 s between chunks. A stream sends its headers after waiting this long for the worker to accept the request,
+/// and an empty chunk whenever it has had nothing to send for this long.
+const HEARTBEAT: Duration = Duration::from_secs(10);
 
 pub fn error(status: StatusCode, kind: &str, message: impl Into<String>) -> Response {
     (status, Json(json!({"error": {"message": message.into(), "type": kind, "code": status.as_u16()}}))).into_response()
@@ -169,13 +175,22 @@ async fn token_request(
         }
         let _ = done_tx.send(o);
     });
-    match admission_rx.await {
-        Ok(Ok(())) => {}
-        Ok(Err(o)) if o.error_code == Some(flux_core::protocol::ErrorCode::ContextFull) => return context_overflow(o.error.unwrap_or_default(), api),
-        Ok(Err(o)) => return error(StatusCode::INTERNAL_SERVER_ERROR, "engine_error", o.error.unwrap_or_else(|| "generation failed before admission".into())),
-        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "engine_error", "generation task failed before admission"),
+    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    // The native worker accepts a request with its first prompt chunk, which can take minutes deep in a long
+    // context. A stream stops waiting after a heartbeat: a later failure streams instead of returning a status.
+    let admitted = match stream {
+        true => tokio::time::timeout(HEARTBEAT, admission_rx).await.ok(),
+        false => Some(admission_rx.await),
+    };
+    match admitted {
+        None | Some(Ok(Ok(()))) => {}
+        Some(Ok(Err(o))) if o.error_code == Some(flux_core::protocol::ErrorCode::ContextFull) => return context_overflow(o.error.unwrap_or_default(), api),
+        Some(Ok(Err(o))) => {
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "engine_error", o.error.unwrap_or_else(|| "generation failed before admission".into()))
+        }
+        Some(Err(_)) => return error(StatusCode::INTERNAL_SERVER_ERROR, "engine_error", "generation task failed before admission"),
     }
-    respond(st, api, id, body.get("stream").and_then(Value::as_bool).unwrap_or(false), parsed, rx, done_rx).await
+    respond(st, api, id, stream, parsed, rx, done_rx).await
 }
 
 /// `parsed`: the reply arrives as chat deltas and a final message instead of plain text.
@@ -184,7 +199,7 @@ async fn respond(st: Arc<AppState>, api: Api, id: String, stream: bool, parsed: 
     let created = chrono::Utc::now().timestamp();
     if stream {
         let body = sse(api, id, model, created, parsed, rx, done);
-        return SseResponse::new(body).keep_alive(KeepAlive::default()).into_response();
+        return SseResponse::new(body).into_response();
     }
     let mut rx = rx;
     let mut text = String::new();
@@ -229,15 +244,23 @@ fn sse(
     done: oneshot::Receiver<Outcome>,
 ) -> impl Stream<Item = Result<Sse, Infallible>> {
     let (id2, model2) = (id.clone(), model.clone());
-    let pieces = stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|p| (p, rx)) }).flat_map(move |p| {
+    let pieces = stream::unfold(rx, |mut rx| async move {
+        match tokio::time::timeout(HEARTBEAT, rx.recv()).await {
+            Ok(p) => p.map(|p| (Some(p), rx)),
+            Err(_) => Some((None, rx)),
+        }
+    })
+    .flat_map(move |p| {
         let values = match p {
-            Piece::Text { deltas, .. } if parsed => deltas.into_iter().map(|d| delta_chunk(&id, &model, created, d)).collect(),
-            Piece::Text { token, text, .. } => {
+            // Comments do not reset a client's idle timer; an empty chunk does and adds nothing to the reply.
+            None => vec![chunk(api, &id, &model, created, Some(""), None, None)],
+            Some(Piece::Text { deltas, .. }) if parsed => deltas.into_iter().map(|d| delta_chunk(&id, &model, created, d)).collect(),
+            Some(Piece::Text { token, text, .. }) => {
                 let mut c = chunk(api, &id, &model, created, Some(&text), None, None);
                 c["flux_token"] = if token >= 0 { json!(token) } else { Value::Null };
                 vec![c]
             }
-            Piece::Chunk(c) => vec![c],
+            Some(Piece::Chunk(c)) => vec![c],
         };
         stream::iter(values.into_iter().map(|v| Ok(Sse::default().data(v.to_string()))))
     });
