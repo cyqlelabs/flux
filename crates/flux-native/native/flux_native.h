@@ -57,9 +57,13 @@ void fx_chat_parser_free(fx_chat_parser * p);
 // and adds "message" (the assistant message with reasoning_content and tool_calls).
 char * fx_chat_parser_push(fx_chat_parser * p, const char * text, int32_t len, bool final);
 
+// Called between the chunks of a decoded batch with the batch tokens queued so far; returning true stops the batch.
+typedef bool (*fx_chunk_hook)(void * data, int32_t n_done);
 // One llama_decode over n tokens; returns llama_decode's status (0 = ok), -100 for a batch over n_batch,
-// -101 when the drafter fails to follow it, -102 when llama_decode throws.
-int32_t fx_decode(fx_engine * e, int32_t n, const int32_t * tokens, const int32_t * pos, const int32_t * seq, const int8_t * logits);
+// -101 when the drafter fails to follow it, -102 when llama_decode throws. A batch of one sequence may pass a hook:
+// when it stops the batch, the status is 2 and the context and the drafter keep the first *n_done tokens.
+int32_t fx_decode(fx_engine * e, int32_t n, const int32_t * tokens, const int32_t * pos, const int32_t * seq, const int8_t * logits,
+                  fx_chunk_hook hook, void * hook_data, int32_t * n_done);
 // Time attribution of decode steps per device and op (engine loaded with "trace": true).
 // {"prompt":[ids],"steps":N,"seq":0} -> {"plain_step_us":[...],"traced_step_us":[...],"ops":[{"device","op","us","count"}],...}
 char * fx_trace(fx_engine * e, const char * request_json);

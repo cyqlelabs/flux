@@ -3,7 +3,7 @@
 
 use anyhow::{bail, ensure, Result};
 use serde_json::Value;
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr::NonNull;
 
 /// Revision of the backend this crate was compiled against.
@@ -54,7 +54,7 @@ pub fn verify_libraries() -> Result<()> {
 }
 
 mod ffi {
-    use std::ffi::c_char;
+    use std::ffi::{c_char, c_void};
 
     #[repr(C)]
     pub struct Engine {
@@ -92,7 +92,17 @@ mod ffi {
         pub fn fx_chat_parser_new(spec: *const c_char, error: *mut *mut c_char) -> *mut ChatParser;
         pub fn fx_chat_parser_free(p: *mut ChatParser);
         pub fn fx_chat_parser_push(p: *mut ChatParser, text: *const c_char, len: i32, last: bool) -> *mut c_char;
-        pub fn fx_decode(e: *mut Engine, n: i32, tokens: *const i32, pos: *const i32, seq: *const i32, logits: *const i8) -> i32;
+        pub fn fx_decode(
+            e: *mut Engine,
+            n: i32,
+            tokens: *const i32,
+            pos: *const i32,
+            seq: *const i32,
+            logits: *const i8,
+            hook: Option<unsafe extern "C" fn(data: *mut c_void, n_done: i32) -> bool>,
+            hook_data: *mut c_void,
+            n_done: *mut i32,
+        ) -> i32;
         pub fn fx_trace(e: *mut Engine, req: *const c_char) -> *mut c_char;
         pub fn fx_route_stats(e: *mut Engine, req: *const c_char) -> *mut c_char;
         pub fn fx_seq_clear(e: *mut Engine, seq: i32);
@@ -228,12 +238,33 @@ impl Engine {
         take_json(unsafe { ffi::fx_apply_template(self.ptr.as_ptr(), c.as_ptr()) })
     }
 
-    /// One backend step over the given tokens; `logits[i] != 0` requests output for row i.
-    pub fn decode(&mut self, tokens: &[i32], pos: &[i32], seq: &[i32], logits: &[i8]) -> Result<()> {
+    /// One backend step over the given tokens; `logits[i] != 0` requests output for row i. A batch of one sequence
+    /// may pass `on_chunk`, called between the backend's chunks of it with the tokens queued so far: when it returns
+    /// true the batch stops there, and decode returns `Some` of the leading tokens kept, which produced no output.
+    pub fn decode(
+        &mut self,
+        tokens: &[i32],
+        pos: &[i32],
+        seq: &[i32],
+        logits: &[i8],
+        mut on_chunk: Option<&mut dyn FnMut(usize) -> bool>,
+    ) -> Result<Option<usize>> {
         assert!(tokens.len() == pos.len() && pos.len() == seq.len() && seq.len() == logits.len());
-        let rc = unsafe { ffi::fx_decode(self.ptr.as_ptr(), tokens.len() as i32, tokens.as_ptr(), pos.as_ptr(), seq.as_ptr(), logits.as_ptr()) };
+        unsafe extern "C" fn trampoline(data: *mut c_void, n_done: i32) -> bool {
+            let f = unsafe { &mut *(data as *mut &mut dyn FnMut(usize) -> bool) };
+            f(n_done as usize)
+        }
+        let (hook, data) = match on_chunk.as_mut() {
+            Some(f) => (Some(trampoline as unsafe extern "C" fn(*mut c_void, i32) -> bool), f as *mut &mut dyn FnMut(usize) -> bool as *mut c_void),
+            None => (None, std::ptr::null_mut()),
+        };
+        let mut n_done = 0;
+        let rc = unsafe {
+            ffi::fx_decode(self.ptr.as_ptr(), tokens.len() as i32, tokens.as_ptr(), pos.as_ptr(), seq.as_ptr(), logits.as_ptr(), hook, data, &mut n_done)
+        };
         match rc {
-            0 => Ok(()),
+            0 => Ok(None),
+            2 if hook.is_some() => Ok(Some(n_done as usize)),
             1 => bail!("no KV slot available for this batch (context full)"),
             2 => bail!("decode aborted"),
             -100 => bail!("batch larger than n_batch"),

@@ -5077,7 +5077,7 @@ index 62dfa5d81..876c92b71 100644
      LLM_TENSOR_NEXTN_ENORM,
      LLM_TENSOR_NEXTN_HNORM,
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index c1ef12f56..e876d7372 100644
+index c1ef12f56..0e8434b2f 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -7,16 +7,22 @@
@@ -5947,7 +5947,19 @@ index c1ef12f56..e876d7372 100644
      }
  
      // reserve again with pp graph to avoid ggml-alloc reallocations during inference
-@@ -1171,8 +1914,16 @@ void llama_context::set_embeddings(bool value) {
+@@ -1159,6 +1902,11 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
+     }
+ }
+ 
++void llama_context::set_chunk_callback(bool (*callback)(void * data, int32_t n_done), void * data) {
++    chunk_callback      = callback;
++    chunk_callback_data = data;
++}
++
+ void llama_context::set_embeddings(bool value) {
+     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+ 
+@@ -1171,8 +1919,16 @@ void llama_context::set_embeddings(bool value) {
  void llama_context::set_embeddings_nextn(bool value, bool masked) {
      LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
  
@@ -5964,7 +5976,7 @@ index c1ef12f56..e876d7372 100644
  }
  
  void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
-@@ -1190,6 +1941,16 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
+@@ -1190,6 +1946,16 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
      cparams.nextn_layer_offset = offset;
  }
  
@@ -5981,7 +5993,7 @@ index c1ef12f56..e876d7372 100644
  void llama_context::set_causal_attn(bool value) {
      LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
  
-@@ -1332,6 +2093,9 @@ bool llama_context::set_adapter_cvec(
+@@ -1332,6 +2098,9 @@ bool llama_context::set_adapter_cvec(
  }
  
  llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
@@ -5991,7 +6003,7 @@ index c1ef12f56..e876d7372 100644
      if (mctx && !mctx->apply()) {
          LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
          ret = GGML_STATUS_FAILED;
-@@ -1356,6 +2120,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1356,6 +2125,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          }
  
          n_reused++;
@@ -5999,7 +6011,7 @@ index c1ef12f56..e876d7372 100644
      } else {
          res->reset();
  
-@@ -1374,7 +2139,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1374,7 +2144,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
              return nullptr;
          }
  
@@ -6019,7 +6031,7 @@ index c1ef12f56..e876d7372 100644
              LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
              ret = GGML_STATUS_ALLOC_FAILED;
              return nullptr;
-@@ -1391,6 +2167,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1391,6 +2172,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
      }
  
@@ -6043,7 +6055,7 @@ index c1ef12f56..e876d7372 100644
      const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
      if (status != GGML_STATUS_SUCCESS) {
          LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
-@@ -1491,6 +2284,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
+@@ -1491,6 +2289,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
          ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
          GGML_ASSERT(backend_res != nullptr);
          GGML_ASSERT(logits.data != nullptr);
@@ -6051,7 +6063,7 @@ index c1ef12f56..e876d7372 100644
  
          ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_tokens*n_vocab*sizeof(float));
      }
-@@ -1656,11 +2450,26 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1656,11 +2455,26 @@ int llama_context::decode(const llama_batch & batch_inp) {
          return -1;
      }
  
@@ -6078,7 +6090,7 @@ index c1ef12f56..e876d7372 100644
      // DFlash embd batches carry the fused target features at the encoder input width
      const bool    dflash_embd = model.arch == LLM_ARCH_DFLASH && batch_inp.embd;
      const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : dflash_embd ? hparams.n_embd_inp_enc() : hparams.n_embd_inp();
-@@ -1745,9 +2554,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1745,9 +2559,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
      memory_update(false);
  
      llama_memory_context_ptr mctx;
@@ -6093,7 +6105,7 @@ index c1ef12f56..e876d7372 100644
          if (!mctx) {
              return -2;
          }
-@@ -1803,6 +2616,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1803,6 +2621,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
      int64_t n_outputs_prev = 0;
      int64_t n_tokens_prev  = 0;
  
@@ -6107,11 +6119,12 @@ index c1ef12f56..e876d7372 100644
 +            depth + (llama_pos) n_tokens_all > (llama_pos) cparams.kv_floor_tokens && memory->page_host_bytes() > 0;
 +    cparams.kv_stage_now = stage_trial && staging.on;
 +    const int64_t t_batch = ggml_time_us();
++    chunk_stop = false;
 +
      do {
          const auto & ubatch = mctx->get_ubatch();
  
-@@ -1822,10 +2646,43 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1822,10 +2652,43 @@ int llama_context::decode(const llama_batch & batch_inp) {
              n_outputs = n_outputs_new;
          }
  
@@ -6155,7 +6168,7 @@ index c1ef12f56..e876d7372 100644
          if (!res) {
              // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
              llama_pos pos_min[LLAMA_MAX_SEQ];
-@@ -1857,6 +2714,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1857,6 +2720,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
              }
          }
  
@@ -6167,7 +6180,7 @@ index c1ef12f56..e876d7372 100644
          // plot the computation graph in dot format (for debugging purposes)
          //if (n_past%100 == 0) {
          //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
-@@ -1881,7 +2743,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1881,7 +2749,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
              if (n_outputs) {
                  GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                  GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
@@ -6186,8 +6199,18 @@ index c1ef12f56..e876d7372 100644
              }
          }
  
-@@ -1980,6 +2852,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1978,8 +2856,23 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ 
+         n_outputs_prev += n_outputs;
          n_tokens_prev  += ubatch.n_tokens;
++
++        // flux: the caller may stop a long batch between its chunks (llama_set_chunk_callback); the queued ones stay,
++        // and the output mappings are left unset, so no row of the batch reads as an output
++        if (chunk_callback && n_tokens_prev < n_tokens_all && chunk_callback(chunk_callback_data, (int32_t) n_tokens_prev)) {
++            n_outputs  = n_outputs_prev;
++            chunk_stop = true;
++            return 2;
++        }
      } while (mctx->next());
  
 +    if (stage_trial) {
@@ -6200,7 +6223,7 @@ index c1ef12f56..e876d7372 100644
      // set to total number of outputs in the batch, for use in llama_get_logits_ith
      n_outputs = n_outputs_all;
  
-@@ -2033,6 +2912,55 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -2033,6 +2926,55 @@ int llama_context::decode(const llama_batch & batch_inp) {
      // wait for the computation to finish (automatically done when obtaining the model output)
      //synchronize();
  
@@ -6256,7 +6279,7 @@ index c1ef12f56..e876d7372 100644
      return 0;
  }
  
-@@ -2486,6 +3414,7 @@ llm_graph_params llama_context::graph_params(
+@@ -2486,6 +3428,7 @@ llm_graph_params llama_context::graph_params(
          /*.n_outputs   =*/ n_outputs,
          /*.cb          =*/ graph_get_cb(),
          /*.res         =*/ res,
@@ -6264,7 +6287,7 @@ index c1ef12f56..e876d7372 100644
      };
  }
  
-@@ -2542,6 +3471,29 @@ llm_graph_cb llama_context::graph_get_cb() const {
+@@ -2542,6 +3485,29 @@ llm_graph_cb llama_context::graph_get_cb() const {
                  }
              }
          }
@@ -6294,7 +6317,7 @@ index c1ef12f56..e876d7372 100644
      };
  }
  
-@@ -3365,6 +4317,20 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
+@@ -3365,6 +4331,20 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
          for (const auto & [buft, size] : memory->memory_breakdown()) {
              ret[buft].context += size;
          }
@@ -6315,7 +6338,7 @@ index c1ef12f56..e876d7372 100644
      }
      if (model.hparams.no_alloc) {
          for (size_t i = 0; i < backends.size(); ++i) {
-@@ -3379,6 +4345,15 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
+@@ -3379,6 +4359,15 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
              ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
          }
      }
@@ -6331,7 +6354,7 @@ index c1ef12f56..e876d7372 100644
      return ret;
  }
  
-@@ -3610,182 +4585,2022 @@ void llama_context::opt_epoch(
+@@ -3610,183 +4599,2023 @@ void llama_context::opt_epoch(
  }
  
  //
@@ -6706,6 +6729,7 @@ index c1ef12f56..e876d7372 100644
 -        return ctx;
 -    } catch (const std::exception & err) {
 -        LLAMA_LOG_ERROR("%s: failed to initialize the context: %s\n", __func__, err.what());
+-    }
 +        // the candidates are the routed experts that neither the pool nor the tier holds or fetches
 +        std::vector<bool> taken(n_expert, false);
 +        for (int32_t e : l.expert) {
@@ -6723,7 +6747,9 @@ index c1ef12f56..e876d7372 100644
 +            }
 +        }
 +        std::sort(missing.begin(), missing.end(), [&](int32_t a, int32_t b) { return l.score[a] > l.score[b]; });
-+
+ 
+-    return nullptr;
+-}
 +        // the tier slots, those whose expert the pool now holds first (always replaceable), then by score
 +        auto value = [&](int32_t ts) {
 +            const int32_t e = tl.expert[ts];
@@ -6734,7 +6760,13 @@ index c1ef12f56..e876d7372 100644
 +            held[ts] = (int32_t) ts;
 +        }
 +        std::sort(held.begin(), held.end(), [&](int32_t a, int32_t b) { return value(a) < value(b); });
-+
+ 
+-// deprecated
+-llama_context * llama_new_context_with_model(
+-                 llama_model * model,
+-        llama_context_params   params) {
+-    return llama_init_from_model(model, params);
+-}
 +        for (size_t k = 0; k < missing.size() && k < held.size() && (int32_t) k < n_swap_layer; ++k) {
 +            const int32_t e_new = missing[k];
 +            const int32_t e_old = tl.expert[held[k]];
@@ -6744,9 +6776,10 @@ index c1ef12f56..e876d7372 100644
 +            }
 +            cand.push_back({ gone ? l.score[e_new] : l.score[e_new] - l.score[e_old], i, e_new, held[k] });
 +        }
-     }
++    }
  
--    return nullptr;
+-void llama_free(llama_context * ctx) {
+-    delete ctx;
 -}
 +    std::sort(cand.begin(), cand.end(), [](const swap & a, const swap & b) { return a.gain > b.gain; });
 +    {
@@ -6767,11 +6800,8 @@ index c1ef12f56..e876d7372 100644
 +        return;
 +    }
  
--// deprecated
--llama_context * llama_new_context_with_model(
--                 llama_model * model,
--        llama_context_params   params) {
--    return llama_init_from_model(model, params);
+-uint32_t llama_n_ctx(const llama_context * ctx) {
+-    return ctx->n_ctx();
 -}
 +    // evict now: from the next graph on, the CPU (or the pool) serves the old expert, and the tier thread
 +    // copies the new one in after any job that still uses the slot
@@ -6794,15 +6824,15 @@ index c1ef12f56..e876d7372 100644
 +        t->cv.notify_one();
 +    }
  
--void llama_free(llama_context * ctx) {
--    delete ctx;
+-uint32_t llama_n_ctx_seq(const llama_context * ctx) {
+-    return ctx->n_ctx_seq();
 +    swaps             += cand.size();
 +    n_flight_tier     += (int32_t) cand.size();
 +    n_swaps_tier_prof += (int32_t) cand.size();
  }
  
--uint32_t llama_n_ctx(const llama_context * ctx) {
--    return ctx->n_ctx();
+-uint32_t llama_n_batch(const llama_context * ctx) {
+-    return ctx->n_batch();
 -}
 +void llama_moe_cache::work() {
 +    std::unique_lock<std::mutex> lock(mutex);
@@ -6812,16 +6842,13 @@ index c1ef12f56..e876d7372 100644
 +            return;
 +        }
  
--uint32_t llama_n_ctx_seq(const llama_context * ctx) {
--    return ctx->n_ctx_seq();
+-uint32_t llama_n_ubatch(const llama_context * ctx) {
+-    return ctx->n_ubatch();
 -}
 +        std::vector<job> jobs;
 +        jobs.swap(queued);
 +        lock.unlock();
- 
--uint32_t llama_n_batch(const llama_context * ctx) {
--    return ctx->n_batch();
--}
++
 +        for (const job & j : jobs) {
 +            const auto & l = layers[j.layer];
 +            for (int k = 0; k < 4; ++k) {
@@ -6834,9 +6861,7 @@ index c1ef12f56..e876d7372 100644
 +        for (const auto & backend : backends_copy) {
 +            ggml_backend_synchronize(backend.get());
 +        }
- 
--uint32_t llama_n_ubatch(const llama_context * ctx) {
--    return ctx->n_ubatch();
++
 +        lock.lock();
 +        done.insert(done.end(), jobs.begin(), jobs.end());
 +        cv_done.notify_all();
@@ -8483,10 +8508,11 @@ index c1ef12f56..e876d7372 100644
 +
 +uint32_t llama_n_ubatch(const llama_context * ctx) {
 +    return ctx->n_ubatch();
- }
++}
  
  uint32_t llama_n_seq_max(const llama_context * ctx) {
-@@ -3897,6 +6712,10 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
+     return ctx->n_seq_max();
+@@ -3897,6 +6726,10 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
      ctx->set_nextn_layer_offset(offset);
  }
  
@@ -8497,7 +8523,17 @@ index c1ef12f56..e876d7372 100644
  llama_memory_t llama_get_memory(const struct llama_context * ctx) {
      if (!ctx) {
          return nullptr;
-@@ -4328,3 +7147,43 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
+@@ -4245,7 +7078,8 @@ int32_t llama_decode(
+         llama_context * ctx,
+           llama_batch   batch) {
+     const int ret = ctx->decode(batch);
+-    if (ret != 0 && ret != 1) {
++    // flux: a batch stopped by the chunk callback did not fail
++    if (ret != 0 && ret != 1 && !(ret == 2 && ctx->chunk_stopped())) {
+         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
+     }
+ 
+@@ -4328,3 +7162,47 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
  llama_context * llama_get_ctx_other(struct llama_context * ctx) {
      return ctx->get_cparams().ctx_other;
  }
@@ -8541,8 +8577,12 @@ index c1ef12f56..e876d7372 100644
 +void llama_moe_cache_stats(llama_context * ctx, int64_t * hits, int64_t * lookups, int64_t * swaps) {
 +    ctx->moe_cache_stats(hits, lookups, swaps);
 +}
++
++void llama_set_chunk_callback(llama_context * ctx, bool (*callback)(void * data, int32_t n_done), void * data) {
++    ctx->set_chunk_callback(callback, data);
++}
 diff --git a/src/llama-context.h b/src/llama-context.h
-index bf91daa8b..e139b2b70 100644
+index bf91daa8b..c498febec 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -8,10 +8,18 @@
@@ -8957,7 +8997,15 @@ index bf91daa8b..e139b2b70 100644
      void synchronize();
  
      const llama_model   & get_model()   const;
-@@ -116,11 +503,19 @@ struct llama_context {
+@@ -112,15 +499,27 @@ struct llama_context {
+ 
+     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
+ 
++    // flux: see llama_set_chunk_callback; chunk_stopped tells whether it stopped the last batch
++    void set_chunk_callback(bool (*callback)(void * data, int32_t n_done), void * data);
++    bool chunk_stopped() const { return chunk_stop; }
++
+     void set_embeddings (bool value);
      void set_embeddings_nextn(bool value, bool masked);
      void set_embeddings_layer_inp(uint32_t lid, bool enable);
      void set_nextn_layer_offset(int32_t offset);
@@ -8977,7 +9025,7 @@ index bf91daa8b..e139b2b70 100644
      bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
  
      bool set_adapter_cvec(
-@@ -345,6 +740,56 @@ private:
+@@ -345,6 +744,56 @@ private:
  
      bool sched_need_reserve = true;
  
@@ -9034,7 +9082,19 @@ index bf91daa8b..e139b2b70 100644
      ggml_backend_t backend_cpu = nullptr;
      std::vector<ggml_backend_ptr> backends;
  
-@@ -373,6 +818,13 @@ private:
+@@ -357,6 +806,11 @@ private:
+     ggml_abort_callback abort_callback      = nullptr;
+     void *              abort_callback_data = nullptr;
+ 
++    // flux: see llama_set_chunk_callback
++    bool (*chunk_callback)(void * data, int32_t n_done) = nullptr;
++    void * chunk_callback_data = nullptr;
++    bool chunk_stop = false;
++
+     std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;
+ 
+     // pointers and buffer types used for the compute buffer of each backend
+@@ -373,6 +827,13 @@ private:
      // keep copies of the per-sequence memory on the device
      std::map<llama_seq_id, llama_memory_buffers> mem_storage;
  
@@ -9084,7 +9144,7 @@ index b592de18c..09ae3b27b 100644
      bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
      bool op_offload;
 diff --git a/src/llama-ext.h b/src/llama-ext.h
-index 92a759b7a..ac7c0316e 100644
+index 92a759b7a..86988eedb 100644
 --- a/src/llama-ext.h
 +++ b/src/llama-ext.h
 @@ -67,7 +67,10 @@ LLAMA_API void llama_quant_compute_types(
@@ -9111,7 +9171,7 @@ index 92a759b7a..ac7c0316e 100644
  // mirrors:
  // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
  LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
-@@ -116,6 +125,73 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
+@@ -116,6 +125,83 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
  
  LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
  
@@ -9181,6 +9241,16 @@ index 92a759b7a..ac7c0316e 100644
 +// Cumulative counts of the cached path: expert selections (lookups), selections of experts resident on a GPU
 +// (hits) and swaps, tiers included
 +LLAMA_API void llama_moe_cache_stats(struct llama_context * ctx, int64_t * hits, int64_t * lookups, int64_t * swaps);
++
++//
++// flux: prompt chunk callback
++//
++
++// Called inside llama_decode after each chunk of a batch that leaves chunks to compute, with the batch tokens
++// queued so far (they may still be computing). They lead the batch when it holds one sequence. Returning true
++// stops the batch there: llama_decode returns 2 and keeps the queued chunks in memory. Unlike the abort callback,
++// it never interrupts a graph, so a recurrent state is never left between two chunks. Null removes it.
++LLAMA_API void llama_set_chunk_callback(struct llama_context * ctx, bool (*callback)(void * data, int32_t n_done), void * data);
 +
  //
  // model/context data extraction

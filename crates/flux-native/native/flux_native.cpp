@@ -1477,7 +1477,8 @@ char * fx_chat_parser_push(fx_chat_parser * p, const char * text, int32_t len, b
     }
 }
 
-int32_t fx_decode(fx_engine * e, int32_t n, const int32_t * tokens, const int32_t * pos, const int32_t * seq, const int8_t * logits) {
+int32_t fx_decode(fx_engine * e, int32_t n, const int32_t * tokens, const int32_t * pos, const int32_t * seq, const int8_t * logits,
+                  fx_chunk_hook hook, void * hook_data, int32_t * n_done) {
     if (n > e->n_batch) {
         return -100;
     }
@@ -1493,14 +1494,36 @@ int32_t fx_decode(fx_engine * e, int32_t n, const int32_t * tokens, const int32_
     // like single-token decode, so they use the decode thread count; prompt chunks use the batch count.
     const bool small = n < op_offload_min_batch();
     llama_set_n_threads(e->ctx, e->n_threads, small ? e->n_threads : e->n_threads_batch);
+    struct chunks {
+        fx_chunk_hook hook;
+        void * data;
+        int32_t n_done;
+    } done{hook, hook_data, n};
+    if (hook) {
+        llama_set_chunk_callback(e->ctx, [](void * p, int32_t n_queued) {
+            auto * d = (chunks *) p;
+            d->n_done = n_queued;
+            return d->hook(d->data, n_queued);
+        }, &done);
+    }
     const int64_t t_verify = ggml_time_us();
     int32_t rc;
     try {
         rc = llama_decode(e->ctx, e->batch);
     } catch (const std::exception & ex) {
         fprintf(stderr, "decode failed: %s\n", ex.what());
-        return -102;
+        rc = -102;
     }
+    llama_set_chunk_callback(e->ctx, nullptr, nullptr);
+    if (rc == -102) {
+        return rc;
+    }
+    // A stopped batch kept its leading chunks, which the drafter follows like a whole batch.
+    const bool stopped = hook && rc == 2;
+    if (stopped) {
+        e->batch.n_tokens = done.n_done;
+    }
+    *n_done = done.n_done;
     if (e->spec && small) {
         // The drafter reads the target's hidden states next, so waiting here only moves the wait into this timer.
         llama_synchronize(e->ctx);
@@ -1515,7 +1538,7 @@ int32_t fx_decode(fx_engine * e, int32_t n, const int32_t * tokens, const int32_
     // The drafter consumes the target's hidden state for every decoded row, prompt included.
     try {
         const int64_t t0 = ggml_time_us();
-        if (rc == 0 && e->spec && !common_speculative_process(e->spec, e->batch)) {
+        if ((rc == 0 || stopped) && e->spec && !common_speculative_process(e->spec, e->batch)) {
             return -101;
         }
         if (small) {

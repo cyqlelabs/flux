@@ -89,6 +89,8 @@ pub struct NativeWorker {
     recurrent: bool,
     paged: bool,
     seqs: Vec<Seq>,
+    /// Requests that arrived while a prompt batch ran, handled before newer ones.
+    pending: VecDeque<Request>,
     free: Vec<i32>,
     /// Tokens each idle slot still holds from its last request, reused by the next prompt sharing them.
     cached: Vec<Vec<i32>>,
@@ -122,6 +124,7 @@ impl NativeWorker {
             recurrent: false,
             paged: false,
             seqs: vec![],
+            pending: VecDeque::new(),
             free: vec![],
             cached: vec![],
             turns: vec![],
@@ -143,11 +146,13 @@ impl NativeWorker {
         loop {
             let busy = self.seqs.iter().any(|s| !s.prefill_done() || s.wants_decode());
             if busy && commands >= 8 {
-                self.step();
+                self.step(&rx);
                 commands = 0;
                 continue;
             }
-            let req = if busy {
+            let req = if let Some(r) = self.pending.pop_front() {
+                Some(r)
+            } else if busy {
                 match rx.try_recv() {
                     Ok(r) => Some(r),
                     Err(TryRecvError::Empty) => None,
@@ -179,7 +184,7 @@ impl NativeWorker {
                     commands += 1;
                 }
                 None => {
-                    self.step();
+                    self.step(&rx);
                     commands = 0;
                 }
             }
@@ -421,7 +426,7 @@ impl NativeWorker {
         });
     }
 
-    fn step(&mut self) {
+    fn step(&mut self, rx: &Receiver<Request>) {
         let mut undrafted = HashSet::new();
         // Reserve before either drafter or target runs. Admission already holds the reply floor.
         for i in (0..self.seqs.len()).rev() {
@@ -500,19 +505,37 @@ impl NativeWorker {
         }
 
         let t0 = Instant::now();
-        let engine = self.engine.as_mut().unwrap();
-        if let Err(e) = engine.decode(&tokens, &pos, &seqid, &logits) {
-            let mut involved: Vec<usize> = decode_rows.clone();
-            involved.extend(chunk.map(|c| c.0));
-            involved.sort_unstable();
-            involved.dedup();
-            for &i in involved.iter().rev() {
-                self.error(Some(&self.seqs[i].req.clone()), None, ErrorCode::Backend, e.to_string());
-                self.finish(i, FinishReason::Error);
+        // A prompt chunk alone in its step reports progress between the backend's chunks and stops there when its
+        // request is cancelled, so neither the serve nor a cancel waits for the whole batch.
+        let decoded = {
+            let pending = &mut self.pending;
+            let mut report = chunk.filter(|_| decode_rows.is_empty()).map(|(i, _)| between_chunks(&self.seqs[i], &self.out, rx, pending));
+            self.engine.as_mut().unwrap().decode(&tokens, &pos, &seqid, &logits, report.as_mut().map(|f| f as &mut dyn FnMut(usize) -> bool))
+        };
+        let stopped = match decoded {
+            Ok(stopped) => stopped,
+            Err(e) => {
+                let mut involved: Vec<usize> = decode_rows.clone();
+                involved.extend(chunk.map(|c| c.0));
+                involved.sort_unstable();
+                involved.dedup();
+                for &i in involved.iter().rev() {
+                    self.error(Some(&self.seqs[i].req.clone()), None, ErrorCode::Backend, e.to_string());
+                    self.finish(i, FinishReason::Error);
+                }
+                return;
             }
+        };
+        self.steps += 1;
+        // Stopped for a cancel: the sequence keeps the tokens computed and finishes when the cancel is handled.
+        if let (Some(n), Some((i, _))) = (stopped, chunk) {
+            let s = &mut self.seqs[i];
+            s.kv.extend_from_slice(&s.prompt[s.prefilled..s.prefilled + n]);
+            s.prefilled += n;
+            s.pos = s.prefilled as i32;
+            self.prefilled += n as u64;
             return;
         }
-        self.steps += 1;
 
         for &i in &decode_rows {
             let s = &mut self.seqs[i];
@@ -801,6 +824,21 @@ impl NativeWorker {
     fn kv_ram(&self) -> u64 {
         let info = self.engine.as_ref().and_then(|e| e.info().ok()).unwrap_or_default();
         info["kv_pages"].as_object().map_or(0, |classes| classes.values().filter_map(|c| c["ram_bytes"].as_u64()).sum())
+    }
+}
+
+/// Runs between the backend's chunks of `s`'s prompt chunk: reports its progress and queues the requests that
+/// arrived; true stops the batch when one of them cancels `s`.
+fn between_chunks<'a>(s: &'a Seq, out: &'a Out, rx: &'a Receiver<Request>, pending: &'a mut VecDeque<Request>) -> impl FnMut(usize) -> bool + 'a {
+    move |n| {
+        let (done, total, ms) = ((s.prefilled + n) as u32, s.prompt.len() as u32, s.t_start.elapsed().as_secs_f64() * 1e3);
+        out.send(&Event::Prefilling { req: s.req.clone(), done, total, reused: s.reused as u32, ms });
+        let mut cancelled = false;
+        while let Ok(r) = rx.try_recv() {
+            cancelled |= matches!(&r, Request::Cancel { req } if *req == s.req);
+            pending.push_back(r);
+        }
+        cancelled
     }
 }
 
